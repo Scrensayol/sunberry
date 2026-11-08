@@ -25,3 +25,10 @@ debug = true
 lto = true
 # strip = true
 # panic = "abort"
+
+# what releases ship: release keeps debug info for profiling, this drops it.
+# stripping here also works for cross targets, where the host's strip can't
+[profile.dist]
+inherits = "release"
+debug = false
+strip = true
