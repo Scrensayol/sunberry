@@ -304,20 +304,20 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         parentheses(self, binary.right_group(), &binary.right)
     }
 
-    fn format_closure_parameters(&mut self, closure: &Closure) -> fmt::Result {
+    // `skip` leaves out leading parameters, the implicit self of a method
+    fn format_closure_parameters(&mut self, closure: &Closure, skip: usize) -> fmt::Result {
         let function = closure.function.lock();
+        let mut parameters = function.parameters.iter().skip(skip);
         write!(
             self.output,
             "{}",
             if function.is_variadic {
-                function
-                    .parameters
-                    .iter()
+                parameters
                     .map(|x| x.to_string())
                     .chain(std::iter::once("...".into()))
                     .join(", ")
             } else {
-                function.parameters.iter().join(", ")
+                parameters.join(", ")
             }
         )
     }
@@ -366,7 +366,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
 
 	pub(crate) fn format_closure(&mut self, closure: &Closure) -> fmt::Result {
 		write!(self.output, "function(")?;
-		self.format_closure_parameters(closure)?;
+		self.format_closure_parameters(closure, 0)?;
 		write!(self.output, ")")?;
 		let function = closure.function.lock();
 		if let Some(name) = &function.name {
@@ -378,8 +378,17 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
 	}
 
 	fn format_named_function(&mut self, name: &LValue, closure: &Closure) -> fmt::Result {
-		write!(self.output, "function {}(", name)?;
-		self.format_closure_parameters(closure)?;
+		let is_method = closure.function.lock().is_method;
+		if is_method
+			&& let LValue::Index(index) = name
+			&& let RValue::Literal(Literal::String(key)) = index.right.as_ref()
+		{
+			write!(self.output, "function {}:{}(", index.left, String::from_utf8_lossy(key))?;
+			self.format_closure_parameters(closure, 1)?;
+		} else {
+			write!(self.output, "function {}(", name)?;
+			self.format_closure_parameters(closure, 0)?;
+		}
 		write!(self.output, ")")?;
 		let function = closure.function.lock();
 		if let Some(fname) = &function.name {
@@ -767,7 +776,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             self.indent()?;
             if let RValue::Closure(closure) = &method.value {
                 write!(self.output, "function {}(", method.name)?;
-                self.format_closure_parameters(closure)?;
+                self.format_closure_parameters(closure, 0)?;
                 write!(self.output, ")")?;
                 self.format_closure_body(closure)?;
                 write!(self.output, "end")?;

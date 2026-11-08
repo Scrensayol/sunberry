@@ -29,6 +29,7 @@ mod literal;
 mod local;
 //mod name_gen;
 pub mod local_declarations;
+pub mod method_sugar;
 pub mod name_locals;
 mod repeat;
 pub mod replace_locals;

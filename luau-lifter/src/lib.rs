@@ -4,7 +4,8 @@ mod lifter;
 mod op_code;
 
 use ast::{
-    local_declarations::LocalDeclarer, name_locals::name_locals, replace_locals::replace_locals,
+    local_declarations::LocalDeclarer, method_sugar::method_sugar, name_locals::name_locals,
+    replace_locals::replace_locals,
     Traverse,
 };
 
@@ -193,6 +194,7 @@ pub fn decompile_bytecode(bytecode: &[u8], encode_key: u8) -> String {
             let (mut upvalues, mut body) = rayon::join(decompile_children, decompile_main);
             panic::set_hook(prev_hook);
             link_upvalues(&mut body, &mut upvalues);
+            method_sugar(&mut body);
             name_locals(&mut body, true);
             ast::formatter::Formatter::format_parallel(&body, Default::default())
         }

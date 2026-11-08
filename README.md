@@ -31,6 +31,32 @@ local time = tick()
 
 Names come from `GetService`, `WaitForChild` and `FindFirst*` arguments, required modules, `Instance.new` class names, string index keys, closure names and globals. They stay unique within a script and never shadow a global the script uses. Bytecode compiled with debug level 2 keeps the original local names, and those are used as-is.
 
+Event handlers and loops get the parameter names you'd expect from Roblox's API:
+
+```lua
+Players.PlayerAdded:Connect(function(player)
+	player.Chatted:Connect(function(message)
+		-- ...
+	end)
+end)
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	-- ...
+end)
+for _, descendant in workspace:GetDescendants() do
+	-- ...
+end
+```
+
+**Methods look like methods.** Functions on a class table that use their first parameter as an object print with `:` and `self`, the way they were written:
+
+```lua
+function v_u_4:Update(p14)
+	local v17 = self:GetHumanoid()
+	if self.lastUpdate == nil or p14 > 1 then
+```
+
+This never changes behaviour, since `function X:m()` is exactly `X.m = function(self)`.
+
 **Deterministic output.** The same bytecode always decompiles to the same text, at any thread count. In shiny, some statement order depended on memory addresses.
 
 **A better `serve`.** Responses are gzipped when the client asks (executors built on libcurl do by default), so a 2.7 MB result crosses the network as about 370 KB. Bad input returns an error instead of dropping the connection, and long decompiles no longer block other requests.

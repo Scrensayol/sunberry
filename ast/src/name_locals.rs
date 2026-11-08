@@ -1,13 +1,19 @@
 use itertools::Either;
-use rustc_hash::FxHashSet;
+use parking_lot::Mutex;
+use rustc_hash::{FxHashMap, FxHashSet};
 use triomphe::Arc;
 
-use crate::{Block, LValue, Literal, RValue, RcLocal, Select, Statement, Traverse, Upvalue};
+use crate::{
+    Block, Function, GenericFor, LValue, Literal, MethodCall, RValue, RcLocal, Select, Statement,
+    Traverse, Upvalue,
+};
 
 const RESERVED: &[&str] = &[
     "and", "break", "continue", "do", "else", "elseif", "end", "export", "false", "for",
     "function", "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true",
     "type", "until", "while",
+    // only methods get to be self, see name_local
+    "self",
 ];
 
 // Turns a string constant into something usable as a local name, or None when
@@ -87,6 +93,47 @@ fn name_hint(value: &RValue) -> Option<String> {
     }
 }
 
+// Conventional parameter names for an event's handler, mostly Roblox's own (scripts usually
+// say `hit` and `gameProcessed` where the docs say `otherPart` and `gameProcessedEvent`), so a
+// callback passed to `x.PlayerAdded:Connect` gets `player` instead of `p1`.
+fn event_parameters(event: &[u8]) -> &'static [&'static str] {
+    match event {
+        b"PlayerAdded" | b"PlayerRemoving" | b"OnServerEvent" => &["player"],
+        b"CharacterAdded" | b"CharacterRemoving" | b"CharacterAppearanceLoaded" => &["character"],
+        b"ChildAdded" | b"ChildRemoved" => &["child"],
+        b"DescendantAdded" | b"DescendantRemoving" => &["descendant"],
+        b"AncestryChanged" => &["child", "parent"],
+        b"Touched" | b"TouchEnded" => &["hit"],
+        b"Heartbeat" | b"RenderStepped" | b"PreRender" | b"PreAnimation" | b"PreSimulation"
+        | b"PostSimulation" => &["deltaTime"],
+        b"Stepped" => &["time", "deltaTime"],
+        b"InputBegan" | b"InputEnded" | b"InputChanged" => &["input", "gameProcessed"],
+        b"Chatted" => &["message"],
+        b"HealthChanged" => &["health"],
+        b"StateChanged" => &["oldState", "newState"],
+        b"MoveToFinished" => &["reached"],
+        b"FocusLost" => &["enterPressed", "inputThatCausedFocusLoss"],
+        _ => &[],
+    }
+}
+
+// What iterating over the result of these methods yields, for naming loop values.
+fn collection_item(method: &str) -> Option<&'static str> {
+    Some(match method {
+        "GetChildren" => "child",
+        "GetDescendants" => "descendant",
+        "GetPlayers" => "player",
+        "GetTagged" => "instance",
+        "GetTouchingParts" | "GetPartsInPart" => "part",
+        "GetPlayingAnimationTracks" => "track",
+        _ => return None,
+    })
+}
+
+fn local_key(local: &RcLocal) -> usize {
+    Arc::as_ptr(&local.0 .0) as usize
+}
+
 struct Namer {
     rename: bool,
     counter: usize,
@@ -94,6 +141,11 @@ struct Namer {
     // every name a local can no longer be given: keywords, globals the script
     // reads or writes, and names already handed out
     taken: FxHashSet<String>,
+    // names for parameters and loop variables, from how they're used. keyed by address,
+    // holding the locals themselves would break the Arc::count check in name_local
+    usage_hints: FxHashMap<usize, String>,
+    // locals defined as `local function f`, so `Connect(f)` can name f's parameters
+    local_functions: FxHashMap<usize, Arc<Mutex<Function>>>,
 }
 
 impl Namer {
@@ -115,6 +167,9 @@ impl Namer {
             let known = lock.0.as_deref().and_then(|n| sanitize(n.as_bytes()));
             if Arc::count(&local.0 .0) == 1 {
                 lock.0 = Some("_".to_string());
+            } else if known.as_deref() == Some("self") {
+                // every method has its own self, they shadow each other on purpose
+                lock.0 = known;
             } else if let Some(name) = known.or(hint) {
                 lock.0 = Some(self.claim(name));
             } else {
@@ -136,6 +191,44 @@ impl Namer {
         }
     }
 
+    // `x.Event:Connect(function(a, b) ... end)` or `x.Event:Connect(f)`
+    fn hint_event_handler(&mut self, call: &MethodCall) {
+        let function = match call.arguments.first() {
+            Some(RValue::Closure(closure)) => Some(closure.function.0.clone()),
+            Some(RValue::Local(local)) => self.local_functions.get(&local_key(local)).cloned(),
+            _ => None,
+        };
+        if matches!(call.method.as_str(), "Connect" | "Once" | "ConnectParallel")
+            && let RValue::Index(index) = call.value.as_ref()
+            && let RValue::Literal(Literal::String(event)) = index.right.as_ref()
+            && let Some(function) = function
+        {
+            let function = function.lock();
+            for (param, name) in function.parameters.iter().zip(event_parameters(event)) {
+                self.usage_hints.insert(local_key(param), name.to_string());
+            }
+        }
+    }
+
+    // `for _, v in x:GetChildren()` and `for _, v in ipairs(x:GetChildren())`
+    fn hint_loop_value(&mut self, generic_for: &GenericFor) {
+        let iterated = match generic_for.right.as_slice() {
+            [RValue::Call(call) | RValue::Select(Select::Call(call))]
+                if matches!(call.value.as_ref(), RValue::Global(g) if g.0 == b"ipairs" || g.0 == b"pairs") =>
+            {
+                call.arguments.first()
+            }
+            [single] => Some(single),
+            _ => None,
+        };
+        if let Some(RValue::MethodCall(call) | RValue::Select(Select::MethodCall(call))) = iterated
+            && let Some(item) = collection_item(&call.method)
+            && let Some(value) = generic_for.res_locals.get(1)
+        {
+            self.usage_hints.insert(local_key(value), item.to_string());
+        }
+    }
+
     fn name_locals(&mut self, block: &mut Block) {
         for statement in &mut block.0 {
             // TODO: traverse_rvalues
@@ -143,7 +236,8 @@ impl Namer {
                 if let itertools::Either::Right(RValue::Closure(closure)) = value {
                     let mut function = closure.function.lock();
                     for param in &function.parameters {
-                        self.name_local("p", param, None);
+                        let hint = self.usage_hints.get(&local_key(param)).cloned();
+                        self.name_local("p", param, hint);
                     }
                     self.name_locals(&mut function.body);
                 };
@@ -176,7 +270,8 @@ impl Namer {
                 }
                 Statement::GenericFor(generic_for) => {
                     for res_local in &generic_for.res_locals {
-                        self.name_local("v", res_local, None);
+                        let hint = self.usage_hints.get(&local_key(res_local)).cloned();
+                        self.name_local("v", res_local, hint);
                     }
                     self.name_locals(&mut generic_for.block.lock());
                 }
@@ -212,6 +307,12 @@ impl Namer {
                     }
                     _ => {}
                 }
+                if let Either::Right(
+                    RValue::MethodCall(call) | RValue::Select(Select::MethodCall(call)),
+                ) = &value
+                {
+                    self.hint_event_handler(call);
+                }
                 if let itertools::Either::Right(RValue::Closure(closure)) = value {
                     self.upvalues.extend(
                         closure
@@ -227,6 +328,15 @@ impl Namer {
                 None
             });
             match statement {
+                Statement::Assign(assign)
+                    if assign.prefix
+                        && let [LValue::Local(local)] = assign.left.as_slice()
+                        && let [RValue::Closure(closure)] = assign.right.as_slice() =>
+                {
+                    self.local_functions
+                        .insert(local_key(local), closure.function.0.clone());
+                }
+                Statement::MethodCall(call) => self.hint_event_handler(call),
                 Statement::If(r#if) => {
                     self.find_upvalues(&mut r#if.then_block.lock());
                     self.find_upvalues(&mut r#if.else_block.lock());
@@ -241,6 +351,7 @@ impl Namer {
                     self.find_upvalues(&mut numeric_for.block.lock());
                 }
                 Statement::GenericFor(generic_for) => {
+                    self.hint_loop_value(generic_for);
                     self.find_upvalues(&mut generic_for.block.lock());
                 }
                 _ => {}
@@ -255,6 +366,8 @@ pub fn name_locals(block: &mut Block, rename: bool) {
         counter: 1,
         upvalues: FxHashSet::default(),
         taken: RESERVED.iter().map(|s| s.to_string()).collect(),
+        usage_hints: FxHashMap::default(),
+        local_functions: FxHashMap::default(),
     };
     namer.find_upvalues(block);
     namer.name_locals(block);
