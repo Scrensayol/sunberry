@@ -19,6 +19,7 @@ mod closure;
 pub mod fold_classes;
 mod r#continue;
 mod r#for;
+pub mod dominators;
 pub mod formatter;
 mod global;
 mod goto;
@@ -203,6 +204,22 @@ impl LocalRw for LValue {
             LValue::Local(_) => Vec::new(),
             LValue::Global(global) => global.values_read(),
             LValue::Index(index) => index.values_read(),
+        }
+    }
+
+    fn push_values_read<'a>(&'a self, out: &mut Vec<&'a RcLocal>) {
+        match self {
+            LValue::Local(_) => {}
+            LValue::Global(global) => global.push_values_read(out),
+            LValue::Index(index) => index.push_values_read(out),
+        }
+    }
+
+    fn push_values_read_mut<'a>(&'a mut self, out: &mut Vec<&'a mut RcLocal>) {
+        match self {
+            LValue::Local(_) => {}
+            LValue::Global(global) => global.push_values_read_mut(out),
+            LValue::Index(index) => index.push_values_read_mut(out),
         }
     }
 

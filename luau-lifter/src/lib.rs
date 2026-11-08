@@ -17,13 +17,14 @@ use cfg::{
     },
 };
 use indexmap::IndexMap;
+use rayon::prelude::*;
 
 use lifter::Lifter;
 
 //use cfg_ir::{dot, function::Function, ssa};
 use clap::Parser;
 use parking_lot::Mutex;
-use petgraph::algo::dominators::simple_fast;
+use ast::dominators::simple_fast;
 
 use rustc_hash::FxHashMap;
 use triomphe::Arc;
@@ -58,14 +59,15 @@ pub fn decompile_bytecode(bytecode: &[u8], encode_key: u8) -> String {
         Bytecode::Chunk(chunk) => {
             let main_ast = Arc::<Mutex<ast::Function>>::default();
             let mut lifted = Vec::new();
-            let mut stack: Vec<(Arc<Mutex<ast::Function>>, usize)> = Vec::new();
+            let mut wave: Vec<(Arc<Mutex<ast::Function>>, usize)> = Vec::new();
 
             // lift main on its own so its arc stays unique, try_unwrap needs that later
             let main_lifted = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ast::seed_local_ids(lift_seed(chunk.main));
                 Lifter::lift(&chunk.functions, &chunk.string_table, chunk.main)
             })) {
                 Ok((function, upvalues, child_functions)) => {
-                    stack.extend(child_functions.into_iter().map(|(a, f)| (a.0, f)));
+                    wave.extend(child_functions.into_iter().map(|(a, f)| (a.0, f)));
                     Some((function, upvalues))
                 }
                 Err(e) => {
@@ -79,75 +81,93 @@ pub fn decompile_bytecode(bytecode: &[u8], encode_key: u8) -> String {
                 }
             };
 
-            while let Some((ast_func, func_id)) = stack.pop() {
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    Lifter::lift(&chunk.functions, &chunk.string_table, func_id)
-                })) {
-                    Ok((function, upvalues, child_functions)) => {
-                        lifted.push((ast_func, function, upvalues));
-                        stack.extend(child_functions.into_iter().map(|(a, f)| (a.0, f)));
-                    }
-                    Err(e) => {
-                        let msg = e.downcast_ref::<String>().map(String::as_str)
-                            .or_else(|| e.downcast_ref::<&str>().copied())
-                            .unwrap_or("unknown panic");
-                        ast_func.lock().body.push(
-                            ast::Comment::new(format!(
-                                "failed to lift function {}: {}", func_id, msg
-                            )).into(),
-                        );
-                    }
-                }
-            }
-
-            // one clone so the panic branch can still write to the ast, the closure takes the other
-            let mut upvalues = lifted
-                .into_iter()
-                .map(|(ast_function, function, upvalues_in)| {
-                    use std::{backtrace::Backtrace, cell::RefCell, panic};
-
-                    thread_local! {
-                        static BACKTRACE: RefCell<Option<Backtrace>> = const { RefCell::new(None) };
-                    }
-
-                    let function_id = function.id;
-                    let mut args = std::panic::AssertUnwindSafe(Some((
-                        ast_function.clone(),
-                        function,
-                        upvalues_in,
-                    )));
-
-                    let prev_hook = panic::take_hook();
-                    panic::set_hook(Box::new(|_| {
-                        let trace = Backtrace::capture();
-                        BACKTRACE.with(move |b| b.borrow_mut().replace(trace));
-                    }));
-                    let result = panic::catch_unwind(move || {
-                        let (ast_function, function, upvalues_in) = args.take().unwrap();
-                        decompile_function(ast_function, function, upvalues_in)
-                    });
-                    panic::set_hook(prev_hook);
-
+            // lifting is independent per function too, so lift in waves: every function
+            // found by one wave gets lifted in parallel in the next
+            while !wave.is_empty() {
+                let results = std::mem::take(&mut wave)
+                    .into_par_iter()
+                    .map(|(ast_func, func_id)| {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            ast::seed_local_ids(lift_seed(func_id));
+                            Lifter::lift(&chunk.functions, &chunk.string_table, func_id)
+                        }));
+                        (ast_func, func_id, result)
+                    })
+                    .collect::<Vec<_>>();
+                for (ast_func, func_id, result) in results {
                     match result {
-                        Ok(r) => r,
+                        Ok((function, upvalues, child_functions)) => {
+                            lifted.push((ast_func, function, upvalues));
+                            wave.extend(child_functions.into_iter().map(|(a, f)| (a.0, f)));
+                        }
                         Err(e) => {
                             let msg = e.downcast_ref::<String>().map(String::as_str)
                                 .or_else(|| e.downcast_ref::<&str>().copied())
                                 .unwrap_or("unknown panic");
-                            ast_function.lock().body.push(
+                            ast_func.lock().body.push(
                                 ast::Comment::new(format!(
-                                    "failed to decompile function {}: {}", function_id, msg
+                                    "failed to lift function {}: {}", func_id, msg
                                 )).into(),
                             );
-                            (ByAddress(ast_function), Vec::new())
                         }
                     }
-                })
-                .collect::<FxHashMap<_, _>>();
+                }
+            }
+
+            use std::{backtrace::Backtrace, cell::RefCell, panic};
+
+            thread_local! {
+                static BACKTRACE: RefCell<Option<Backtrace>> = const { RefCell::new(None) };
+            }
+
+            // the hook is process wide, so set it once around the parallel section
+            let prev_hook = panic::take_hook();
+            panic::set_hook(Box::new(|_| {
+                let trace = Backtrace::capture();
+                BACKTRACE.with(move |b| b.borrow_mut().replace(trace));
+            }));
+
+            // functions decompile independently: a parent only reaches a child's ast
+            // through fold_classes, which takes the lock and is idempotent. that holds
+            // for main as well, so it runs alongside the others
+            let decompile_children = move || {
+                lifted
+                    .into_par_iter()
+                    .map(|(ast_function, function, upvalues_in)| {
+                        let function_id = function.id;
+                        // one clone so the panic branch can still write to the ast, the closure takes the other
+                        let mut args = std::panic::AssertUnwindSafe(Some((
+                            ast_function.clone(),
+                            function,
+                            upvalues_in,
+                        )));
+
+                        let result = panic::catch_unwind(move || {
+                            let (ast_function, function, upvalues_in) = args.take().unwrap();
+                            decompile_function(ast_function, function, upvalues_in)
+                        });
+
+                        match result {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let msg = e.downcast_ref::<String>().map(String::as_str)
+                                    .or_else(|| e.downcast_ref::<&str>().copied())
+                                    .unwrap_or("unknown panic");
+                                ast_function.lock().body.push(
+                                    ast::Comment::new(format!(
+                                        "failed to decompile function {}: {}", function_id, msg
+                                    )).into(),
+                                );
+                                (ByAddress(ast_function), Vec::new())
+                            }
+                        }
+                    })
+                    .collect::<FxHashMap<_, _>>()
+            };
 
             // main_ast is moved into the closure, so on panic theres nothing left to
             // write to and we have to make up a body instead
-            let mut body = match main_lifted {
+            let decompile_main = move || match main_lifted {
                 Some((function, upvalues_in)) => {
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                         decompile_function(main_ast, function, upvalues_in)
@@ -169,11 +189,24 @@ pub fn decompile_bytecode(bytecode: &[u8], encode_key: u8) -> String {
                 }
                 None => Arc::try_unwrap(main_ast).unwrap().into_inner().body,
             };
+
+            let (mut upvalues, mut body) = rayon::join(decompile_children, decompile_main);
+            panic::set_hook(prev_hook);
             link_upvalues(&mut body, &mut upvalues);
             name_locals(&mut body, true);
-            body.to_string()
+            ast::formatter::Formatter::format_parallel(&body, Default::default())
         }
     }
+}
+
+// every function gets its own id range for locals made while lifting it and another for
+// decompiling it, see ast::seed_local_ids
+fn lift_seed(function_id: usize) -> u64 {
+    (function_id as u64 * 2) << 32
+}
+
+fn decompile_seed(function_id: usize) -> u64 {
+    (function_id as u64 * 2 + 1) << 32
 }
 
 fn decompile_function(
@@ -181,6 +214,7 @@ fn decompile_function(
     mut function: Function,
     upvalues_in: Vec<ast::RcLocal>,
 ) -> (ByAddress<Arc<Mutex<ast::Function>>>, Vec<ast::RcLocal>) {
+    ast::seed_local_ids(decompile_seed(function.id));
     let (local_count, local_groups, upvalue_in_groups, upvalue_passed_groups) =
         cfg::ssa::construct(&mut function, &upvalues_in);
     let upvalue_to_group = upvalue_in_groups

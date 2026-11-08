@@ -5,8 +5,8 @@ use by_address::ByAddress;
 use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
 use parking_lot::Mutex;
+use crate::dominators::simple_fast;
 use petgraph::{
-    algo::dominators::simple_fast,
     prelude::{DiGraph, NodeIndex},
     Direction,
 };

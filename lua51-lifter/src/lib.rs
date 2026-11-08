@@ -10,7 +10,7 @@ use cfg::ssa::{
 use indexmap::IndexMap;
 use lifter::Lifter;
 use parking_lot::Mutex;
-use petgraph::algo::dominators::simple_fast;
+use ast::dominators::simple_fast;
 use rustc_hash::FxHashMap;
 use triomphe::Arc;
 

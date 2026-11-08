@@ -172,7 +172,6 @@ fn apply_local_map_to_values_referenced<T: LocalRw + Traverse>(
         }
         *from = to.clone();
     }
-    let mut map = FxHashMap::default();
     for (from, mut to) in uses_local
         .values_read_mut()
         .into_iter()
@@ -181,18 +180,17 @@ fn apply_local_map_to_values_referenced<T: LocalRw + Traverse>(
         while let Some(to_to) = local_map.get(to) {
             to = to_to;
         }
-        map.insert(from.clone(), to.clone());
         *from = to.clone();
     }
-    // uses_local.traverse_rvalues(&mut |rvalue| {
-    //     if let Some(closure) = rvalue.as_closure_mut() {
-    //         replace_locals(&mut closure.body, &map)
-    //     }
-    // });
 }
 
 // does not replace locals in child closures
 pub fn apply_local_map(function: &mut Function, local_map: FxHashMap<RcLocal, RcLocal>) {
+    // callers pass whatever they collected, often nothing, and the walk below is the
+    // whole function
+    if local_map.is_empty() {
+        return;
+    }
     for param in &mut function.parameters {
         if let Some(mut new_param) = local_map.get(param) {
             // TODO: make sure this doesnt cycle if theres a li -> li entry
@@ -529,10 +527,14 @@ impl<'a> SsaConstructor<'a> {
         Vec<FxHashSet<RcLocal>>,
     ) {
         let entry = self.function.entry().unwrap();
-        let mut visited_nodes = Vec::with_capacity(self.function.graph().node_count());
+        // visited blocks that aren't sealed yet, in visit order. sealed blocks never
+        // unseal, so rescanning every visited block after each fill was quadratic
+        let mut unsealed = Vec::new();
         for i in 0..self.dfs.len() {
             let node = self.dfs[i];
-            visited_nodes.push(node);
+            if node != entry {
+                unsealed.push(node);
+            }
             for stat_index in 0..self.function.block(node).unwrap().len() {
                 let statement = self
                     .function
@@ -605,25 +607,25 @@ impl<'a> SsaConstructor<'a> {
             }
             self.filled_blocks.insert(node);
 
-            for &node in &visited_nodes {
-                if node != entry
-                    && !self.sealed_blocks.contains(&node)
-                    && !self
-                        .function
-                        .predecessor_blocks(node)
-                        .any(|p| !self.filled_blocks.contains(&p))
+            unsealed.retain(|&node| {
+                if self
+                    .function
+                    .predecessor_blocks(node)
+                    .any(|p| !self.filled_blocks.contains(&p))
                 {
-                    if let Some(incomplete_params) = self.incomplete_params.remove(&node) {
-                        for (local, param_local) in incomplete_params {
-                            // TODO: this is a bit weird, maybe we should have a upvalue rvalue
-                            if !self.new_upvalues_in.contains_key(&local) {
-                                self.add_param_args(node, &local, param_local);
-                            }
+                    return true;
+                }
+                if let Some(incomplete_params) = self.incomplete_params.remove(&node) {
+                    for (local, param_local) in incomplete_params {
+                        // TODO: this is a bit weird, maybe we should have a upvalue rvalue
+                        if !self.new_upvalues_in.contains_key(&local) {
+                            self.add_param_args(node, &local, param_local);
                         }
                     }
-                    self.sealed_blocks.insert(node);
                 }
-            }
+                self.sealed_blocks.insert(node);
+                false
+            });
         }
 
         // TODO: this is a bit meh, maybe we should have an argument rvalue

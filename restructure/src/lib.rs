@@ -1,4 +1,7 @@
-use ast::{LocalRw, Traverse};
+use ast::{
+    dominators::{simple_fast, Dominators},
+    LocalRw, Traverse,
+};
 use cfg::{block::BranchType, function::Function};
 use itertools::Itertools;
 use parking_lot::Mutex;
@@ -6,7 +9,6 @@ use triomphe::Arc;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use petgraph::{
-    algo::dominators::{simple_fast, Dominators},
     stable_graph::{EdgeIndex, NodeIndex, StableDiGraph},
     visit::*,
 };
@@ -19,7 +21,7 @@ mod r#loop;
 // TODO: REFACTOR: move
 pub fn post_dominators<N: Default, E: Default>(
     graph: &mut StableDiGraph<N, E>,
-) -> Dominators<NodeIndex> {
+) -> Dominators {
     let exits = graph
         .node_identifiers()
         .filter(|&n| graph.neighbors(n).count() == 0)
@@ -69,8 +71,8 @@ impl GraphStructurer {
     fn try_match_pattern(
         &mut self,
         node: NodeIndex,
-        dominators: &Dominators<NodeIndex>,
-        post_dom: &Dominators<NodeIndex>,
+        dominators: &Dominators,
+        post_dom: &Dominators,
     ) -> bool {
         let successors = self.function.successor_blocks(node).collect_vec();
 

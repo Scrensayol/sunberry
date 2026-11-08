@@ -7,7 +7,8 @@ use triomphe::Arc;
 use tuple::Map;
 
 use crate::GraphStructurer;
-use petgraph::{algo::dominators::Dominators, stable_graph::NodeIndex};
+use ast::dominators::Dominators;
+use petgraph::stable_graph::NodeIndex;
 
 impl GraphStructurer {
     fn simplify_if(if_stat: &mut ast::If) {
@@ -234,7 +235,7 @@ impl GraphStructurer {
     // a -> b a -> c
     pub(crate) fn refine_virtual_edge_jump(
         &mut self,
-        post_dom: &Dominators<NodeIndex>,
+        post_dom: &Dominators,
         entry: NodeIndex,
         node: NodeIndex,
         header: NodeIndex,
@@ -266,7 +267,7 @@ impl GraphStructurer {
 
     pub(crate) fn refine_virtual_edge_conditional(
         &mut self,
-        post_dom: &Dominators<NodeIndex>,
+        post_dom: &Dominators,
         entry: NodeIndex,
         then_node: NodeIndex,
         else_node: NodeIndex,
@@ -361,7 +362,7 @@ impl GraphStructurer {
         entry: NodeIndex,
         then_target: NodeIndex,
         else_target: NodeIndex,
-        dominators: &Dominators<NodeIndex>,
+        dominators: &Dominators,
     ) -> bool {
         if self.is_loop_header(entry) {
             // try_collapse_loop already handles a continue at the header

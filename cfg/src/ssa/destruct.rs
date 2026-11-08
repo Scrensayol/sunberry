@@ -1,10 +1,9 @@
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
-use ast::{LocalRw, RcLocal};
+use ast::{dominators::simple_fast, LocalRw, RcLocal};
 use indexmap::IndexMap;
 use itertools::Itertools;
 use petgraph::{
-    algo::dominators::simple_fast,
     prelude::DiGraphMap,
     stable_graph::NodeIndex,
     visit::{Dfs, DfsPostOrder, EdgeRef},
@@ -239,11 +238,14 @@ impl<'a> Destructor<'a> {
 
     fn build_local_map(&self) -> FxHashMap<RcLocal, RcLocal> {
         let mut map = FxHashMap::default();
+        let mut named = FxHashSet::default();
         for (local, con_class) in &self.congruence_classes {
+            // every member maps to the same class, so only name each class once
+            let first_visit = named.insert(Rc::as_ptr(con_class));
             let con_class = con_class.borrow();
             let new_local = con_class.iter().next().unwrap().1;
             // the class becomes one local, keep a debug name if any member had one
-            if new_local.0 .0.lock().0.is_none() {
+            if first_visit && new_local.0 .0.lock().0.is_none() {
                 let name = con_class.iter().find_map(|(_, l)| l.0 .0.lock().0.clone());
                 new_local.0 .0.lock().0 = name;
             }

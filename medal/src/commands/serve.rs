@@ -6,6 +6,7 @@ use axum::{
 };
 use serde::Deserialize;
 use tokio::net::TcpListener;
+use tower_http::compression::CompressionLayer;
 use tracing::info;
 
 use crate::commands::decompile_no_io;
@@ -21,6 +22,10 @@ pub async fn serve(port: u16, luau: bool, lua51: bool) -> Result<(), std::io::Er
     if lua51 {
         app = app.route("/lua51/decompile", post(decompile_lua51));
     }
+
+    // output is a few MB of text that gzips ~7x, and clients that don't ask for it
+    // (no Accept-Encoding) still get it plain
+    let app = app.layer(CompressionLayer::new());
 
     // Run the web server
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
@@ -44,9 +49,16 @@ struct EncodeKey {
 }
 
 async fn decompile_luau(query: Query<EncodeKey>, body: Bytes) -> String {
-    decompile_no_io(body, query.encode_key, false)
+    decompile_blocking(body, query.encode_key, false).await
 }
 
 async fn decompile_lua51(body: Bytes) -> String {
-    decompile_no_io(body, default_encode_key(), true)
+    decompile_blocking(body, default_encode_key(), true).await
+}
+
+/// Big scripts take seconds, so keep them off the async workers
+async fn decompile_blocking(body: Bytes, encode_key: u8, lua51: bool) -> String {
+    tokio::task::spawn_blocking(move || decompile_no_io(body, encode_key, lua51))
+        .await
+        .unwrap_or_else(|_| "-- decompiler panicked".to_string())
 }

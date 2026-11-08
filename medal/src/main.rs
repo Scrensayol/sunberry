@@ -4,6 +4,9 @@ use crate::commands::{Cli, decompile, serve};
 
 mod commands;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
     // Setup the logger

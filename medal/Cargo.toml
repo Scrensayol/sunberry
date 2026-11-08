@@ -13,5 +13,8 @@ lua51-lifter = { path = "../lua51-lifter" }
 luau-lifter = { path = "../luau-lifter" }
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1.42", features = ["rt-multi-thread"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "compression-deflate"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+# decompiling is allocation heavy: ~60% faster than musl's malloc, ~20% faster than glibc's
+mimalloc = { version = "0.1", default-features = false }

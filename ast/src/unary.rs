@@ -409,6 +409,14 @@ impl LocalRw for Unary {
     fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
         self.value.values_read_mut()
     }
+
+    fn push_values_read<'a>(&'a self, out: &mut Vec<&'a RcLocal>) {
+        self.value.push_values_read(out);
+    }
+
+    fn push_values_read_mut<'a>(&'a mut self, out: &mut Vec<&'a mut RcLocal>) {
+        self.value.push_values_read_mut(out);
+    }
 }
 
 impl fmt::Display for Unary {

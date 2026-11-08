@@ -4,13 +4,14 @@ use std::{
 };
 
 use itertools::Itertools;
+use rayon::prelude::*;
 
 use crate::{
     Assign, Binary, BinaryOperation, Block, Call, Class, Closure, GenericFor, If, Index, LValue,
     Literal, MethodCall, NumericFor, RValue, Repeat, Return, Select, Statement, Table, Unary, While,
 };
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub enum IndentationMode {
     Spaces(u8),
     #[default]
@@ -59,6 +60,28 @@ pub struct Formatter<'a, W: fmt::Write> {
     pub(crate) output: &'a mut W,
 }
 
+impl Formatter<'_, String> {
+    // top level statements format independently, so they're done in parallel and
+    // joined exactly like format_block_no_indent writes them
+    pub fn format_parallel(main: &Block, indentation_mode: IndentationMode) -> String {
+        (0..main.len())
+            .into_par_iter()
+            .map(|i| {
+                let mut output = String::new();
+                Formatter {
+                    indentation_level: 0,
+                    indentation_mode,
+                    output: &mut output,
+                }
+                .format_block_statement(main, i)
+                .unwrap();
+                output
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 impl<'a, W: fmt::Write> Formatter<'a, W> {
     pub fn format(
         main: &Block,
@@ -98,64 +121,72 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
     }
 
     fn format_block_no_indent(&mut self, block: &Block) -> fmt::Result {
-        for (i, statement) in block.iter().enumerate() {
+        for i in 0..block.len() {
             if i != 0 {
                 writeln!(self.output)?;
             }
-            self.format_statement(statement)?;
-            if let Some(next_statement) =
-                block.iter().skip(i + 1).find(|s| s.as_comment().is_none())
-            {
-                fn is_ambiguous(r: &RValue) -> bool {
-                    match r {
-                        RValue::Local(_)
-                        | RValue::Global(_)
-                        | RValue::Index(_)
-                        | RValue::Call(_)
-                        | RValue::MethodCall(_)
-                        | RValue::Select(Select::Call(_) | Select::MethodCall(_)) => true,
-                        RValue::Binary(binary) => is_ambiguous(&binary.right),
-                        _ => false,
+            self.format_block_statement(block, i)?;
+        }
+        Ok(())
+    }
+
+    // the statement at `i` plus the `;` it needs when the next one would otherwise
+    // parse as a continuation of it
+    fn format_block_statement(&mut self, block: &Block, i: usize) -> fmt::Result {
+        let statement = &block[i];
+        self.format_statement(statement)?;
+        if let Some(next_statement) =
+            block.iter().skip(i + 1).find(|s| s.as_comment().is_none())
+        {
+            fn is_ambiguous(r: &RValue) -> bool {
+                match r {
+                    RValue::Local(_)
+                    | RValue::Global(_)
+                    | RValue::Index(_)
+                    | RValue::Call(_)
+                    | RValue::MethodCall(_)
+                    | RValue::Select(Select::Call(_) | Select::MethodCall(_)) => true,
+                    RValue::Binary(binary) => is_ambiguous(&binary.right),
+                    _ => false,
+                }
+            }
+
+            let disambiguate = match statement {
+                Statement::Call(_) | Statement::MethodCall(_) => true,
+                Statement::Repeat(repeat) => is_ambiguous(&repeat.condition),
+                Statement::Assign(Assign { right: list, .. })
+                | Statement::Return(Return { values: list }) => {
+                    if let Some(last) = list.last() {
+                        is_ambiguous(last)
+                    } else {
+                        false
                     }
                 }
-
-                let disambiguate = match statement {
-                    Statement::Call(_) | Statement::MethodCall(_) => true,
-                    Statement::Repeat(repeat) => is_ambiguous(&repeat.condition),
-                    Statement::Assign(Assign { right: list, .. })
-                    | Statement::Return(Return { values: list }) => {
-                        if let Some(last) = list.last() {
-                            is_ambiguous(last)
+                Statement::Goto(_) | Statement::Continue(_) | Statement::Break(_) => true,
+                _ => false,
+            };
+            let disambiguate = disambiguate
+                && match next_statement {
+                    Statement::Assign(Assign {
+                        left,
+                        prefix: false,
+                        ..
+                    }) => {
+                        if let Some(index) = left[0].as_index() {
+                            Self::should_wrap_left_rvalue(&index.left)
                         } else {
                             false
                         }
                     }
-                    Statement::Goto(_) | Statement::Continue(_) | Statement::Break(_) => true,
+                    Statement::Call(Call { value, .. })
+                    | Statement::MethodCall(MethodCall { value, .. }) => {
+                        Self::should_wrap_left_rvalue(value)
+                    }
+                    Statement::Comment(_) => unimplemented!(),
                     _ => false,
                 };
-                let disambiguate = disambiguate
-                    && match next_statement {
-                        Statement::Assign(Assign {
-                            left,
-                            prefix: false,
-                            ..
-                        }) => {
-                            if let Some(index) = left[0].as_index() {
-                                Self::should_wrap_left_rvalue(&index.left)
-                            } else {
-                                false
-                            }
-                        }
-                        Statement::Call(Call { value, .. })
-                        | Statement::MethodCall(MethodCall { value, .. }) => {
-                            Self::should_wrap_left_rvalue(value)
-                        }
-                        Statement::Comment(_) => unimplemented!(),
-                        _ => false,
-                    };
-                if disambiguate {
-                    write!(self.output, ";")?;
-                }
+            if disambiguate {
+                write!(self.output, ";")?;
             }
         }
         Ok(())

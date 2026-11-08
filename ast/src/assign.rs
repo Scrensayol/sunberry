@@ -46,19 +46,33 @@ impl SideEffects for Assign {
 
 impl LocalRw for Assign {
     fn values_read(&self) -> Vec<&RcLocal> {
-        self.left
-            .iter()
-            .flat_map(|l| l.values_read())
-            .chain(self.right.iter().flat_map(|r| r.values_read()))
-            .collect()
+        let mut out = Vec::new();
+        self.push_values_read(&mut out);
+        out
     }
 
     fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
-        self.left
-            .iter_mut()
-            .flat_map(|l| l.values_read_mut())
-            .chain(self.right.iter_mut().flat_map(|r| r.values_read_mut()))
-            .collect()
+        let mut out = Vec::new();
+        self.push_values_read_mut(&mut out);
+        out
+    }
+
+    fn push_values_read<'a>(&'a self, out: &mut Vec<&'a RcLocal>) {
+        for l in &self.left {
+            l.push_values_read(out);
+        }
+        for r in &self.right {
+            r.push_values_read(out);
+        }
+    }
+
+    fn push_values_read_mut<'a>(&'a mut self, out: &mut Vec<&'a mut RcLocal>) {
+        for l in &mut self.left {
+            l.push_values_read_mut(out);
+        }
+        for r in &mut self.right {
+            r.push_values_read_mut(out);
+        }
     }
 
     fn values_written(&self) -> Vec<&RcLocal> {

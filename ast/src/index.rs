@@ -23,19 +23,25 @@ impl Index {
 
 impl LocalRw for Index {
     fn values_read(&self) -> Vec<&RcLocal> {
-        self.left
-            .values_read()
-            .into_iter()
-            .chain(self.right.values_read())
-            .collect()
+        let mut out = Vec::new();
+        self.push_values_read(&mut out);
+        out
     }
 
     fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
-        self.left
-            .values_read_mut()
-            .into_iter()
-            .chain(self.right.values_read_mut())
-            .collect()
+        let mut out = Vec::new();
+        self.push_values_read_mut(&mut out);
+        out
+    }
+
+    fn push_values_read<'a>(&'a self, out: &mut Vec<&'a RcLocal>) {
+        self.left.push_values_read(out);
+        self.right.push_values_read(out);
+    }
+
+    fn push_values_read_mut<'a>(&'a mut self, out: &mut Vec<&'a mut RcLocal>) {
+        self.left.push_values_read_mut(out);
+        self.right.push_values_read_mut(out);
     }
 }
 

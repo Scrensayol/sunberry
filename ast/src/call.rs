@@ -45,19 +45,29 @@ impl Traverse for Call {
 
 impl LocalRw for Call {
     fn values_read(&self) -> Vec<&RcLocal> {
-        self.value
-            .values_read()
-            .into_iter()
-            .chain(self.arguments.iter().flat_map(|r| r.values_read()))
-            .collect()
+        let mut out = Vec::new();
+        self.push_values_read(&mut out);
+        out
     }
 
     fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
-        self.value
-            .values_read_mut()
-            .into_iter()
-            .chain(self.arguments.iter_mut().flat_map(|r| r.values_read_mut()))
-            .collect()
+        let mut out = Vec::new();
+        self.push_values_read_mut(&mut out);
+        out
+    }
+
+    fn push_values_read<'a>(&'a self, out: &mut Vec<&'a RcLocal>) {
+        self.value.push_values_read(out);
+        for argument in &self.arguments {
+            argument.push_values_read(out);
+        }
+    }
+
+    fn push_values_read_mut<'a>(&'a mut self, out: &mut Vec<&'a mut RcLocal>) {
+        self.value.push_values_read_mut(out);
+        for argument in &mut self.arguments {
+            argument.push_values_read_mut(out);
+        }
     }
 }
 
@@ -109,19 +119,29 @@ impl Traverse for MethodCall {
 
 impl LocalRw for MethodCall {
     fn values_read(&self) -> Vec<&RcLocal> {
-        self.value
-            .values_read()
-            .into_iter()
-            .chain(self.arguments.iter().flat_map(|r| r.values_read()))
-            .collect()
+        let mut out = Vec::new();
+        self.push_values_read(&mut out);
+        out
     }
 
     fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
-        self.value
-            .values_read_mut()
-            .into_iter()
-            .chain(self.arguments.iter_mut().flat_map(|r| r.values_read_mut()))
-            .collect()
+        let mut out = Vec::new();
+        self.push_values_read_mut(&mut out);
+        out
+    }
+
+    fn push_values_read<'a>(&'a self, out: &mut Vec<&'a RcLocal>) {
+        self.value.push_values_read(out);
+        for argument in &self.arguments {
+            argument.push_values_read(out);
+        }
+    }
+
+    fn push_values_read_mut<'a>(&'a mut self, out: &mut Vec<&'a mut RcLocal>) {
+        self.value.push_values_read_mut(out);
+        for argument in &mut self.arguments {
+            argument.push_values_read_mut(out);
+        }
     }
 }
 
