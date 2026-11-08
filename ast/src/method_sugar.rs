@@ -1,4 +1,5 @@
 use itertools::Either;
+use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
 use crate::{
@@ -13,9 +14,24 @@ use crate::{
 // the function either sits on a class table (`X.__index = X`) or its name is called
 // with `:` somewhere in the script.
 pub fn method_sugar(block: &mut Block) {
-    let mut facts = Facts::default();
-    collect_facts(block, &mut facts);
-    mark_methods(block, &facts, &mut Vec::new());
+    // top level statements are separate subtrees, so both passes run over them in parallel
+    let facts = block
+        .0
+        .par_iter_mut()
+        .map(|statement| {
+            let mut facts = Facts::default();
+            collect_facts(statement, &mut facts);
+            facts
+        })
+        .reduce(Facts::default, |mut a, b| {
+            a.called_methods.extend(b.called_methods);
+            a.class_tables.extend(b.class_tables);
+            a
+        });
+    block
+        .0
+        .par_iter_mut()
+        .for_each(|statement| mark_methods(statement, &facts, &mut Vec::new()));
 }
 
 #[derive(Default)]
@@ -33,33 +49,37 @@ enum Node<'a> {
 // it, and on every value inside those statements, in one traversal
 fn walk(block: &mut Block, f: &mut impl FnMut(Node<'_>)) {
     for statement in &mut block.0 {
-        f(Node::Statement(statement));
-        statement.post_traverse_values(&mut |value| -> Option<()> {
-            f(Node::Value(match &value {
-                Either::Left(lvalue) => Either::Left(&**lvalue),
-                Either::Right(rvalue) => Either::Right(&**rvalue),
-            }));
-            if let Either::Right(RValue::Closure(closure)) = value {
-                walk(&mut closure.function.lock().body, f);
-            }
-            None
-        });
-        match statement {
-            Statement::If(r#if) => {
-                walk(&mut r#if.then_block.lock(), f);
-                walk(&mut r#if.else_block.lock(), f);
-            }
-            Statement::While(r#while) => walk(&mut r#while.block.lock(), f),
-            Statement::Repeat(repeat) => walk(&mut repeat.block.lock(), f),
-            Statement::NumericFor(numeric_for) => walk(&mut numeric_for.block.lock(), f),
-            Statement::GenericFor(generic_for) => walk(&mut generic_for.block.lock(), f),
-            _ => {}
-        }
+        walk_statement(statement, f);
     }
 }
 
-fn collect_facts(block: &mut Block, facts: &mut Facts) {
-    walk(block, &mut |node| match node {
+fn walk_statement(statement: &mut Statement, f: &mut impl FnMut(Node<'_>)) {
+    f(Node::Statement(statement));
+    statement.post_traverse_values(&mut |value| -> Option<()> {
+        f(Node::Value(match &value {
+            Either::Left(lvalue) => Either::Left(&**lvalue),
+            Either::Right(rvalue) => Either::Right(&**rvalue),
+        }));
+        if let Either::Right(RValue::Closure(closure)) = value {
+            walk(&mut closure.function.lock().body, f);
+        }
+        None
+    });
+    match statement {
+        Statement::If(r#if) => {
+            walk(&mut r#if.then_block.lock(), f);
+            walk(&mut r#if.else_block.lock(), f);
+        }
+        Statement::While(r#while) => walk(&mut r#while.block.lock(), f),
+        Statement::Repeat(repeat) => walk(&mut repeat.block.lock(), f),
+        Statement::NumericFor(numeric_for) => walk(&mut numeric_for.block.lock(), f),
+        Statement::GenericFor(generic_for) => walk(&mut generic_for.block.lock(), f),
+        _ => {}
+    }
+}
+
+fn collect_facts(statement: &mut Statement, facts: &mut Facts) {
+    walk_statement(statement, &mut |node| match node {
         Node::Statement(Statement::MethodCall(call))
         | Node::Value(Either::Right(
             RValue::MethodCall(call) | RValue::Select(Select::MethodCall(call)),
@@ -109,59 +129,63 @@ fn references_any(block: &mut Block, locals: &[RcLocal]) -> bool {
     found
 }
 
-// `selfs` holds the self of every method we're currently inside of
-fn mark_methods(block: &mut Block, facts: &Facts, selfs: &mut Vec<RcLocal>) {
+fn mark_methods_in(block: &mut Block, facts: &Facts, selfs: &mut Vec<RcLocal>) {
     for statement in &mut block.0 {
-        if let Statement::Assign(assign) = statement
-            && let [LValue::Index(index)] = assign.left.as_slice()
-            && let [RValue::Closure(closure)] = assign.right.as_slice()
-            && let RValue::Literal(Literal::String(key)) = index.right.as_ref()
-            && Formatter::<String>::is_valid_name(key)
-        {
-            let mut function = closure.function.lock();
-            let Some(first) = function.parameters.first().cloned() else {
-                continue;
-            };
-            let named_self = first.0 .0.lock().0.as_deref() == Some("self");
-            let looks_like_method = || {
-                facts.class_tables.contains(&index.left)
-                    || facts
-                        .called_methods
-                        .contains(String::from_utf8_lossy(key).as_ref())
-            };
-            // an outer self used in here would be shadowed by this one
-            if (named_self || looks_like_method() && used_as_object(&mut function.body, &first))
-                && (selfs.is_empty() || !references_any(&mut function.body, selfs))
-            {
-                function.is_method = true;
-                first.0 .0.lock().0 = Some("self".to_string());
-                selfs.push(first);
-                mark_methods(&mut function.body, facts, selfs);
-                selfs.pop();
-                continue;
-            }
-        }
+        mark_methods(statement, facts, selfs);
+    }
+}
 
-        statement.post_traverse_values(&mut |value| -> Option<()> {
-            if let Either::Right(RValue::Closure(closure)) = value {
-                mark_methods(&mut closure.function.lock().body, facts, selfs);
-            }
-            None
-        });
-        match statement {
-            Statement::If(r#if) => {
-                mark_methods(&mut r#if.then_block.lock(), facts, selfs);
-                mark_methods(&mut r#if.else_block.lock(), facts, selfs);
-            }
-            Statement::While(r#while) => mark_methods(&mut r#while.block.lock(), facts, selfs),
-            Statement::Repeat(repeat) => mark_methods(&mut repeat.block.lock(), facts, selfs),
-            Statement::NumericFor(numeric_for) => {
-                mark_methods(&mut numeric_for.block.lock(), facts, selfs)
-            }
-            Statement::GenericFor(generic_for) => {
-                mark_methods(&mut generic_for.block.lock(), facts, selfs)
-            }
-            _ => {}
+// `selfs` holds the self of every method we're currently inside of
+fn mark_methods(statement: &mut Statement, facts: &Facts, selfs: &mut Vec<RcLocal>) {
+    if let Statement::Assign(assign) = statement
+        && let [LValue::Index(index)] = assign.left.as_slice()
+        && let [RValue::Closure(closure)] = assign.right.as_slice()
+        && let RValue::Literal(Literal::String(key)) = index.right.as_ref()
+        && Formatter::<String>::is_valid_name(key)
+    {
+        let mut function = closure.function.lock();
+        let Some(first) = function.parameters.first().cloned() else {
+            return;
+        };
+        let named_self = first.0 .0.lock().0.as_deref() == Some("self");
+        let looks_like_method = || {
+            facts.class_tables.contains(&index.left)
+                || facts
+                    .called_methods
+                    .contains(String::from_utf8_lossy(key).as_ref())
+        };
+        // an outer self used in here would be shadowed by this one
+        if (named_self || looks_like_method() && used_as_object(&mut function.body, &first))
+            && (selfs.is_empty() || !references_any(&mut function.body, selfs))
+        {
+            function.is_method = true;
+            first.0 .0.lock().0 = Some("self".to_string());
+            selfs.push(first);
+            mark_methods_in(&mut function.body, facts, selfs);
+            selfs.pop();
+            return;
         }
+    }
+
+    statement.post_traverse_values(&mut |value| -> Option<()> {
+        if let Either::Right(RValue::Closure(closure)) = value {
+            mark_methods_in(&mut closure.function.lock().body, facts, selfs);
+        }
+        None
+    });
+    match statement {
+        Statement::If(r#if) => {
+            mark_methods_in(&mut r#if.then_block.lock(), facts, selfs);
+            mark_methods_in(&mut r#if.else_block.lock(), facts, selfs);
+        }
+        Statement::While(r#while) => mark_methods_in(&mut r#while.block.lock(), facts, selfs),
+        Statement::Repeat(repeat) => mark_methods_in(&mut repeat.block.lock(), facts, selfs),
+        Statement::NumericFor(numeric_for) => {
+            mark_methods_in(&mut numeric_for.block.lock(), facts, selfs)
+        }
+        Statement::GenericFor(generic_for) => {
+            mark_methods_in(&mut generic_for.block.lock(), facts, selfs)
+        }
+        _ => {}
     }
 }
