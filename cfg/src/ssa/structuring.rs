@@ -29,6 +29,8 @@ impl From<PatternOperator> for ast::BinaryOperation {
     }
 }
 
+// some matched pieces are only kept for Debug output when tracing structuring
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct ConditionalAssignmentPattern {
     assigner: NodeIndex,
@@ -40,8 +42,6 @@ pub struct ConditionalAssignmentPattern {
     operator: PatternOperator,
 }
 
-type ConditionalSequenceConfiguration = (bool, bool);
-
 #[derive(Debug)]
 pub struct ConditionalSequencePattern {
     first_node: NodeIndex,
@@ -52,6 +52,7 @@ pub struct ConditionalSequencePattern {
     final_condition: ast::RValue,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct GenericForNextPattern {
     body_node: NodeIndex,

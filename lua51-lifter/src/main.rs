@@ -8,8 +8,6 @@ use std::{
 
 use clap::Parser;
 
-mod lifter;
-
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;

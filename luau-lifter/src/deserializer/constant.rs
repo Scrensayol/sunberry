@@ -22,6 +22,8 @@ const CONSTANT_CLASS_SHAPE: u8 = 10;
 const CONSTANT_VECTORD: u8 = 11;
 
 #[derive(Debug)]
+// parsed in full so the reader stays aligned, not every field is used yet
+#[allow(dead_code)]
 pub enum Constant {
     Nil,
     Boolean(bool),

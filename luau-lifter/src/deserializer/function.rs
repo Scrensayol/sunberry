@@ -33,10 +33,15 @@ pub struct Function {
     pub instructions: Vec<Instruction>,
     pub constants: Vec<Constant>,
     pub functions: Vec<usize>,
+    // line info is parsed but not used yet
+    #[allow(dead_code)]
     pub line_defined: usize,
     pub function_name: usize,
+    #[allow(dead_code)]
     pub line_gap_log2: Option<u8>,
+    #[allow(dead_code)]
     pub line_info_delta: Option<Vec<u8>>,
+    #[allow(dead_code)]
     pub abs_line_info_delta: Option<Vec<u32>>,
     pub locals: Vec<LocalVariable>,
 }
