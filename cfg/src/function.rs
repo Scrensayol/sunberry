@@ -1,5 +1,6 @@
 use ast::{LocalRw, RcLocal};
 use contracts::requires;
+use rustc_hash::FxHashMap;
 
 use petgraph::{
     stable_graph::{EdgeReference, Neighbors, NodeIndex, StableDiGraph},
@@ -15,6 +16,12 @@ pub struct Function {
     pub name: Option<String>,
     pub parameters: Vec<RcLocal>,
     pub is_variadic: bool,
+    // debug names for the locals written by the statement at (block, index),
+    // consumed by SSA construction when it gives each write its own local
+    pub debug_names: FxHashMap<(NodeIndex, usize), Vec<(RcLocal, String)>>,
+    // debug names for a local live on entry to a block, for the block params
+    // SSA construction creates where definitions merge
+    pub debug_param_names: FxHashMap<(NodeIndex, RcLocal), String>,
     graph: StableDiGraph<ast::Block, BlockEdge>,
     entry: Option<NodeIndex>,
 }
@@ -26,6 +33,8 @@ impl Function {
             name: None,
             parameters: Vec::new(),
             is_variadic: false,
+            debug_names: FxHashMap::default(),
+            debug_param_names: FxHashMap::default(),
             graph: StableDiGraph::new(),
             entry: None,
         }

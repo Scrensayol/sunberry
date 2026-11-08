@@ -12,6 +12,17 @@ use super::{
 
 use crate::{instruction::*, op_code::OpCode};
 
+// A local's debug record (debug level 2): its name lives in `register` from
+// `start_pc`, the instruction after the one that initialises it, up to but not
+// including `end_pc`.
+#[derive(Debug)]
+pub struct LocalVariable {
+    pub name: usize,
+    pub start_pc: usize,
+    pub end_pc: usize,
+    pub register: u8,
+}
+
 #[derive(Debug)]
 pub struct Function {
     pub max_stack_size: u8,
@@ -27,6 +38,7 @@ pub struct Function {
     pub line_gap_log2: Option<u8>,
     pub line_info_delta: Option<Vec<u8>>,
     pub abs_line_info_delta: Option<Vec<u32>>,
+    pub locals: Vec<LocalVariable>,
 }
 
 impl Function {
@@ -166,17 +178,26 @@ impl Function {
                 (input, Some(abs_line_info_delta))
             }
         };
+        let mut locals = Vec::new();
         let input = match le_u8(input)? {
             (input, 0) => input,
             (input, _) => {
-                panic!("we have debug info");
                 let (mut input, num_locvars) = leb128_usize(input)?;
+                locals.reserve(num_locvars);
                 for _ in 0..num_locvars {
-                    (input, _) = leb128_usize(input)?;
-                    (input, _) = leb128_usize(input)?;
-                    (input, _) = leb128_usize(input)?;
-                    (input, _) = le_u8(input)?;
+                    let (name, start_pc, end_pc, register);
+                    (input, name) = leb128_usize(input)?;
+                    (input, start_pc) = leb128_usize(input)?;
+                    (input, end_pc) = leb128_usize(input)?;
+                    (input, register) = le_u8(input)?;
+                    locals.push(LocalVariable {
+                        name,
+                        start_pc,
+                        end_pc,
+                        register,
+                    });
                 }
+                // upvalue names, the parent's locals already carry them
                 let (mut input, num_upvalues) = leb128_usize(input)?;
                 for _ in 0..num_upvalues {
                     (input, _) = leb128_usize(input)?;
@@ -227,6 +248,7 @@ impl Function {
                 line_gap_log2,
                 line_info_delta,
                 abs_line_info_delta,
+                locals,
             },
         ))
     }

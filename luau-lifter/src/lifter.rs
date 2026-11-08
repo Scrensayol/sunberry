@@ -15,7 +15,7 @@ use super::{
     instruction::Instruction,
     op_code::OpCode,
 };
-use ast::{self};
+use ast::{self, LocalRw};
 use cfg::{
     block::{BlockEdge, BranchType},
     function::Function,
@@ -96,7 +96,12 @@ impl<'a> Lifter<'a> {
         }
 
         for i in 0..self.function_list[self.function.id].num_parameters {
-            let parameter = ast::RcLocal::default();
+            let name = self.function_list[self.function.id]
+                .locals
+                .iter()
+                .find(|l| l.register == i && l.start_pc == 0)
+                .and_then(|l| self.string(l.name));
+            let parameter = ast::RcLocal::new(ast::Local::new(name));
             self.function.parameters.push(parameter.clone());
             self.register_map.insert(i as usize, parameter);
         }
@@ -110,6 +115,8 @@ impl<'a> Lifter<'a> {
             block.0.extend(statements);
             self.function.set_edges(self.current_node.unwrap(), edges);
         }
+
+        self.record_debug_param_names();
 
         let entry_node = self.function.new_block();
         self.function.set_edges(
@@ -258,6 +265,7 @@ impl<'a> Lifter<'a> {
             .enumerate();
 
         while let Some((index, instruction)) = iter.next() {
+            let statement_count = statements.len();
             match *instruction {
                 Instruction::BC {
                     op_code,
@@ -1452,6 +1460,14 @@ impl<'a> Lifter<'a> {
                     _ => unreachable!("{:?}", instruction),
                 },
             }
+
+            // some opcodes consume the instructions after them, the write
+            // happens at the last one
+            let pc = iter
+                .clone()
+                .next()
+                .map_or(block_end, |(i, _)| block_start + i - 1);
+            self.record_debug_names(&statements, statement_count, pc);
         }
 
         let last_index = iter
@@ -1473,6 +1489,94 @@ impl<'a> Lifter<'a> {
         }
 
         (statements, edges)
+    }
+
+    fn string(&self, index: usize) -> Option<String> {
+        let bytes = self.string_table.get(index.checked_sub(1)?)?;
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    // Matches each register written by statements[from..] against the debug
+    // locals, so SSA construction can name the local it creates for that write.
+    // A local's range starts where the value it was initialised with becomes
+    // visible: past the AUX slots after the write, or for loop variables at the
+    // top of the loop body.
+    fn record_debug_names(&mut self, statements: &[ast::Statement], from: usize, pc: usize) {
+        let locals = &self.function_list[self.function.id].locals;
+        if locals.is_empty() {
+            return;
+        }
+        let instructions = &self.function_list[self.function.id].instructions;
+        let skip_aux = |mut pc: usize| {
+            while let Some(Instruction::BC {
+                op_code: OpCode::LOP_NOP,
+                ..
+            }) = instructions.get(pc)
+            {
+                pc += 1;
+            }
+            pc
+        };
+        let next = skip_aux(pc + 1);
+        let mut visible = vec![next];
+        if let Instruction::AD {
+            op_code: OpCode::LOP_FORGLOOP | OpCode::LOP_FORNLOOP,
+            d,
+            ..
+        } = instructions[pc]
+        {
+            visible.push((pc as isize + 1 + d as isize) as usize);
+        }
+        if let Some(Instruction::AD {
+            op_code:
+                OpCode::LOP_FORNPREP
+                | OpCode::LOP_FORGPREP
+                | OpCode::LOP_FORGPREP_INEXT
+                | OpCode::LOP_FORGPREP_NEXT,
+            ..
+        }) = instructions.get(next)
+        {
+            visible.push(next + 1);
+        }
+        let node = self.current_node.unwrap();
+        for (index, statement) in statements.iter().enumerate().skip(from) {
+            let names = statement
+                .values_written()
+                .into_iter()
+                .filter_map(|local| {
+                    let (&register, _) = self.register_map.iter().find(|(_, l)| *l == local)?;
+                    let debug_local = locals.iter().find(|l| {
+                        l.register as usize == register
+                            && visible.iter().any(|&v| l.start_pc <= v && v < l.end_pc)
+                    })?;
+                    Some((local.clone(), self.string(debug_local.name)?))
+                })
+                .collect::<Vec<_>>();
+            if !names.is_empty() {
+                self.function.debug_names.insert((node, index), names);
+            }
+        }
+    }
+
+    // Names every register a debug local covers at the start of each block, so a
+    // block param that merges its definitions keeps the name.
+    fn record_debug_param_names(&mut self) {
+        let locals = &self.function_list[self.function.id].locals;
+        for (&start_pc, &node) in &self.blocks {
+            for local in locals
+                .iter()
+                .filter(|l| l.start_pc <= start_pc && start_pc < l.end_pc)
+            {
+                let Some(register) = self.register_map.get(&(local.register as usize)) else {
+                    continue;
+                };
+                if let Some(name) = self.string(local.name) {
+                    self.function
+                        .debug_param_names
+                        .insert((node, register.clone()), name);
+                }
+            }
+        }
     }
 
     fn register(&mut self, index: usize) -> ast::RcLocal {

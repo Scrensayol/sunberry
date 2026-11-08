@@ -351,6 +351,29 @@ impl<'a> SsaConstructor<'a> {
         same
     }
 
+    // The block param for `local` on entry to `node`, named after the debug local
+    // covering it there, if any.
+    fn param_local(&self, node: NodeIndex, local: &RcLocal) -> RcLocal {
+        let name = self
+            .function
+            .debug_param_names
+            .get(&(node, local.clone()))
+            .cloned();
+        RcLocal::new(ast::Local::new(name))
+    }
+
+    // The fresh local for a write to `local` by the statement at (node, stat_index),
+    // carrying the debug name the lifter recorded for it, if any.
+    fn defined_local(&self, node: NodeIndex, stat_index: usize, local: &RcLocal) -> RcLocal {
+        let name = self
+            .function
+            .debug_names
+            .get(&(node, stat_index))
+            .and_then(|names| names.iter().find(|(l, _)| l == local))
+            .map(|(_, name)| name.clone());
+        RcLocal::new(ast::Local::new(name))
+    }
+
     fn find_local(&mut self, node: NodeIndex, local: &RcLocal) -> RcLocal {
         let res = if let Some(new_local) = self
             .current_definition
@@ -363,7 +386,7 @@ impl<'a> SsaConstructor<'a> {
             // search globally
             if !self.sealed_blocks.contains(&node) {
                 // TODO: this code is repeated multiple times, create new_local function
-                let param_local = RcLocal::default();
+                let param_local = self.param_local(node, local);
                 self.old_locals.insert(param_local.clone(), local.clone());
                 if let Some(upvalues) = self.new_upvalues_in.get_mut(local) {
                     upvalues.insert(param_local.clone());
@@ -377,7 +400,7 @@ impl<'a> SsaConstructor<'a> {
             } else if let Ok(pred) = self.function.predecessor_blocks(node).exactly_one() {
                 self.find_local(pred, local)
             } else {
-                let param_local = RcLocal::default();
+                let param_local = self.param_local(node, local);
                 self.old_locals.insert(param_local.clone(), local.clone());
                 if let Some(upvalues) = self.new_upvalues_in.get_mut(local) {
                     upvalues.insert(param_local.clone());
@@ -523,7 +546,7 @@ impl<'a> SsaConstructor<'a> {
                     && let Some(local) = assign.left[0].as_local().cloned()
                     && assign.right[0].as_closure().is_some()
                 {
-                    let new_local = RcLocal::default();
+                    let new_local = self.defined_local(node, stat_index, &local);
                     self.old_locals.insert(new_local.clone(), local.clone());
                     if let Some(upvalues) = self.new_upvalues_in.get_mut(&local) {
                         upvalues.insert(new_local.clone());
@@ -549,7 +572,7 @@ impl<'a> SsaConstructor<'a> {
                     self.read(node, stat_index);
                     // write
                     for (local_index, local) in written.iter().enumerate() {
-                        let new_local = RcLocal::default();
+                        let new_local = self.defined_local(node, stat_index, local);
                         self.old_locals.insert(new_local.clone(), local.clone());
                         if let Some(upvalues) = self.new_upvalues_in.get_mut(local) {
                             upvalues.insert(new_local.clone());
@@ -606,7 +629,13 @@ impl<'a> SsaConstructor<'a> {
         // TODO: this is a bit meh, maybe we should have an argument rvalue
         if let Some(mut incomplete_params) = self.incomplete_params.remove(&entry) {
             for param in &mut self.function.parameters {
-                *param = incomplete_params.remove(param).unwrap_or_default();
+                let new_param = incomplete_params.remove(param).unwrap_or_default();
+                // keep the debug name the lifter gave the parameter
+                let name = param.0 .0.lock().0.clone();
+                if new_param.0 .0.lock().0.is_none() {
+                    new_param.0 .0.lock().0 = name;
+                }
+                *param = new_param;
             }
         }
         assert!(self.incomplete_params.is_empty());

@@ -242,6 +242,11 @@ impl<'a> Destructor<'a> {
         for (local, con_class) in &self.congruence_classes {
             let con_class = con_class.borrow();
             let new_local = con_class.iter().next().unwrap().1;
+            // the class becomes one local, keep a debug name if any member had one
+            if new_local.0 .0.lock().0.is_none() {
+                let name = con_class.iter().find_map(|(_, l)| l.0 .0.lock().0.clone());
+                new_local.0 .0.lock().0 = name;
+            }
             // TODO: see apply_local_map TODO,
             // we dont want to handle this here
             if local != new_local {
