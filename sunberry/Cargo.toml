@@ -1,9 +1,9 @@
 [package]
-name = "medal"
-version = "0.2.0"
+name = "sunberry"
+version = "0.3.0"
 edition.workspace = true
 authors.workspace = true
-default-run = "medal"
+default-run = "sunberry"
 
 [dependencies]
 axum = "0.8"

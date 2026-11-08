@@ -8,7 +8,7 @@ members = [
     "luau-lifter",
     "restructure",
     "luau-worker",
-    "medal",
+    "sunberry",
 ]
 
 [workspace.package]
