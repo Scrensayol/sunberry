@@ -1,0 +1,22 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # the toolchain comes from rust-toolchain, rustup installs it on first use
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release -p sunberry -p lua51-lifter
+
+      - name: Test
+        run: cargo test --release -p ast -p cfg -p restructure -p luau-lifter
