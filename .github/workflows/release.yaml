@@ -25,7 +25,7 @@ jobs:
             echo "::error::$tag already has a release, bump the version in sunberry/Cargo.toml first"
             exit 1
           fi
-          gh release create "$tag" --draft --title "sunberry $version" --notes "" \
+          gh release create "$tag" --draft --title "sunberry $tag" --notes-file .github/release-template.md \
             --target "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
     outputs:
