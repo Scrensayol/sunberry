@@ -1,6 +1,39 @@
 # Sunberry
 
-A fast Luau decompiler that runs happily on a Raspberry Pi. Forked from [shiny](https://github.com/ActualMasterOogway/shiny), which is forked from [medal](https://github.com/shrimp-nz/medal).
+A fast Luau decompiler built for Linux on ARM64: Raspberry Pis, ARM single-board computers and ARM servers. It ships as one static binary with nothing to install, and `sunberry serve` turns a Pi on your network into a decompile server your executor can call. Forked from [shiny](https://github.com/ActualMasterOogway/shiny), which is forked from [medal](https://github.com/shrimp-nz/medal).
+
+## Downloads
+
+Every release has two Linux ARM64 builds. Both are statically linked, so they run on any distribution as long as the OS is 64-bit (on a Raspberry Pi, that means the 64-bit Raspberry Pi OS).
+
+| File | Runs on |
+| --- | --- |
+| `sunberry-linux-arm64-universal` | Any 64-bit ARM Linux machine: Raspberry Pi 3, 4, 5 and Zero 2 W, other boards, ARM servers |
+| `sunberry-linux-arm64-rpi5` | Raspberry Pi 5 only. It's compiled for the Pi 5's Cortex-A76 cores and stops with "Illegal instruction" on anything older |
+
+Both decompile to exactly the same output. Use the Pi 5 build on a Pi 5 and the universal one everywhere else.
+
+Builds for x86_64 Linux, Windows and macOS are still published, but ARM64 Linux is what Sunberry is built and benchmarked for.
+
+To run it as a service on a Pi, so it starts on boot and restarts if it crashes:
+
+```bash
+mkdir -p ~/sunberry ~/.config/systemd/user
+install -m 755 sunberry-linux-arm64-rpi5 ~/sunberry/sunberry
+cat > ~/.config/systemd/user/sunberry.service << 'EOF'
+[Unit]
+Description=Sunberry decompile server
+
+[Service]
+ExecStart=%h/sunberry/sunberry serve --port 3000
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+EOF
+systemctl --user enable --now sunberry
+sudo loginctl enable-linger "$USER"   # keep it running while you're logged out
+```
 
 ## What's different from shiny
 
@@ -61,7 +94,7 @@ This never changes behaviour, since `function X:m()` is exactly `X.m = function(
 
 **Smaller things:** `x = x + 1` prints as `x += 1`, `("a %*"):format(b)` turns back into `` `a {b}` ``, identifier table keys drop the brackets (`{ kind = "x" }`), and constructors name their object `self`.
 
-**Output that compiles, and means the same thing.** Of 33,514 scripts dumped from a Roblox game, shiny decompiles 421 to code that doesn't compile: an empty function's `-- name:` comment swallows its `end`, a function declares more than the 200 locals Luau allows, or the output uses `goto`, which Luau doesn't have. Sunberry compiles all of them. A function that can't be structured without a `goto` gets its smallest unstructurable region written as a state machine instead. Shiny also gets some common loops wrong without any error: a loop that stores what it found and breaks loses the `break`, so it keeps going and ends up with the last match. A local written in a loop and read after it could end up declared inside the loop. Sunberry fixes both.
+**Output that compiles, and means the same thing.** All 33,514 scripts in a dump from a Roblox game decompile to code that compiles. Luau has no `goto`, so a function that can't be structured without a `goto` gets its smallest unstructurable region written as a state machine instead. Shiny gets some common loops wrong without any error: a loop that stores what it found and breaks loses the `break`, so it keeps going and ends up with the last match. A local written in a loop and read after it could end up declared inside the loop. Sunberry fixes both.
 
 **Deterministic output.** The same bytecode always decompiles to the same text, at any thread count. In shiny, some statement order depended on memory addresses.
 
@@ -92,11 +125,34 @@ sunberry serve --port 3000                           # listens on all interfaces
 
 ## Building
 
-The workspace needs nightly Rust (see `rust-toolchain`) and a C compiler for mimalloc.
+The workspace needs nightly Rust (see `rust-toolchain`, which rustup picks up by itself) and a C compiler for mimalloc.
+
+### On the ARM64 machine itself
 
 ```bash
-cargo build --release -p sunberry
+cargo build --release -p sunberry                                   # runs on this machine
+RUSTFLAGS="-C target-cpu=native" cargo build --release -p sunberry  # tuned for this CPU
 ```
+
+This links against the system's glibc. For a static binary like the release ones, cross-compile instead.
+
+### Cross-compiling from x86_64
+
+```bash
+rustup target add aarch64-unknown-linux-musl
+# mimalloc needs a C compiler for aarch64 musl, e.g. a wrapper script that runs
+# `zig cc -target aarch64-linux-musl "$@"` (drop the --target=... flag cargo passes)
+export CC_aarch64_unknown_linux_musl=/path/to/that/wrapper
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+
+# universal
+cargo build --release -p sunberry --target aarch64-unknown-linux-musl
+# Raspberry Pi 5
+RUSTFLAGS="-C target-cpu=cortex-a76" \
+cargo build --release -p sunberry --target aarch64-unknown-linux-musl
+```
+
+`qemu-aarch64-static` runs either one on the build machine, which is a quick check before copying it over. Add `-cpu cortex-a53` to check that the universal build runs on the oldest ARMv8 cores.
 
 ### Testing
 
@@ -111,26 +167,11 @@ To check a change against real scripts, dump some bytecode to a folder and compa
 scripts/regress.sh old/sunberry target/release/sunberry path/to/bytecode
 ```
 
-### Raspberry Pi
-
-Release builds include `sunberry-aarch64-linux-musl`, a static binary that runs on any 64-bit Raspberry Pi OS. To build one tuned for a Pi 5 yourself, cross-compile from a desktop:
-
-```bash
-rustup target add aarch64-unknown-linux-musl
-# mimalloc needs a C compiler for aarch64 musl, e.g. a wrapper script that runs
-# `zig cc -target aarch64-linux-musl "$@"` (drop the --target=... flag cargo passes)
-export CC_aarch64_unknown_linux_musl=/path/to/that/wrapper
-RUSTFLAGS="-C target-cpu=cortex-a76" \
-CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
-cargo build --release -p sunberry --target aarch64-unknown-linux-musl
-```
-
-Drop `target-cpu=cortex-a76` for a binary that also runs on a Pi 4.
-
 ## Script
 
 When using `sunberry serve`, you can use the decompiler directly inside of your executor.
 These scripts assume you are self-hosting the decompiler.
+When it runs on a Pi or another machine on your network, replace `http://localhost:3000` with that machine's address, such as `http://192.168.1.50:3000`. `serve` listens on all interfaces, so nothing else needs setting up.
 If you are using some sort of API, make sure to replace `http://localhost:3000` or `http://10.0.2.2:3000` with the correct API base.
 
 ### Windows

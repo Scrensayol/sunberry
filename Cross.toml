@@ -1,0 +1,4 @@
+# The release workflow builds arm64 through cross, and the Pi 5 build passes its CPU tuning
+# in RUSTFLAGS, which has to reach the build inside the container.
+[build.env]
+passthrough = ["RUSTFLAGS"]

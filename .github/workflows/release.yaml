@@ -41,18 +41,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux arm64, the main targets. universal runs on any ARMv8-A CPU, the Pi 5 build
+          # uses its Cortex-A76's instructions and won't start on older cores
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact_name: sunberry-linux-arm64-universal
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact_name: sunberry-linux-arm64-rpi5
+            rustflags: "-C target-cpu=cortex-a76"
+
+          # Linux x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact_name: sunberry-x86_64-linux-musl
+
           # Windows
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: sunberry-x86_64.exe
-
-          # Linux
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            artifact_name: sunberry-x86_64-linux-musl
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            artifact_name: sunberry-aarch64-linux-musl
 
           # macOS
           - os: macos-latest
@@ -69,9 +76,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
+          key: ${{ matrix.artifact_name }}
 
       - name: Build binary
         uses: houseabsolute/actions-rust-cross@v0
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         with:
           command: "build"
           target: ${{ matrix.target }}
