@@ -291,6 +291,7 @@ fn decompile_function(
     let outer_locals = upvalues_in.iter().chain(params.iter()).cloned().collect();
     let block: Arc<Mutex<ast::Block>> =
         Arc::new(restructure::lift(function, FxHashSet::clone(&outer_locals)).into());
+    ast::escaping_counters::split_escaping_counters(&mut block.lock());
     ast::fold_classes::fold_classes(&mut block.lock());
     LocalDeclarer::default().declare_locals(
         // TODO: why does block.clone() not work?

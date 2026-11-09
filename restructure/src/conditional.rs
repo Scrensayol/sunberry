@@ -29,9 +29,11 @@ impl GraphStructurer {
             && let Some(else_return) = else_return
         {
             if then_return.values.is_empty() && else_return.values.is_empty() {
+                // both return, so the return goes after the if. leaving it out would only
+                // be right at the end of the function, inside a loop body it would continue
                 then_block.pop();
                 else_block.pop();
-                None
+                Some(vec![ast::Return::new(Vec::new()).into()].into())
             } else if !then_return.values.is_empty() && else_return.values.is_empty() {
                 Some(std::mem::take(&mut else_block))
             } else if then_return.values.is_empty() && !else_return.values.is_empty() {

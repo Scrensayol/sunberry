@@ -20,6 +20,7 @@ pub mod fold_classes;
 mod r#continue;
 mod r#for;
 pub mod dominators;
+pub mod escaping_counters;
 pub mod formatter;
 mod global;
 mod goto;

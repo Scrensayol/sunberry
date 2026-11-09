@@ -1,5 +1,5 @@
 use array_tool::vec::Intersect;
-use ast::{Reduce, SideEffects};
+use ast::{LocalRw, Reduce, SideEffects};
 use cfg::block::{BlockEdge, BranchType};
 use itertools::Itertools;
 use rustc_hash::FxHashSet;
@@ -59,6 +59,66 @@ impl GraphStructurer {
         init_blocks.exactly_one().unwrap()
     }
 
+    // An inlined function that returns from inside a loop leaves `found = true` on the
+    // path out of the body and `found = false` in the loop's exit, both going on to the
+    // same place. The exit's assignments can move ahead of the loop instead, as long as
+    // they're constants, nothing else reaches the exit and every way through the body
+    // overwrites them without reading them first. Takes them out of the exit if so.
+    fn hoistable_exit(
+        &mut self,
+        header: NodeIndex,
+        body: NodeIndex,
+        exit: NodeIndex,
+    ) -> Option<Vec<ast::Statement>> {
+        if self.function.predecessor_blocks(exit).any(|p| p != header) {
+            return None;
+        }
+        let mut assigned = Vec::new();
+        for statement in self.function.block(exit).unwrap().iter() {
+            match statement {
+                ast::Statement::Comment(_) => {}
+                ast::Statement::Assign(assign)
+                    if !assign.prefix
+                        && assign.left.len() == 1
+                        && assign.right.len() == 1
+                        && matches!(assign.right[0], ast::RValue::Literal(_)) =>
+                {
+                    assigned.push(assign.left[0].as_local()?.clone());
+                }
+                _ => return None,
+            }
+        }
+        let mut overwritten = FxHashSet::default();
+        let header_statements = self.function.block(header).unwrap().len();
+        // referenced needs them mutable, but only reads them
+        let mut statements = self
+            .function
+            .block(header)
+            .unwrap()
+            .iter()
+            .chain(self.function.block(body).unwrap().iter())
+            .cloned()
+            .collect_vec();
+        for (index, statement) in statements.iter_mut().enumerate() {
+            let mut referenced = Vec::new();
+            ast::limit_locals::referenced(statement, &mut referenced);
+            for local in assigned.iter().filter(|l| referenced.contains(l)) {
+                let overwrites = index >= header_statements
+                    && matches!(statement, ast::Statement::Assign(assign)
+                        if assign.left.iter().any(|l| l.as_local() == Some(local)))
+                    && !statement.values_read().contains(&local);
+                if !overwrites || overwritten.contains(local) {
+                    return None;
+                }
+                overwritten.insert(local.clone());
+            }
+        }
+        if overwritten.len() != assigned.iter().unique().count() {
+            return None;
+        }
+        Some(std::mem::take(&mut self.function.block_mut(exit).unwrap().0))
+    }
+
     pub(crate) fn try_collapse_loop(
         &mut self,
         header: NodeIndex,
@@ -106,20 +166,62 @@ impl GraphStructurer {
                 // which happens after match_jump merges away a nop JUMP body (such as `break`).
                 let body_terminates = then_successors.is_empty();
                 let body_is_exit = then_node == else_node;
-                let pattern_match = body_terminates
-                    || body_is_exit
-                    || then_successors[0] == else_node
-                    || (else_successors.len() == 1 && then_successors[0] == else_successors[0])
-                    || (then_successors[0] == header && else_node == init_block);
-                if !pattern_match {
+                if !body_terminates
+                    && !body_is_exit
+                    && then_successors[0] == header
+                    && else_node != init_block
+                {
                     return false;
                 }
+
+                // The back edges are all continues by now, so a body that goes on anywhere
+                // but the header is breaking out of the loop: falling off the end of a for
+                // body would start the next iteration instead. Going on to the loop's exit
+                // is a plain break, and so is going where the exit goes when the exit has no
+                // code to skip or its code can move ahead of the loop. Anywhere else, a flag
+                // set before the break picks between that and the exit after the loop.
+                let breaks_to = (!body_terminates
+                    && !body_is_exit
+                    && then_node != init_block
+                    && then_successors[0] != header)
+                    .then(|| then_successors[0]);
+                let mut hoisted = Vec::new();
+                let mut break_flag = None;
+                if let Some(target) = breaks_to
+                    && target != else_node
+                {
+                    let skips_exit = else_successors.len() == 1 && else_successors[0] == target;
+                    if !skips_exit || !Self::block_is_no_op(self.function.block(else_node).unwrap())
+                    {
+                        match skips_exit
+                            .then(|| self.hoistable_exit(header, then_node, else_node))
+                            .flatten()
+                        {
+                            Some(statements) => hoisted = statements,
+                            None => break_flag = Some(ast::RcLocal::default()),
+                        }
+                    }
+                }
+                let set_flag = |value: bool| -> Option<ast::Statement> {
+                    break_flag.as_ref().map(|flag| {
+                        ast::Assign::new(
+                            vec![ast::LValue::Local(flag.clone())],
+                            vec![ast::Literal::Boolean(value).into()],
+                        )
+                        .into()
+                    })
+                };
 
                 let statement = self.function.block_mut(header).unwrap().pop().unwrap();
                 let statements = std::mem::take(&mut self.function.block_mut(header).unwrap().0);
 
                 let body_ast = if then_node == init_block || body_is_exit {
                     vec![ast::Break {}.into()].into()
+                } else if breaks_to.is_some() {
+                    let mut body_ast = self.function.remove_block(then_node).unwrap();
+                    body_ast.extend(set_flag(true));
+                    body_ast.push(ast::Break {}.into());
+                    body_ast
                 } else {
                     let mut body_ast = self.function.remove_block(then_node).unwrap();
                     body_ast.extend(statements.iter().cloned());
@@ -156,15 +258,38 @@ impl GraphStructurer {
                         unreachable!();
                     }
                 };
+                init_ast.extend(hoisted);
+                init_ast.extend(set_flag(false));
                 init_ast.push(new_stat);
+                if let Some(flag) = &break_flag {
+                    init_ast.push(
+                        ast::If::new(
+                            ast::RValue::Local(flag.clone()),
+                            ast::Block::default(),
+                            ast::Block::default(),
+                        )
+                        .into(),
+                    );
+                }
                 self.function.remove_block(header);
 
-                self.function.set_edges(
-                    init_block,
-                    vec![(else_node, BlockEdge::new(BranchType::Unconditional))],
-                );
-
-                self.match_jump(init_block, Some(else_node));
+                if let Some(target) = breaks_to
+                    && break_flag.is_some()
+                {
+                    self.function.set_edges(
+                        init_block,
+                        vec![
+                            (target, BlockEdge::new(BranchType::Then)),
+                            (else_node, BlockEdge::new(BranchType::Else)),
+                        ],
+                    );
+                } else {
+                    self.function.set_edges(
+                        init_block,
+                        vec![(else_node, BlockEdge::new(BranchType::Unconditional))],
+                    );
+                    self.match_jump(init_block, Some(else_node));
+                }
                 return true;
             }
             return false;

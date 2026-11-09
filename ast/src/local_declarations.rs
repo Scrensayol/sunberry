@@ -21,10 +21,25 @@ pub struct LocalDeclarer {
     block_to_node: FxHashMap<ByAddress<Arc<Mutex<Block>>>, NodeIndex>,
     graph: DiGraph<(Option<Arc<Mutex<Block>>>, usize), ()>,
     local_usages: IndexMap<RcLocal, FxHashMap<NodeIndex, usize>>,
+    // where each local is read. a read isn't always under a write: a local written in a
+    // loop body can be read after a break out of it
+    local_reads: FxHashMap<RcLocal, FxHashMap<NodeIndex, usize>>,
+    // a for loop declares these itself, even when the body assigns to them
+    loop_locals: FxHashSet<RcLocal>,
     declarations: FxHashMap<ByAddress<Arc<Mutex<Block>>>, BTreeMap<usize, IndexSet<RcLocal>>>,
 }
 
 impl LocalDeclarer {
+    fn read_at(&mut self, locals: Vec<&RcLocal>, node: NodeIndex, stat_index: usize) {
+        for local in locals {
+            self.local_reads
+                .entry(local.clone())
+                .or_default()
+                .entry(node)
+                .or_insert(stat_index);
+        }
+    }
+
     fn visit(&mut self, block: Arc<Mutex<Block>>, stat_index: usize) -> NodeIndex {
         let node = self.graph.add_node((Some(block.clone()), stat_index));
         self.block_to_node.insert(block.clone().into(), node);
@@ -45,6 +60,10 @@ impl LocalDeclarer {
                         .or_insert(stat_index);
                 }
             }
+            // a repeat's condition is inside the loop's scope, see below
+            if !matches!(stat, Statement::Repeat(_)) {
+                self.read_at(stat.values_read(), node, stat_index);
+            }
             match stat {
                 Statement::If(r#if) => {
                     let if_node = self.graph.add_node((None, stat_index));
@@ -61,12 +80,16 @@ impl LocalDeclarer {
                 Statement::Repeat(repeat) => {
                     let child = self.visit(r#repeat.block.clone(), stat_index);
                     self.graph.add_edge(node, child, ());
+                    let end = repeat.block.lock().len();
+                    self.read_at(stat.values_read(), child, end);
                 }
                 Statement::NumericFor(numeric_for) => {
+                    self.loop_locals.insert(numeric_for.counter.clone());
                     let child = self.visit(r#numeric_for.block.clone(), stat_index);
                     self.graph.add_edge(node, child, ());
                 }
                 Statement::GenericFor(generic_for) => {
+                    self.loop_locals.extend(generic_for.res_locals.iter().cloned());
                     let child = self.visit(r#generic_for.block.clone(), stat_index);
                     self.graph.add_edge(node, child, ());
                 }
@@ -83,9 +106,13 @@ impl LocalDeclarer {
     ) {
         let root_node = self.visit(root_block, 0);
         let dominators = simple_fast(&self.graph, root_node);
-        for (local, usages) in self.local_usages {
-            if locals_to_ignore.contains(&local) {
+        for (local, mut usages) in std::mem::take(&mut self.local_usages) {
+            if locals_to_ignore.contains(&local) || self.loop_locals.contains(&local) {
                 continue;
+            }
+            for (&node, &stat_index) in self.local_reads.get(&local).into_iter().flatten() {
+                let first = usages.entry(node).or_insert(stat_index);
+                *first = (*first).min(stat_index);
             }
             let (mut node, mut first_stat_index) = if usages.len() == 1 {
                 usages.into_iter().next().unwrap()
@@ -100,25 +127,20 @@ impl LocalDeclarer {
                     common_dominators = common_dominators.intersect(node_dominators);
                 }
                 let common_dominator = common_dominators[0];
-                if let Some((_, first_stat_index)) =
-                    usages.into_iter().find(|&(n, _)| n == common_dominator)
+                // the first statement of the common block that uses the local, either
+                // itself or somewhere in a block nested in it
+                let mut first_stat_index = usages.get(&common_dominator).copied();
+                for child in self
+                    .graph
+                    .neighbors_directed(common_dominator, Direction::Outgoing)
                 {
-                    (common_dominator, first_stat_index)
-                } else {
-                    // find the left-most dominated node
-                    let mut first_stat_index = None;
-                    for child in self
-                        .graph
-                        .neighbors_directed(common_dominator, Direction::Outgoing)
-                    {
-                        for node_dominators in &node_dominators {
-                            if node_dominators.contains(&child) {
-                                first_stat_index = Some(self.graph.node_weight(child).unwrap().1);
-                            }
-                        }
+                    if node_dominators.iter().any(|d| d.contains(&child)) {
+                        let index = self.graph.node_weight(child).unwrap().1;
+                        first_stat_index =
+                            Some(first_stat_index.map_or(index, |first| first.min(index)));
                     }
-                    (common_dominator, first_stat_index.unwrap())
                 }
+                (common_dominator, first_stat_index.unwrap())
             };
             while let (block, parent_stat_index) = self.graph.node_weight(node).unwrap()
                 && block.is_none()

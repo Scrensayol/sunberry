@@ -61,6 +61,8 @@ This never changes behaviour, since `function X:m()` is exactly `X.m = function(
 
 **Smaller things:** `x = x + 1` prints as `x += 1`, `("a %*"):format(b)` turns back into `` `a {b}` ``, identifier table keys drop the brackets (`{ kind = "x" }`), and constructors name their object `self`.
 
+**Output that compiles, and means the same thing.** Of 33,514 scripts dumped from a Roblox game, shiny decompiles 421 to code that doesn't compile: an empty function's `-- name:` comment swallows its `end`, a function declares more than the 200 locals Luau allows, or the output uses `goto`, which Luau doesn't have. Sunberry compiles all of them. A function that can't be structured without a `goto` gets its smallest unstructurable region written as a state machine instead. Shiny also gets some common loops wrong without any error: a loop that stores what it found and breaks loses the `break`, so it keeps going and ends up with the last match. A local written in a loop and read after it could end up declared inside the loop. Sunberry fixes both.
+
 **Deterministic output.** The same bytecode always decompiles to the same text, at any thread count. In shiny, some statement order depended on memory addresses.
 
 **A better `serve`.** Responses are gzipped when the client asks (executors built on libcurl do by default), so a 2.7 MB result crosses the network as about 370 KB. Bad input returns an error instead of dropping the connection, and long decompiles no longer block other requests.

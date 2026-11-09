@@ -57,7 +57,7 @@ pub(crate) fn for_each_block(block: &mut Block, f: &mut impl FnMut(&mut Block)) 
 }
 
 // every local referenced anywhere in `statement`, nested blocks and closures included
-fn referenced(statement: &mut Statement, out: &mut Vec<RcLocal>) {
+pub fn referenced(statement: &mut Statement, out: &mut Vec<RcLocal>) {
     out.extend(statement.values().into_iter().cloned());
     statement.post_traverse_values(&mut |value| -> Option<()> {
         if let Either::Right(RValue::Closure(closure)) = value {
