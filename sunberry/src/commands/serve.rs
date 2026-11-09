@@ -43,22 +43,24 @@ pub const fn default_encode_key() -> u8 {
 }
 
 #[derive(Deserialize)]
-struct EncodeKey {
+struct LuauQuery {
     #[serde(default = "default_encode_key")]
     encode_key: u8,
+    /// the script's name, so a module's returned table can be named after it
+    name: Option<String>,
 }
 
-async fn decompile_luau(query: Query<EncodeKey>, body: Bytes) -> String {
-    decompile_blocking(body, query.encode_key, false).await
+async fn decompile_luau(Query(query): Query<LuauQuery>, body: Bytes) -> String {
+    decompile_blocking(body, query.encode_key, false, query.name).await
 }
 
 async fn decompile_lua51(body: Bytes) -> String {
-    decompile_blocking(body, default_encode_key(), true).await
+    decompile_blocking(body, default_encode_key(), true, None).await
 }
 
 /// Big scripts take seconds, so keep them off the async workers
-async fn decompile_blocking(body: Bytes, encode_key: u8, lua51: bool) -> String {
-    tokio::task::spawn_blocking(move || decompile_no_io(body, encode_key, lua51))
+async fn decompile_blocking(body: Bytes, encode_key: u8, lua51: bool, name: Option<String>) -> String {
+    tokio::task::spawn_blocking(move || decompile_no_io(body, encode_key, lua51, name.as_deref()))
         .await
         .unwrap_or_else(|_| "-- decompiler panicked".to_string())
 }

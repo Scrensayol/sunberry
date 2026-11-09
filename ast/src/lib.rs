@@ -28,9 +28,11 @@ mod index;
 mod literal;
 mod local;
 //mod name_gen;
+pub mod limit_locals;
 pub mod local_declarations;
 pub mod method_sugar;
 pub mod name_locals;
+pub mod redundant_continue;
 mod repeat;
 pub mod replace_locals;
 mod r#return;
@@ -42,6 +44,7 @@ pub mod type_system;
 mod unary;
 mod vararg;
 mod r#while;
+mod r#do;
 
 pub use assign::*;
 pub use binary::*;
@@ -60,6 +63,7 @@ pub use r#for::*;
 pub use r#if::*;
 pub use r#return::*;
 pub use r#while::*;
+pub use r#do::*;
 pub use repeat::*;
 pub use set_list::*;
 pub use side_effects::*;
@@ -301,6 +305,7 @@ pub enum Statement {
     SetList(SetList),
     Class(Class),
     Comment(Comment),
+    Do(Do),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -351,6 +356,7 @@ impl fmt::Display for Statement {
             Statement::Close(close) => write!(f, "{}", close),
             Statement::Class(class) => write!(f, "{}", class),
             Statement::Empty(empty) => write!(f, "{}", empty),
+            Statement::Do(r#do) => write!(f, "{}", r#do),
         }
     }
 }

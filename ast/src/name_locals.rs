@@ -146,6 +146,31 @@ struct Namer {
     usage_hints: FxHashMap<usize, String>,
     // locals defined as `local function f`, so `Connect(f)` can name f's parameters
     local_functions: FxHashMap<usize, Arc<Mutex<Function>>>,
+    // whether a self is in scope here, a method's or a constructor's. another one would
+    // shadow it. the main chunk starts with it set, a module's own class table isn't a self
+    self_visible: bool,
+    // the local a module script returns and the script's name, which it gets when nothing
+    // better suggests itself
+    module: Option<(usize, String)>,
+}
+
+// `setmetatable({...}, Class)` or `setmetatable(Base.new(...), Class)`, the usual ways a
+// constructor makes its object
+fn is_constructed_object(value: &RValue) -> bool {
+    let (RValue::Call(call) | RValue::Select(Select::Call(call))) = value else {
+        return false;
+    };
+    let is_super_new = |value: &RValue| match value {
+        RValue::Call(call) | RValue::Select(Select::Call(call)) => {
+            index_key(&call.value) == Some(b"new".as_slice())
+        }
+        _ => false,
+    };
+    matches!(call.value.as_ref(), RValue::Global(g) if g.0 == b"setmetatable")
+        && matches!(
+            call.arguments.as_slice(),
+            [object, _] if matches!(object, RValue::Table(_)) || is_super_new(object)
+        )
 }
 
 impl Namer {
@@ -239,7 +264,17 @@ impl Namer {
                         let hint = self.usage_hints.get(&local_key(param)).cloned();
                         self.name_local("p", param, hint);
                     }
+                    let outer_self_visible = self.self_visible;
+                    // a function's body only sees an outer self if it uses one, and those are
+                    // captured as upvalues, so start from whether it captures a self
+                    self.self_visible = function.is_method
+                        || closure.upvalues.iter().any(|upvalue| match upvalue {
+                            Upvalue::Copy(l) | Upvalue::Ref(l) => {
+                                l.0 .0.lock().0.as_deref() == Some("self")
+                            }
+                        });
                     self.name_locals(&mut function.body);
+                    self.self_visible = outer_self_visible;
                 };
                 None
             });
@@ -250,8 +285,24 @@ impl Namer {
                     } else {
                         vec![None; assign.left.len()]
                     };
-                    for (lvalue, hint) in assign.left.iter().zip(hints) {
-                        self.name_local("v", lvalue.as_local().unwrap(), hint);
+                    for (i, (lvalue, hint)) in assign.left.iter().zip(hints).enumerate() {
+                        let local = lvalue.as_local().unwrap();
+                        let hint = hint.or_else(|| {
+                            self.module
+                                .as_ref()
+                                .filter(|(key, _)| *key == local_key(local))
+                                .map(|(_, name)| name.clone())
+                        });
+                        if !self.self_visible
+                            && assign.left.len() == assign.right.len()
+                            && is_constructed_object(&assign.right[i])
+                            && local.0 .0.lock().0.is_none()
+                        {
+                            // `local self = setmetatable({}, Class)`, name_local keeps it
+                            local.0 .0.lock().0 = Some("self".to_string());
+                            self.self_visible = true;
+                        }
+                        self.name_local("v", local, hint);
                     }
                 }
                 Statement::If(r#if) => {
@@ -361,6 +412,22 @@ impl Namer {
 }
 
 pub fn name_locals(block: &mut Block, rename: bool) {
+    name_module_locals(block, rename, None)
+}
+
+// Like name_locals, and when the script ends by returning a local, that local can take
+// `script_name`, so a module's class table reads `ClassicCamera` instead of `v_u_4`.
+pub fn name_module_locals(block: &mut Block, rename: bool, script_name: Option<&str>) {
+    let module = script_name
+        .and_then(|name| sanitize(name.as_bytes()))
+        .zip(match block.last() {
+            Some(Statement::Return(r#return)) => match r#return.values.as_slice() {
+                [RValue::Local(local)] => Some(local_key(local)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .map(|(name, key)| (key, name));
     let mut namer = Namer {
         rename,
         counter: 1,
@@ -368,6 +435,8 @@ pub fn name_locals(block: &mut Block, rename: bool) {
         taken: RESERVED.iter().map(|s| s.to_string()).collect(),
         usage_hints: FxHashMap::default(),
         local_functions: FxHashMap::default(),
+        self_visible: true,
+        module,
     };
     namer.find_upvalues(block);
     namer.name_locals(block);

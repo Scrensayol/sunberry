@@ -4,7 +4,9 @@ mod lifter;
 mod op_code;
 
 use ast::{
-    local_declarations::LocalDeclarer, method_sugar::method_sugar, name_locals::name_locals,
+    limit_locals::limit_locals, local_declarations::LocalDeclarer, method_sugar::method_sugar,
+    redundant_continue::remove_redundant_continues,
+    name_locals::name_module_locals,
     replace_locals::replace_locals,
     Traverse,
 };
@@ -54,6 +56,12 @@ struct Args {
 }
 
 pub fn decompile_bytecode(bytecode: &[u8], encode_key: u8) -> String {
+    decompile_script(bytecode, encode_key, None)
+}
+
+// `script_name` is the name of the script the bytecode came from, if known. A module that
+// returns a local names that local after it.
+pub fn decompile_script(bytecode: &[u8], encode_key: u8, script_name: Option<&str>) -> String {
     let chunk = deserializer::deserialize(bytecode, encode_key).unwrap();
     match chunk {
         Bytecode::Error(msg) => msg,
@@ -195,7 +203,9 @@ pub fn decompile_bytecode(bytecode: &[u8], encode_key: u8) -> String {
             panic::set_hook(prev_hook);
             link_upvalues(&mut body, &mut upvalues);
             method_sugar(&mut body);
-            name_locals(&mut body, true);
+            name_module_locals(&mut body, true, script_name);
+            remove_redundant_continues(&mut body);
+            limit_locals(&mut body);
             ast::formatter::Formatter::format_parallel(&body, Default::default())
         }
     }

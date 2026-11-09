@@ -7,7 +7,7 @@ use itertools::Itertools;
 use rayon::prelude::*;
 
 use crate::{
-    Assign, Binary, BinaryOperation, Block, Call, Class, Closure, GenericFor, If, Index, LValue,
+    Assign, Binary, BinaryOperation, Block, Call, Class, Closure, Do, GenericFor, If, Index, LValue,
     Literal, MethodCall, NumericFor, RValue, Repeat, Return, Select, Statement, Table, Unary, While,
 };
 
@@ -253,9 +253,15 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             } else {
                 if !sequential_keys
                     && let Some(key) = key {
-                        write!(self.output, "[")?;
-                        self.format_rvalue(key)?;
-                        write!(self.output, "] = ")?;
+                        if let RValue::Literal(Literal::String(name)) = key
+                            && Self::is_valid_name(name)
+                        {
+                            write!(self.output, "{} = ", String::from_utf8_lossy(name))?;
+                        } else {
+                            write!(self.output, "[")?;
+                            self.format_rvalue(key)?;
+                            write!(self.output, "] = ")?;
+                        }
                     }
                 self.format_rvalue(value)?;
                 if !is_last {
@@ -359,6 +365,10 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             self.format_block(&function.body)?;
             writeln!(self.output)?;
             self.indent()
+        } else if function.name.is_some() {
+            // the `-- name:` comment runs to the end of the line and would swallow the `end`
+            writeln!(self.output)?;
+            self.indent()
         } else {
             write!(self.output, " ")
         }
@@ -403,7 +413,10 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         match rvalue {
             RValue::Select(Select::Call(call)) | RValue::Call(call) => self.format_call(call),
             RValue::Select(Select::MethodCall(method_call)) | RValue::MethodCall(method_call) => {
-                self.format_method_call(method_call)
+                match Self::interpolation(method_call) {
+                    Some(text) => self.format_interpolation(&text, &method_call.arguments),
+                    None => self.format_method_call(method_call),
+                }
             }
             RValue::Table(table) => self.format_table(table),
             RValue::Index(index) => self.format_index(index),
@@ -455,10 +468,10 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         Ok(())
     }
     pub(crate) fn is_valid_name(name: &[u8]) -> bool {
-        if !(name
-            .iter()
-            .enumerate()
-            .all(|(i, &c)| (i != 0 && c.is_ascii_digit()) || c.is_ascii_alphabetic() || c == b'_'))
+        if name.is_empty()
+            || !name.iter().enumerate().all(|(i, &c)| {
+                (i != 0 && c.is_ascii_digit()) || c.is_ascii_alphabetic() || c == b'_'
+            })
         {
             return false;
         }
@@ -561,6 +574,57 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         write!(self.output, ")")
     }
 
+    // Luau compiles `` `a{x}b` `` to `("a%*b"):format(x)`. Returns the literal pieces around
+    // each `%*` when the call can go back to an interpolated string with the same meaning:
+    // only `%*` and `%%` in the format, one plain expression per `%*`.
+    fn interpolation(method_call: &MethodCall) -> Option<Vec<Vec<u8>>> {
+        let RValue::Literal(Literal::String(format)) = method_call.value.as_ref() else {
+            return None;
+        };
+        if method_call.method != "format"
+            || method_call.arguments.is_empty()
+            || method_call
+                .arguments
+                .iter()
+                .any(|a| matches!(a, RValue::Select(_) | RValue::VarArg(_)))
+        {
+            return None;
+        }
+        let mut pieces = vec![Vec::new()];
+        let mut i = 0;
+        while i < format.len() {
+            if format[i] == b'%' {
+                match format.get(i + 1) {
+                    Some(b'*') => pieces.push(Vec::new()),
+                    Some(b'%') => pieces.last_mut().unwrap().push(b'%'),
+                    _ => return None,
+                }
+                i += 2;
+            } else {
+                pieces.last_mut().unwrap().push(format[i]);
+                i += 1;
+            }
+        }
+        (pieces.len() == method_call.arguments.len() + 1).then_some(pieces)
+    }
+
+    fn format_interpolation(&mut self, pieces: &[Vec<u8>], arguments: &[RValue]) -> fmt::Result {
+        write!(self.output, "`")?;
+        for (i, piece) in pieces.iter().enumerate() {
+            let text = Self::escape_string(piece)
+                .replace('`', "\\`")
+                .replace('{', "\\{")
+                .replace('}', "\\}");
+            write!(self.output, "{}", text)?;
+            if let Some(argument) = arguments.get(i) {
+                write!(self.output, "{{")?;
+                self.format_rvalue(argument)?;
+                write!(self.output, "}}")?;
+            }
+        }
+        write!(self.output, "`")
+    }
+
     pub(crate) fn format_method_call(&mut self, method_call: &MethodCall) -> fmt::Result {
         let wrap = Self::should_wrap_left_rvalue(&method_call.value);
         if wrap {
@@ -607,6 +671,41 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         write!(self.output, "end")
     }
 
+    // `x = x + y` as `x += y`. Only for targets where evaluating them once instead of twice
+    // can't be told apart: locals, globals and `local.constant`, which get read and written
+    // exactly once either way.
+    fn compound_assignment(assign: &Assign) -> Option<(&LValue, &BinaryOperation, &RValue)> {
+        if assign.prefix || assign.parallel {
+            return None;
+        }
+        let ([target], [RValue::Binary(binary)]) = (assign.left.as_slice(), assign.right.as_slice())
+        else {
+            return None;
+        };
+        let same_target = match (target, binary.left.as_ref()) {
+            (LValue::Local(a), RValue::Local(b)) => a == b,
+            (LValue::Global(a), RValue::Global(b)) => a == b,
+            (LValue::Index(a), RValue::Index(b)) => {
+                matches!(a.left.as_ref(), RValue::Local(_))
+                    && matches!(a.right.as_ref(), RValue::Literal(_))
+                    && a == b
+            }
+            _ => false,
+        };
+        let compoundable = matches!(
+            binary.operation,
+            BinaryOperation::Add
+                | BinaryOperation::Sub
+                | BinaryOperation::Mul
+                | BinaryOperation::Div
+                | BinaryOperation::IDiv
+                | BinaryOperation::Mod
+                | BinaryOperation::Pow
+                | BinaryOperation::Concat
+        );
+        (same_target && compoundable).then_some((target, &binary.operation, &binary.right))
+    }
+
     pub(crate) fn format_assign(&mut self, assign: &Assign) -> fmt::Result {
         if assign.prefix {
             write!(self.output, "local ")?;
@@ -647,6 +746,12 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             }
         }
 
+        if let Some((target, operation, value)) = Self::compound_assignment(assign) {
+            self.format_lvalue(target)?;
+            write!(self.output, " {}= ", operation)?;
+            return self.format_rvalue(value);
+        }
+
         for (i, lvalue) in assign.left.iter().enumerate() {
             if i != 0 {
                 write!(self.output, ", ")?;
@@ -683,6 +788,14 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         writeln!(self.output, " do")?;
 
         self.format_block(&r#while.block.lock())?;
+        writeln!(self.output)?;
+        self.indent()?;
+        write!(self.output, "end")
+    }
+
+    pub(crate) fn format_do(&mut self, r#do: &Do) -> fmt::Result {
+        writeln!(self.output, "do")?;
+        self.format_block(&r#do.block.lock())?;
         writeln!(self.output)?;
         self.indent()?;
         write!(self.output, "end")
@@ -799,6 +912,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             Statement::Assign(assign) => self.format_assign(assign),
             Statement::If(r#if) => self.format_if(r#if),
             Statement::While(r#while) => self.format_while(r#while),
+            Statement::Do(r#do) => self.format_do(r#do),
             Statement::Repeat(repeat) => self.format_repeat(repeat),
             Statement::NumericFor(numeric_for) => self.format_numeric_for(numeric_for),
             Statement::GenericFor(generic_for) => self.format_generic_for(generic_for),

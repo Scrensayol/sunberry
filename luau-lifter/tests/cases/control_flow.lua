@@ -3,7 +3,7 @@ local function classify(p2) -- name: classify
 	return p2 < 0 and "negative" or (p2 == 0 and "zero" or (p2 % 2 == 0 and "even" or "odd"))
 end
 local function firstPrimeAfter(p3) -- name: firstPrimeAfter
-	p3 = p3 + 1
+	p3 += 1
 	local v4 = p3 > 1
 	local sqrt = math.sqrt
 	for v5 = 2, math.floor(sqrt(p3)) do
@@ -21,8 +21,8 @@ local function sumUntil(p6) -- name: sumUntil
 	local v7 = 0
 	local v8 = 1
 	while v7 < p6 do
-		v7 = v7 + v8
-		v8 = v8 + 1
+		v7 += v8
+		v8 += 1
 	end
 	return v7, v8
 end

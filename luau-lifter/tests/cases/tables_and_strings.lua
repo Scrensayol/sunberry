@@ -1,16 +1,16 @@
 local function pack(...) -- name: pack
 	return {
-		["n"] = select("#", ...),
+		n = select("#", ...),
 		...
 	}
 end
 local v1 = {
-	["volume"] = 0.8,
-	["keybinds"] = {
-		["jump"] = "Space",
-		["sprint"] = "LeftShift"
+	volume = 0.8,
+	keybinds = {
+		jump = "Space",
+		sprint = "LeftShift"
 	},
-	["tags"] = { "fast", "quiet" },
+	tags = { "fast", "quiet" },
 	[10] = "ten"
 }
 local v7, v8 = (function(...) -- name: minMax
@@ -26,7 +26,7 @@ local v7, v8 = (function(...) -- name: minMax
 	end
 	return huge, v3
 end)(4, 8, 15, 16, 23, 42)
-local v9 = ("range %*..%*, volume %*%%"):format(v7, v8, v1.volume * 100)
+local v9 = `range {v7}..{v8}, volume {v1.volume * 100}%`
 print(v9, #v1.tags, v1.keybinds.jump, v1[10])
 local v10 = {}
 for v11, v12 in pairs(v1.keybinds) do

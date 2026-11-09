@@ -2,7 +2,7 @@ local v4, v5 = (function(p_u_1, p_u_2) -- name: makeCounter
 	local v_u_3 = p_u_1
 	return function()
 		-- upvalues: (ref) v_u_3, (copy) p_u_2
-		v_u_3 = v_u_3 + p_u_2
+		v_u_3 += p_u_2
 		return v_u_3
 	end, function()
 		-- upvalues: (ref) v_u_3, (copy) p_u_1

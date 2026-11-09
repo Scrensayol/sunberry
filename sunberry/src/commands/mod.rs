@@ -26,6 +26,11 @@ pub enum Commands {
         /// Indicate the bytecode is Lua 5.1, assumes Luau by default
         #[arg(short, long, default_value_t = false)]
         lua51: bool,
+
+        /// The name of the script, used to name the table a module returns. Defaults to
+        /// the input file's name
+        #[arg(short, long)]
+        name: Option<String>,
     },
 
     /// Start a simple web server to handle decompiling.

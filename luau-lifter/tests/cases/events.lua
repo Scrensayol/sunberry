@@ -38,7 +38,7 @@ end)
 local v_u_2 = 0
 RunService.Heartbeat:Connect(function(deltaTime)
 	-- upvalues: (ref) v_u_2
-	v_u_2 = v_u_2 + deltaTime
+	v_u_2 += deltaTime
 end)
 local v3 = v_u_2
 for _, child_2 in ipairs(workspace:GetChildren()) do

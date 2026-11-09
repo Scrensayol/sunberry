@@ -57,6 +57,10 @@ function v_u_4:Update(p14)
 
 This never changes behaviour, since `function X:m()` is exactly `X.m = function(self)`.
 
+**Modules are named after their script.** When a module returns a local, that local takes the script's name, so `local v_u_4 = setmetatable({}, BaseCamera)` reads `local ClassicCamera = ...` and `return ClassicCamera`. The CLI uses the input file's name (or `--name`), and `serve` takes a `?name=` parameter.
+
+**Smaller things:** `x = x + 1` prints as `x += 1`, `("a %*"):format(b)` turns back into `` `a {b}` ``, identifier table keys drop the brackets (`{ kind = "x" }`), and constructors name their object `self`.
+
 **Deterministic output.** The same bytecode always decompiles to the same text, at any thread count. In shiny, some statement order depended on memory addresses.
 
 **A better `serve`.** Responses are gzipped when the client asks (executors built on libcurl do by default), so a 2.7 MB result crosses the network as about 370 KB. Bad input returns an error instead of dropping the connection, and long decompiles no longer block other requests.
@@ -92,6 +96,19 @@ The workspace needs nightly Rust (see `rust-toolchain`) and a C compiler for mim
 cargo build --release -p sunberry
 ```
 
+### Testing
+
+```bash
+cargo test --release -p luau-lifter          # snapshot tests in luau-lifter/tests/cases
+UPDATE_SNAPSHOTS=1 cargo test --release -p luau-lifter   # accept intended output changes
+```
+
+To check a change against real scripts, dump some bytecode to a folder and compare the old and new builds over it. The script reports changed outputs, anything that decompiles differently across thread counts and, when `luau-compile` is on your PATH, output that stopped compiling:
+
+```bash
+scripts/regress.sh old/sunberry target/release/sunberry path/to/bytecode
+```
+
 ### Raspberry Pi
 
 Release builds include `sunberry-aarch64-linux-musl`, a static binary that runs on any 64-bit Raspberry Pi OS. To build one tuned for a Pi 5 yourself, cross-compile from a desktop:
@@ -120,9 +137,10 @@ If you are using some sort of API, make sure to replace `http://localhost:3000` 
 getgenv().decompile = function(script_instance)
   local bytecode = getscriptbytecode(script_instance)
   local encoded = crypt.base64encode(bytecode)
+  local name = game:GetService("HttpService"):UrlEncode(script_instance.Name)
   return request(
     {
-      Url = "http://localhost:3000/luau/decompile",
+      Url = "http://localhost:3000/luau/decompile?name=" .. name,
       Method = "POST",
       Body = encoded
     }
@@ -152,9 +170,10 @@ To test if everything is working, on your actual machine [http://localhost:3000/
 getgenv().decompile = function(script_instance)
   local bytecode = getscriptbytecode(script_instance)
   local encoded = crypt.base64encode(bytecode)
+  local name = game:GetService("HttpService"):UrlEncode(script_instance.Name)
   return request(
     {
-      Url = "http://10.0.2.2:3000/luau/decompile",
+      Url = "http://10.0.2.2:3000/luau/decompile?name=" .. name,
       Method = "POST",
       Body = encoded
     }
