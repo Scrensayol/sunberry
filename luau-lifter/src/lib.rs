@@ -252,6 +252,10 @@ fn decompile_function(
     // etc.
     // the macro could also maybe generate an optimal ordering?
     let mut changed = true;
+    // whenever a round changes nothing, one more round runs with structure_conditionals' value
+    // and/or matching on. it has to be a whole round: inline doesn't report what it changed and
+    // can still find more to do
+    let mut value_and_or = false;
     while changed {
         changed = false;
 
@@ -260,7 +264,7 @@ fn decompile_function(
 
         ssa::inline::inline(&mut function, &local_to_group, &upvalue_to_group);
 
-        if structure_conditionals(&mut function)
+        if structure_conditionals(&mut function, value_and_or)
         // || {
         //     let post_dominators = post_dominators(function.graph_mut());
         //     structure_for_loops(&mut function, &dominators, &post_dominators)
@@ -276,6 +280,12 @@ fn decompile_function(
             changed = true;
         }
         ssa::construct::apply_local_map(&mut function, local_map);
+        if value_and_or {
+            value_and_or = false;
+        } else if !changed {
+            value_and_or = true;
+            changed = true;
+        }
     }
     // cfg::dot::render_to(&function, &mut std::io::stdout()).unwrap();
     ssa::Destructor::new(

@@ -1,41 +1,40 @@
-local v_u_2 = {
+local v_u_1 = {
 	get = function() -- name: get
-		local v1 = {
+		return {
 			[2] = {
 				seen = true
 			}
 		}
-		return v1
 	end
 }
-local function seen(p3) -- name: seen
-	-- upvalues: (copy) v_u_2
-	local v4 = v_u_2.get()[p3]
-	local v5
-	if v4 == nil then
-		v5 = false
+local function seen(p2) -- name: seen
+	-- upvalues: (copy) v_u_1
+	local v3 = v_u_1.get()[p2]
+	local v4
+	if v3 == nil then
+		v4 = false
 	else
-		v5 = v4.seen ~= nil
+		v4 = v3.seen ~= nil
 	end
-	return v5
+	return v4
 end
-local function pick(p_u_6) -- name: pick
+local function pick(p_u_5) -- name: pick
 	-- upvalues: (copy) seen
-	local v_u_7 = nil
-	for v8, v9 in p_u_6 do
-		if v9.show and not seen(v9.id) then
-			v_u_7 = v8
+	local v_u_6 = nil
+	for v7, v8 in p_u_5 do
+		if v8.show and not seen(v8.id) then
+			v_u_6 = v7
 			break
 		end
 	end
-	if v_u_7 == nil then
+	if v_u_6 == nil then
 		return false
 	end
-	local v10, v11 = pcall(function()
-		-- upvalues: (copy) p_u_6, (ref) v_u_7
-		return p_u_6[v_u_7].id * 100
+	local v9, v10 = pcall(function()
+		-- upvalues: (copy) p_u_5, (ref) v_u_6
+		return p_u_5[v_u_6].id * 100
 	end)
-	return v10, v11
+	return v9, v10
 end
 print(pick({
 	{
@@ -61,17 +60,17 @@ print(pick({
 		id = 2
 	}
 }))
-local function nextShown(p12, p13) -- name: nextShown
-	local v14 = nil
-	for v15 = p13 + 1, #p12 do
-		if p12[v15].toShow then
-			v14 = v15
+local function nextShown(p11, p12) -- name: nextShown
+	local v13 = nil
+	for v14 = p12 + 1, #p11 do
+		if p11[v14].toShow then
+			v13 = v14
 			break
 		end
 	end
-	return v14 == nil and "none" or "show " .. v14 .. " " .. p12[v14].id
+	return v13 == nil and "none" or "show " .. v13 .. " " .. p11[v13].id
 end
-local v16 = {
+local v15 = {
 	{
 		toShow = true,
 		id = "a"
@@ -85,81 +84,81 @@ local v16 = {
 		id = "c"
 	}
 }
-print(nextShown(v16, 0), nextShown(v16, 1), nextShown(v16, 3))
-local function findKey(p17, p18) -- name: findKey
-	local v19 = nil
-	for v20, v21 in p17 do
-		if v21 == p18 then
-			v19 = v20
+print(nextShown(v15, 0), nextShown(v15, 1), nextShown(v15, 3))
+local function findKey(p16, p17) -- name: findKey
+	local v18 = nil
+	for v19, v20 in p16 do
+		if v20 == p17 then
+			v18 = v19
 			break
 		end
 	end
-	return v19 == nil and "none" or "found " .. v19
+	return v18 == nil and "none" or "found " .. v18
 end
 print(findKey({ "x", "y", "z" }, "y"), findKey({ "x" }, "q"))
-print((function(p22) -- name: conv
-	local v23 = {}
-	for _, v24 in p22 do
-		local v25 = (typeof(v24) ~= "number" and (tonumber(v24) or -1) or v24) * 2
-		table.insert(v23, v25)
+print((function(p21) -- name: conv
+	local v22 = {}
+	for _, v23 in p21 do
+		local v24 = (typeof(v23) ~= "number" and (tonumber(v23) or -1) or v23) * 2
+		table.insert(v22, v24)
 	end
-	return table.concat(v23, ",")
+	return table.concat(v22, ",")
 end)({
 	1,
 	"2",
 	"x",
 	4
-}), (function(p26) -- name: conv2
-	local v27 = {}
-	for v28 = 1, p26 do
-		local v29
-		if v28 % 2 == 0 then
-			v29 = v28 * 100
+}), (function(p25) -- name: conv2
+	local v26 = {}
+	for v27 = 1, p25 do
+		local v28
+		if v27 % 2 == 0 then
+			v28 = v27 * 100
 		else
-			v29 = v28
+			v28 = v27
 		end
-		table.insert(v27, v29)
+		table.insert(v26, v28)
 	end
-	return table.concat(v27, ",")
+	return table.concat(v26, ",")
 end)(4))
-local function m(p30, p31) -- name: m
-	local v32 = {}
-	for _, v33 in p30 do
-		if v33.name then
-			local name = v33.name
-			if p31 and (p31.skip and p31.skip[name .. "*"]) then
-				v32[name] = "skip*"
-			elseif p31 and (p31.skip and p31.skip[name]) then
-				v32[name] = "skip"
+local function m(p29, p30) -- name: m
+	local v31 = {}
+	for _, v32 in p29 do
+		if v32.name then
+			local name = v32.name
+			if p30 and (p30.skip and p30.skip[name .. "*"]) then
+				v31[name] = "skip*"
+			elseif p30 and (p30.skip and p30.skip[name]) then
+				v31[name] = "skip"
 			else
-				local kind = v33.kind
+				local kind = v32.kind
 				if kind == 1 then
-					v32[name] = "one"
+					v31[name] = "one"
 				elseif kind == 2 then
-					v32[name] = "two"
+					v31[name] = "two"
 				else
 					if kind ~= 3 then
 						continue
 					end
-					v32[name] = "three"
+					v31[name] = "three"
 				end
 			end
 		else
-			if v33.kind ~= 9 then
+			if v32.kind ~= 9 then
 				continue
 			end
-			v32.schema = "s"
+			v31.schema = "s"
 		end
 	end
-	local v34 = {}
-	for v35, v36 in v32 do
-		local v37 = v35 .. "=" .. v36
-		table.insert(v34, v37)
+	local v33 = {}
+	for v34, v35 in v31 do
+		local v36 = v34 .. "=" .. v35
+		table.insert(v33, v36)
 	end
-	table.sort(v34)
-	return table.concat(v34, ",")
+	table.sort(v33)
+	return table.concat(v33, ",")
 end
-local v38 = {
+local v37 = {
 	{
 		name = "a",
 		kind = 1
@@ -188,12 +187,11 @@ local v38 = {
 		kind = 1
 	}
 }
-print(m(v38, nil))
-local v39 = {
+print(m(v37, nil))
+print(m(v37, {
 	skip = {
 		["a*"] = true,
 		b = true
 	}
-}
-print(m(v38, v39))
-print(m(v38, {}))
+}))
+print(m(v37, {}))

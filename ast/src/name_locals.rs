@@ -152,6 +152,13 @@ struct Namer {
     // the local a module script returns and the script's name, which it gets when nothing
     // better suggests itself
     module: Option<(usize, String)>,
+    // how many times each local is assigned, its declaration included, and the globals the
+    // script assigns. see global_copy
+    local_writes: FxHashMap<usize, usize>,
+    written_globals: FxHashSet<String>,
+    uses_fenv: bool,
+    // globals a copy has been named after already, so a second copy gets a suffix
+    global_copies: FxHashSet<String>,
 }
 
 // `setmetatable({...}, Class)` or `setmetatable(Base.new(...), Class)`, the usual ways a
@@ -174,6 +181,22 @@ fn is_constructed_object(value: &RValue) -> bool {
 }
 
 impl Namer {
+    // `local script = script`: a local that's only ever a copy of a global can share its
+    // name even though the script uses the global too. Neither one changes, so wherever the
+    // local shadows the global they hold the same value. Returns the global's name if so.
+    fn global_copy(&self, local: &RcLocal, value: &RValue) -> Option<String> {
+        let RValue::Global(global) = value else {
+            return None;
+        };
+        let name = sanitize(&global.0)?;
+        (!self.uses_fenv
+            && local.0 .0.lock().0.is_none()
+            && Arc::count(&local.0 .0) > 1
+            && self.local_writes.get(&local_key(local)) == Some(&1)
+            && !self.written_globals.contains(&name))
+        .then_some(name)
+    }
+
     fn claim(&mut self, base: String) -> String {
         let mut name = base.clone();
         let mut suffix = 2;
@@ -302,6 +325,13 @@ impl Namer {
                             local.0 .0.lock().0 = Some("self".to_string());
                             self.self_visible = true;
                         }
+                        if assign.left.len() == assign.right.len()
+                            && let Some(name) = self.global_copy(local, &assign.right[i])
+                            && self.global_copies.insert(name.clone())
+                        {
+                            local.0 .0.lock().0 = Some(name);
+                            continue;
+                        }
                         self.name_local("v", local, hint);
                     }
                 }
@@ -353,8 +383,19 @@ impl Namer {
             // TODO: doesnt need to be mut
             statement.post_traverse_values(&mut |value| -> Option<()> {
                 match &value {
-                    Either::Right(RValue::Global(g)) | Either::Left(LValue::Global(g)) => {
+                    Either::Right(RValue::Global(g)) => {
+                        if g.0 == b"getfenv" || g.0 == b"setfenv" {
+                            self.uses_fenv = true;
+                        }
                         self.taken.insert(String::from_utf8_lossy(&g.0).into_owned());
+                    }
+                    Either::Left(LValue::Global(g)) => {
+                        let name = String::from_utf8_lossy(&g.0).into_owned();
+                        self.written_globals.insert(name.clone());
+                        self.taken.insert(name);
+                    }
+                    Either::Left(LValue::Local(local)) => {
+                        *self.local_writes.entry(local_key(local)).or_default() += 1;
                     }
                     _ => {}
                 }
@@ -437,6 +478,10 @@ pub fn name_module_locals(block: &mut Block, rename: bool, script_name: Option<&
         local_functions: FxHashMap::default(),
         self_visible: true,
         module,
+        local_writes: FxHashMap::default(),
+        written_globals: FxHashSet::default(),
+        uses_fenv: false,
+        global_copies: FxHashSet::default(),
     };
     namer.find_upvalues(block);
     namer.name_locals(block);
@@ -537,6 +582,29 @@ mod tests {
         assert_eq!(clashing.to_string(), "workspace_2");
         assert_eq!(waited_module.to_string(), "CameraInput");
         assert_eq!(time.to_string(), "time");
+    }
+
+    #[test]
+    fn copies_of_globals_share_their_name() {
+        let copy = RcLocal::default();
+        let second_copy = RcLocal::default();
+        let reassigned = RcLocal::default();
+        let of_written = RcLocal::default();
+        let mut body = Vec::new();
+        body.push(Return::new(vec![global("script")]).into());
+        body.extend(declare(&copy, global("script")));
+        body.extend(declare(&second_copy, global("script")));
+        body.extend(declare(&reassigned, global("game")));
+        body.push(Assign::new(vec![reassigned.clone().into()], vec![string("x")]).into());
+        body.extend(declare(&of_written, global("shared")));
+        body.push(Assign::new(vec![Global::new(b"shared".to_vec()).into()], vec![string("x")]).into());
+
+        name_locals(&mut Block(body), true);
+
+        assert_eq!(copy.to_string(), "script");
+        assert_eq!(second_copy.to_string(), "script_2");
+        assert_eq!(reassigned.to_string(), "game_2");
+        assert_eq!(of_written.to_string(), "shared_2");
     }
 
     #[test]

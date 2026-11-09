@@ -268,7 +268,10 @@ fn match_conditional_sequence(
     }
 }
 
-pub fn structure_conditionals(function: &mut Function) -> bool {
+// `value_and_or` turns on the `x = c and a` matching in make_bool_conditional. It goes
+// first wherever it applies, and matched in the middle of `a and b and c` it leaves the rest
+// for nothing else to match, so lifters only turn it on once everything else is done.
+pub fn structure_conditionals(function: &mut Function, value_and_or: bool) -> bool {
     let mut did_structure = false;
     // TODO: does this need to be in dfs post order?
     let mut dfs = DfsPostOrder::new(function.graph(), function.entry().unwrap());
@@ -276,7 +279,7 @@ pub fn structure_conditionals(function: &mut Function) -> bool {
         if simplify_condition(function, node) {
             did_structure = true;
         }
-        if structure_bool_conditional(function, node) {
+        if structure_bool_conditional(function, node, value_and_or) {
             did_structure = true;
         }
 
@@ -363,15 +366,95 @@ fn is_truthy(rvalue: ast::RValue) -> Option<bool> {
     }
 }
 
+// `a and (b and c)` as `(a and b) and c`, which prints without parentheses. and/or give the
+// same result either way round
+fn chain(left: ast::RValue, right: ast::RValue, operation: ast::BinaryOperation) -> ast::RValue {
+    match right {
+        ast::RValue::Binary(ast::Binary {
+            left: inner_left,
+            right: inner_right,
+            operation: inner,
+        }) if inner == operation => chain(
+            ast::Binary::new(left, *inner_left, operation).into(),
+            *inner_right,
+            operation,
+        ),
+        right => ast::Binary::new(left, right, operation).into(),
+    }
+}
+
+// whether a value is always true or false, never another truthy or falsy value
+fn is_boolean(value: &ast::RValue) -> bool {
+    match value {
+        ast::RValue::Literal(ast::Literal::Boolean(_)) => true,
+        ast::RValue::Unary(ast::Unary {
+            operation: UnaryOperation::Not,
+            ..
+        }) => true,
+        ast::RValue::Binary(ast::Binary { operation, .. }) => matches!(
+            operation,
+            ast::BinaryOperation::Equal
+                | ast::BinaryOperation::NotEqual
+                | ast::BinaryOperation::LessThan
+                | ast::BinaryOperation::LessThanOrEqual
+                | ast::BinaryOperation::GreaterThan
+                | ast::BinaryOperation::GreaterThanOrEqual
+        ),
+        _ => false,
+    }
+}
+
 // TODO: STYLE: rename
 fn make_bool_conditional(
     function: &mut Function,
     node: NodeIndex,
     mut then_value: ast::RValue,
     mut else_value: ast::RValue,
+    value_and_or: bool,
 ) -> Option<ast::RValue> {
     let block = function.block_mut(node).unwrap();
     let r#if = block.last_mut().unwrap().as_if_mut().unwrap();
+    // `if c then x = a else x = c end` is `x = c and a` and `if c then x = c else x = b end`
+    // is `x = c or b`, whatever a and b are: the falsy or truthy c is the result either way.
+    // c gets evaluated once instead of twice, so it can't have side effects
+    let (tested, negated) = match &r#if.condition {
+        ast::RValue::Unary(ast::Unary {
+            value,
+            operation: UnaryOperation::Not,
+        }) => (&**value, true),
+        condition => (condition, false),
+    };
+    // a comparison or `not` is always a boolean, so there the falsy c is `false` and the
+    // truthy one `true`, and `if c then x = a else x = false end` is `x = c and a` too
+    let is_bool = |value: &ast::RValue| matches!(value, ast::RValue::Literal(ast::Literal::Boolean(_)));
+    if value_and_or
+        && !tested.has_side_effects()
+        && !(is_bool(&then_value) && is_bool(&else_value))
+    {
+        let (if_truthy, if_falsy) = if negated {
+            (&else_value, &then_value)
+        } else {
+            (&then_value, &else_value)
+        };
+        let boolean = is_boolean(tested);
+        let r#false = ast::RValue::Literal(ast::Literal::Boolean(false));
+        let r#true = ast::RValue::Literal(ast::Literal::Boolean(true));
+        let not_tested = || ast::Unary::new(tested.clone(), UnaryOperation::Not).reduce();
+        let result = if if_falsy == tested || (boolean && *if_falsy == r#false) {
+            Some((tested.clone(), if_truthy, ast::BinaryOperation::And))
+        } else if if_truthy == tested || (boolean && *if_truthy == r#true) {
+            Some((tested.clone(), if_falsy, ast::BinaryOperation::Or))
+        } else if boolean && *if_truthy == r#false {
+            Some((not_tested(), if_falsy, ast::BinaryOperation::And))
+        } else if boolean && *if_falsy == r#true {
+            Some((not_tested(), if_truthy, ast::BinaryOperation::Or))
+        } else {
+            None
+        };
+        if let Some((left, right, operation)) = result {
+            return Some(chain(left, right.clone(), operation));
+        }
+    }
     if let ast::RValue::Literal(ast::Literal::Boolean(then_value)) = then_value
         && let ast::RValue::Literal(ast::Literal::Boolean(else_value)) = else_value
         && then_value != else_value
@@ -446,7 +529,7 @@ fn make_bool_conditional(
 // local a; if g then a = true else a = false end; return a -> return g and true or false
 // local a; if g then a = false else a = true end; return a -> return not g
 // local a; if g == 1 then a = true else a = false end; return a -> return g == 1
-fn structure_bool_conditional(function: &mut Function, node: NodeIndex) -> bool {
+fn structure_bool_conditional(function: &mut Function, node: NodeIndex, value_and_or: bool) -> bool {
     let match_triangle = |assigner, next, next_args: FxHashMap<ast::RcLocal, ast::RValue>| {
         if let Some(edge_to_next) = function.unconditional_edge(assigner)
             && edge_to_next.target() == next
@@ -489,7 +572,7 @@ fn structure_bool_conditional(function: &mut Function, node: NodeIndex) -> bool 
                 let then_value = then_value.clone();
                 let else_value = else_value.clone();
 
-                if let Some(res) = make_bool_conditional(function, node, then_value, else_value) {
+                if let Some(res) = make_bool_conditional(function, node, then_value, else_value, value_and_or) {
                     function
                         .graph_mut()
                         .edge_weight_mut(then_edge)
@@ -537,7 +620,7 @@ fn structure_bool_conditional(function: &mut Function, node: NodeIndex) -> bool 
                 else_edge.id(),
             );
             let res_local = res_local.clone();
-            if let Some(res) = make_bool_conditional(function, node, then_value, else_value) {
+            if let Some(res) = make_bool_conditional(function, node, then_value, else_value, value_and_or) {
                 function
                     .graph_mut()
                     .edge_weight_mut(then_edge)
@@ -586,7 +669,7 @@ fn structure_bool_conditional(function: &mut Function, node: NodeIndex) -> bool 
                 function.unconditional_edge(else_block).unwrap().id(),
             );
             let res_local = res_local.clone();
-            if let Some(res) = make_bool_conditional(function, node, then_value, else_value) {
+            if let Some(res) = make_bool_conditional(function, node, then_value, else_value, value_and_or) {
                 function
                     .graph_mut()
                     .edge_weight_mut(then_edge)
@@ -643,7 +726,7 @@ fn structure_bool_conditional(function: &mut Function, node: NodeIndex) -> bool 
                 function.unconditional_edge(then_block).unwrap().id(),
                 function.unconditional_edge(else_block).unwrap().id(),
             );
-            if let Some(res) = make_bool_conditional(function, node, then_value, else_value) {
+            if let Some(res) = make_bool_conditional(function, node, then_value, else_value, value_and_or) {
                 function
                     .graph_mut()
                     .edge_weight_mut(then_edge)
@@ -700,7 +783,7 @@ fn structure_bool_conditional(function: &mut Function, node: NodeIndex) -> bool 
             let then_value = then_value.clone();
             let else_value = else_value.clone();
 
-            if let Some(res) = make_bool_conditional(function, node, then_value, else_value) {
+            if let Some(res) = make_bool_conditional(function, node, then_value, else_value, value_and_or) {
                 function.remove_block(then_target);
                 function.remove_block(else_target);
                 let block = function.block_mut(node).unwrap();

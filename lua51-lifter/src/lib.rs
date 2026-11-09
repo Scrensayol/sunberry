@@ -62,7 +62,7 @@ pub fn decompile_bytecode(bytecode: &[u8]) -> String {
 
                 ssa::inline::inline(&mut function, &local_to_group, &upvalue_to_group);
 
-                if structure_conditionals(&mut function)
+                if structure_conditionals(&mut function, false)
                 // || {
                 //     let post_dominators = post_dominators(function.graph_mut());
                 //     structure_for_loops(&mut function, &dominators, &post_dominators)
