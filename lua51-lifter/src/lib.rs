@@ -11,7 +11,7 @@ use indexmap::IndexMap;
 use lifter::Lifter;
 use parking_lot::Mutex;
 use ast::dominators::simple_fast;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use triomphe::Arc;
 
 use lua51_deserializer::chunk::Chunk;
@@ -88,11 +88,13 @@ pub fn decompile_bytecode(bytecode: &[u8]) -> String {
 
             let params = std::mem::take(&mut function.parameters);
             let is_variadic = function.is_variadic;
-            let block = Arc::new(restructure::lift(function).into());
+            let outer_locals: FxHashSet<_> =
+                upvalues_in.iter().chain(params.iter()).cloned().collect();
+            let block = Arc::new(restructure::lift(function, outer_locals.clone()).into());
             LocalDeclarer::default().declare_locals(
                 // TODO: why does block.clone() not work?
                 Arc::clone(&block),
-                &upvalues_in.iter().chain(params.iter()).cloned().collect(),
+                &outer_locals,
             );
 
             {

@@ -232,9 +232,33 @@ impl GraphStructurer {
             || _match_triangle_conditional(else_node, then_node, true)
     }
 
+    fn ends_in_jump(block: &ast::Block) -> bool {
+        matches!(
+            block.last(),
+            Some(ast::Statement::Break(_) | ast::Statement::Continue(_) | ast::Statement::Return(_))
+        )
+    }
+
     // a -> b a -> c
+    // the loop's other back edges: predecessors of `header` inside the loop. the edge into
+    // the loop from outside doesn't count, and it can look like one when an enclosing loop
+    // only exits through a nested return (see post_dominators)
+    fn other_back_edges(
+        &self,
+        dominators: &Dominators,
+        header: NodeIndex,
+        entry: NodeIndex,
+    ) -> Vec<NodeIndex> {
+        self.function
+            .predecessor_blocks(header)
+            .filter(|&n| n != entry)
+            .filter(|&n| dominators.dominators(n).is_some_and(|mut d| d.any(|x| x == header)))
+            .collect()
+    }
+
     pub(crate) fn refine_virtual_edge_jump(
         &mut self,
+        dominators: &Dominators,
         post_dom: &Dominators,
         entry: NodeIndex,
         node: NodeIndex,
@@ -242,11 +266,9 @@ impl GraphStructurer {
         next: Option<NodeIndex>,
     ) -> bool {
         if node == header {
-            // TODO: only check back edges?
             if !self
-                .function
-                .predecessor_blocks(header)
-                .filter(|&n| n != entry)
+                .other_back_edges(dominators, header, entry)
+                .into_iter()
                 .any(|n| {
                     post_dom
                         .dominators(entry)
@@ -256,10 +278,15 @@ impl GraphStructurer {
                 return false;
             }
             let block = &mut self.function.block_mut(entry).unwrap();
-            block.push(ast::Continue {}.into());
+            if !Self::ends_in_jump(block) {
+                block.push(ast::Continue {}.into());
+            }
         } else if Some(node) == next {
             let block = &mut self.function.block_mut(entry).unwrap();
-            block.push(ast::Break {}.into());
+            // match_inner_loop_continue may have put the break there already
+            if !Self::ends_in_jump(block) {
+                block.push(ast::Break {}.into());
+            }
         }
         self.function.set_edges(entry, vec![]);
         true
@@ -267,6 +294,7 @@ impl GraphStructurer {
 
     pub(crate) fn refine_virtual_edge_conditional(
         &mut self,
+        dominators: &Dominators,
         post_dom: &Dominators,
         entry: NodeIndex,
         then_node: NodeIndex,
@@ -274,25 +302,17 @@ impl GraphStructurer {
         header: NodeIndex,
         next: Option<NodeIndex>,
     ) -> bool {
-        let then_main_cont = self
-            .function
-            .predecessor_blocks(header)
-            .filter(|&n| n != entry)
-            .any(|n| {
-                post_dom
-                    .dominators(then_node)
-                    .is_some_and(|mut p| p.contains(&n))
-            });
-
-        let else_main_cont = self
-            .function
-            .predecessor_blocks(header)
-            .filter(|&n| n != entry)
-            .any(|n| {
-                post_dom
-                    .dominators(else_node)
-                    .is_some_and(|mut p| p.contains(&n))
-            });
+        let other_back_edges = self.other_back_edges(dominators, header, entry);
+        let then_main_cont = other_back_edges.iter().any(|&n| {
+            post_dom
+                .dominators(then_node)
+                .is_some_and(|mut p| p.contains(&n))
+        });
+        let else_main_cont = other_back_edges.iter().any(|&n| {
+            post_dom
+                .dominators(else_node)
+                .is_some_and(|mut p| p.contains(&n))
+        });
 
         let mut changed = false;
         let header_successors = self.function.successor_blocks(header).collect_vec();
@@ -354,6 +374,40 @@ impl GraphStructurer {
             || self.match_triangle_conditional(entry, then_node, else_node)
     }
 
+    // The innermost loop `node` is part of. A loop header dominates the code after its loop
+    // as well as its body, so the first header up the dominator tree isn't enough: `node`
+    // has to reach one of the loop's back edges without going through the header.
+    pub(crate) fn innermost_loop(
+        &self,
+        node: NodeIndex,
+        dominators: &Dominators,
+    ) -> Option<NodeIndex> {
+        dominators
+            .dominators(node)?
+            .find(|&header| self.is_loop_header(header) && self.in_loop(node, header, dominators))
+    }
+
+    fn in_loop(&self, node: NodeIndex, header: NodeIndex, dominators: &Dominators) -> bool {
+        if node == header {
+            return true;
+        }
+        let mut stack = self
+            .function
+            .predecessor_blocks(header)
+            .filter(|&p| dominators.dominators(p).is_some_and(|mut d| d.any(|x| x == header)))
+            .collect_vec();
+        let mut seen = rustc_hash::FxHashSet::default();
+        while let Some(current) = stack.pop() {
+            if current == node {
+                return true;
+            }
+            if current != header && seen.insert(current) {
+                stack.extend(self.function.predecessor_blocks(current));
+            }
+        }
+        false
+    }
+
     // a -> b + a -> h, where h is a loop header that dominates a
     // results in a -> b with the h branch as continue (or break, if h is an outer loop)
     // the diamond/triangle matchers only look at the header, not inside the body
@@ -382,16 +436,7 @@ impl GraphStructurer {
         if then_is_back && else_is_back {
             // both branches are headers, so the outer one means "leave the inner
             // loop and continue the outer", which is a break of the inner loop
-            let mut innermost: Option<NodeIndex> = None;
-            if let Some(doms) = dominators.dominators(entry) {
-                for d in doms {
-                    if self.is_loop_header(d) {
-                        innermost = Some(d);
-                        break;
-                    }
-                }
-            }
-            let Some(innermost) = innermost else {
+            let Some(innermost) = self.innermost_loop(entry, dominators) else {
                 return false;
             };
             let (outer_is_then, outer_target, _inner_target) =
@@ -445,21 +490,27 @@ impl GraphStructurer {
         }
         let other_target = if then_is_back { else_target } else { then_target };
         let back_target = if then_is_back { then_target } else { else_target };
+        // when this is the loop's only back edge it's the latch itself, and turning it into
+        // a continue leaves no loop for try_collapse_loop to build. that's still the better
+        // structure for most loops, so it's only kept as a latch on the retry (see lift)
+        if self.keep_latches
+            && self
+                .function
+                .predecessor_blocks(back_target)
+                .filter(|&p| {
+                    dominators.dominators(p).is_some_and(|mut d| d.any(|x| x == back_target))
+                })
+                .all(|p| p == entry)
+        {
+            return false;
+        }
         // dont collapse a loop-header conditional by accident
         if other_target == then_target && then_is_back {
             return false;
         }
         // continue only affects the innermost loop, so a back-edge to an outer
         // header has to become a break instead
-        let mut innermost_header: Option<NodeIndex> = None;
-        if let Some(doms) = dominators.dominators(entry) {
-            for d in doms {
-                if self.is_loop_header(d) {
-                    innermost_header = Some(d);
-                    break;
-                }
-            }
-        }
+        let innermost_header = self.innermost_loop(entry, dominators);
         let stmt: ast::Statement = if innermost_header == Some(back_target) {
             ast::Continue {}.into()
         } else {

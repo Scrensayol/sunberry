@@ -29,7 +29,7 @@ use clap::Parser;
 use parking_lot::Mutex;
 use ast::dominators::simple_fast;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use triomphe::Arc;
 
 use deserializer::bytecode::Bytecode;
@@ -288,12 +288,14 @@ fn decompile_function(
 
     let params = std::mem::take(&mut function.parameters);
     let is_variadic = function.is_variadic;
-    let block: Arc<Mutex<ast::Block>> = Arc::new(restructure::lift(function).into());
+    let outer_locals = upvalues_in.iter().chain(params.iter()).cloned().collect();
+    let block: Arc<Mutex<ast::Block>> =
+        Arc::new(restructure::lift(function, FxHashSet::clone(&outer_locals)).into());
     ast::fold_classes::fold_classes(&mut block.lock());
     LocalDeclarer::default().declare_locals(
         // TODO: why does block.clone() not work?
         Arc::clone(&block),
-        &upvalues_in.iter().chain(params.iter()).cloned().collect(),
+        &outer_locals,
     );
 
     {

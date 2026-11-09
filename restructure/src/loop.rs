@@ -324,6 +324,7 @@ impl GraphStructurer {
                 .collect_vec();
 
             let mut changed = false;
+            let mut split = None;
             let common_post_doms = post_dom
                 .dominators(body)
                 .map(|d| d.collect_vec())
@@ -338,6 +339,11 @@ impl GraphStructurer {
             if !self.is_for_next(header)
                 && let Some(new_next) = common_post_doms.into_iter().find(|&p| {
                     self.function.has_block(p)
+                        // an enclosing loop's header post dominates everything in an exitless
+                        // loop (see post_dominators), but it's never this loop's exit
+                        && !dominators
+                            .dominators(header)
+                            .is_some_and(|mut d| d.any(|x| x == p))
                         && continues
                             .iter()
                             .all(|&n| post_dom.dominators(n).unwrap().contains(&p))
@@ -368,6 +374,7 @@ impl GraphStructurer {
                         (next, BlockEdge::new(BranchType::Else)),
                     ],
                 );
+                split = Some(condition_block);
                 changed = true;
             }
 
@@ -397,6 +404,15 @@ impl GraphStructurer {
                 })
                 && self.function.successor_blocks(body).exactly_one().ok() != Some(header)
             {
+                // the split above is only worth it if the loop gets built, and leaving it
+                // would let match_jump merge it back and this split it again, forever
+                if let Some(condition_block) = split {
+                    let edges = self.function.remove_edges(condition_block);
+                    let block = self.function.remove_block(condition_block).unwrap();
+                    *self.function.block_mut(header).unwrap() = block;
+                    self.function.set_edges(header, edges);
+                    return false;
+                }
                 return changed;
             }
 
@@ -416,6 +432,7 @@ impl GraphStructurer {
             {
                 if let Some((then_edge, else_edge)) = self.function.conditional_edges(node) {
                     changed |= self.refine_virtual_edge_conditional(
+                        dominators,
                         post_dom,
                         node,
                         then_edge.target(),
@@ -425,7 +442,7 @@ impl GraphStructurer {
                     );
                 } else if let Some(edge) = self.function.unconditional_edge(node) {
                     changed |=
-                        self.refine_virtual_edge_jump(post_dom, node, edge.target(), header, next);
+                        self.refine_virtual_edge_jump(dominators, post_dom, node, edge.target(), header, next);
                 } else {
                     unreachable!();
                 }

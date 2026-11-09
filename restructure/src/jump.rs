@@ -94,7 +94,12 @@ impl super::GraphStructurer {
                         self.function.block_mut(node).unwrap().extend(block.0);
                         self.function.set_edges(node, edges);
                         true
-                    } else if self.function.entry() != &Some(node) && !self.is_loop_header(node) {
+                    } else if self.function.entry() != &Some(node)
+                        && !self.is_loop_header(node)
+                        // is_for_next looks at a block's first statement, so the for loop
+                        // would be lost
+                        && !self.is_for_next(target)
+                    {
                         // TODO: test
                         for (source, edge) in self
                             .function

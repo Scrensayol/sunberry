@@ -2,7 +2,10 @@ use ast::{
     dominators::{simple_fast, Dominators},
     LocalRw, Traverse,
 };
-use cfg::{block::BranchType, function::Function};
+use cfg::{
+    block::{BlockEdge, BranchType},
+    function::Function,
+};
 use itertools::Itertools;
 use parking_lot::Mutex;
 use triomphe::Arc;
@@ -11,6 +14,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use petgraph::{
     stable_graph::{EdgeIndex, NodeIndex, StableDiGraph},
     visit::*,
+    Direction,
 };
 use tuple::Map;
 
@@ -21,13 +25,49 @@ mod r#loop;
 // TODO: REFACTOR: move
 pub fn post_dominators<N: Default, E: Default>(
     graph: &mut StableDiGraph<N, E>,
+    entry: NodeIndex,
 ) -> Dominators {
-    let exits = graph
+    let mut exits = graph
         .node_identifiers()
         .filter(|&n| graph.neighbors(n).count() == 0)
         .collect_vec();
+    let res = post_dominators_from(graph, &exits);
+    if graph.node_identifiers().all(|n| res.dominators(n).is_some()) {
+        return res;
+    }
+
+    // A loop whose only way out is a return nested inside one of its statements never
+    // reaches an exit, so nothing in it gets post dominators and loop matching would stall.
+    // Give each such region an exit at the first node a dfs from the entry reaches in it,
+    // the header of its outermost loop.
+    let mut reaches_exit = FxHashSet::default();
+    let mark = |from: NodeIndex, reaches_exit: &mut FxHashSet<NodeIndex>| {
+        let mut stack = vec![from];
+        while let Some(node) = stack.pop() {
+            if reaches_exit.insert(node) {
+                stack.extend(graph.neighbors_directed(node, Direction::Incoming));
+            }
+        }
+    };
+    for &exit in &exits {
+        mark(exit, &mut reaches_exit);
+    }
+    let mut dfs = Dfs::new(&*graph, entry);
+    while let Some(node) = dfs.next(&*graph) {
+        if !reaches_exit.contains(&node) {
+            exits.push(node);
+            mark(node, &mut reaches_exit);
+        }
+    }
+    post_dominators_from(graph, &exits)
+}
+
+fn post_dominators_from<N: Default, E: Default>(
+    graph: &mut StableDiGraph<N, E>,
+    exits: &[NodeIndex],
+) -> Dominators {
     let fake_exit = graph.add_node(Default::default());
-    for exit in exits {
+    for &exit in exits {
         graph.add_edge(exit, fake_exit, Default::default());
     }
     let res = simple_fast(Reversed(&*graph), fake_exit);
@@ -39,6 +79,10 @@ struct GraphStructurer {
     pub function: Function,
     loop_headers: FxHashSet<NodeIndex>,
     label_to_node: FxHashMap<ast::Label, NodeIndex>,
+    // see match_inner_loop_continue
+    keep_latches: bool,
+    // the function's parameters and upvalues, which dispatch must not redeclare
+    outer_locals: FxHashSet<ast::RcLocal>,
 }
 
 impl GraphStructurer {
@@ -54,11 +98,17 @@ impl GraphStructurer {
             },
         );
     }
-    fn new(function: Function) -> Self {
+    fn new(
+        function: Function,
+        keep_latches: bool,
+        outer_locals: FxHashSet<ast::RcLocal>,
+    ) -> Self {
         let mut this = Self {
             function,
             loop_headers: FxHashSet::default(),
             label_to_node: FxHashMap::default(),
+            keep_latches,
+            outer_locals,
         };
         this.find_loop_headers();
         this
@@ -119,7 +169,8 @@ impl GraphStructurer {
         let mut dfs_postorder =
             DfsPostOrder::new(self.function.graph(), self.function.entry().unwrap());
         let mut dominators = simple_fast(self.function.graph(), self.function.entry().unwrap());
-        let mut post_dom = post_dominators(self.function.graph_mut());
+        let entry = self.function.entry().unwrap();
+        let mut post_dom = post_dominators(self.function.graph_mut(), entry);
 
         // cfg::dot::render_to(&self.function, &mut std::io::stdout()).unwrap();
 
@@ -129,7 +180,7 @@ impl GraphStructurer {
             let matched = self.try_match_pattern(node, &dominators, &post_dom);
             if matched {
                 dominators = simple_fast(self.function.graph(), self.function.entry().unwrap());
-                post_dom = post_dominators(self.function.graph_mut());
+                post_dom = post_dominators(self.function.graph_mut(), entry);
             }
             changed |= matched;
             // if matched {
@@ -189,6 +240,10 @@ impl GraphStructurer {
                 .push(terminator);
             let edge = self.function.graph_mut().remove_edge(edge).unwrap();
             self.function.graph_mut().add_edge(source, goto_block, edge);
+        } else if let Some((region, entry, exit)) = self.dispatchable_region(source, target)
+            && self.dispatch(&region, entry, exit)
+        {
+            // luau has no goto, so flatten the smallest region around the edge instead
         } else {
             // TODO: make label an Rc and have a global counter for block name
             let label = ast::Label(format!("l{}", target.index()));
@@ -427,6 +482,52 @@ impl GraphStructurer {
         })
     }
 
+    // replaces each break or continue in `block` that's not in a loop of its own with
+    // `state = code; break`, which leaves the dispatch loop saying which one it was
+    fn escape_jumps(
+        block: &mut ast::Block,
+        state: &ast::RcLocal,
+        (break_code, continue_code): (usize, usize),
+        (escapes_break, escapes_continue): (&mut bool, &mut bool),
+    ) {
+        let mut i = 0;
+        while i < block.len() {
+            let code = match &block[i] {
+                ast::Statement::Break(_) => {
+                    *escapes_break = true;
+                    break_code
+                }
+                ast::Statement::Continue(_) => {
+                    *escapes_continue = true;
+                    continue_code
+                }
+                ast::Statement::If(r#if) => {
+                    for nested in [&r#if.then_block, &r#if.else_block] {
+                        Self::escape_jumps(
+                            &mut nested.lock(),
+                            state,
+                            (break_code, continue_code),
+                            (&mut *escapes_break, &mut *escapes_continue),
+                        );
+                    }
+                    i += 1;
+                    continue;
+                }
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            block[i] = ast::Assign::new(
+                vec![ast::LValue::Local(state.clone())],
+                vec![ast::Literal::Number(code as f64).into()],
+            )
+            .into();
+            block.insert(i + 1, ast::Break {}.into());
+            i += 2;
+        }
+    }
+
     // same skip rule as LocalDeclarer, a for's induction variable is per-iteration
     // and must not be hoisted out of the loop, so only recurse into its body
     fn collect_residual_writes(block: &ast::Block, out: &mut FxHashSet<ast::RcLocal>) {
@@ -473,75 +574,179 @@ impl GraphStructurer {
     // state machine. only irreducible cfgs actually need this
     fn dispatch_residual(&mut self) -> bool {
         let nodes: Vec<NodeIndex> = self.function.graph().node_indices().collect();
-        if nodes.iter().any(|&n| {
-            self.is_loop_header(n)
-                || Self::block_has_dangling_break_continue(self.function.block(n).unwrap())
-        }) {
+        if nodes.iter().any(|&n| self.is_loop_header(n)) {
             return false;
         }
         let entry = self.function.entry().unwrap();
+        self.dispatch(&nodes, entry, None)
+    }
+
+    // The smallest region around `source -> target` that dispatch can flatten on its own:
+    // everything `entry` dominates, for the closest dominator of `source` where that
+    // includes `target`, is only entered through `entry` and leaves to one node at most.
+    // Loops inside are fine, a back edge is just another state, as long as they're whole.
+    fn dispatchable_region(
+        &self,
+        source: NodeIndex,
+        target: NodeIndex,
+    ) -> Option<(Vec<NodeIndex>, NodeIndex, Option<NodeIndex>)> {
+        let dominators = simple_fast(self.function.graph(), self.function.entry().unwrap());
+        let dominated_by = |node: NodeIndex, by: NodeIndex| {
+            dominators.dominators(node).is_some_and(|mut d| d.any(|x| x == by))
+        };
+        for entry in dominators.dominators(source)?.collect_vec() {
+            if !dominated_by(target, entry) {
+                continue;
+            }
+            let region = self
+                .function
+                .graph()
+                .node_indices()
+                .filter(|&n| dominated_by(n, entry))
+                .collect_vec();
+            if region.len() < 2 {
+                continue;
+            }
+            let in_region = region.iter().copied().collect::<FxHashSet<_>>();
+            let entered_elsewhere = region.iter().any(|&n| {
+                n != entry
+                    && self
+                        .function
+                        .predecessor_blocks(n)
+                        .any(|p| !in_region.contains(&p))
+            });
+            let exits = region
+                .iter()
+                .flat_map(|&n| self.function.successor_blocks(n))
+                .filter(|s| !in_region.contains(s))
+                .unique()
+                .collect_vec();
+            if entered_elsewhere || exits.len() > 1 {
+                continue;
+            }
+            return Some((region, entry, exits.first().copied()));
+        }
+        None
+    }
+
+    // Flatten `nodes` into `local state = n; while true do if state == 1 then ... elseif
+    // ... end end`, entered through `entry` and leaving to `exit`, if there is one. Always
+    // runnable, but ugly, so it's the last resort before a goto.
+    fn dispatch(&mut self, nodes: &[NodeIndex], entry: NodeIndex, exit: Option<NodeIndex>) -> bool {
+        // a for loop's pseudo statements only mean something to try_collapse_loop
+        if nodes.iter().any(|&n| {
+            self.function.block(n).unwrap().iter().any(|s| {
+                matches!(
+                    s,
+                    ast::Statement::NumForInit(_)
+                        | ast::Statement::NumForNext(_)
+                        | ast::Statement::GenericForInit(_)
+                        | ast::Statement::GenericForNext(_)
+                )
+            })
+        }) {
+            return false;
+        }
+        // A break or continue already placed for an enclosing loop would bind to the
+        // dispatch loop instead, so it leaves that with a code and repeats itself after.
+        // That only works when every node here is in that same loop and none of them is
+        // a loop header, or the jump could mean a different loop.
+        if nodes
+            .iter()
+            .any(|&n| Self::block_has_dangling_break_continue(self.function.block(n).unwrap()))
+        {
+            let dominators = simple_fast(self.function.graph(), self.function.entry().unwrap());
+            let loops = nodes
+                .iter()
+                .map(|&n| self.innermost_loop(n, &dominators))
+                .unique()
+                .collect_vec();
+            if loops.len() != 1
+                || loops[0].is_none()
+                || nodes.iter().any(|&n| self.is_loop_header(n))
+            {
+                return false;
+            }
+        }
         let id: FxHashMap<NodeIndex, usize> =
             nodes.iter().enumerate().map(|(i, &n)| (n, i + 1)).collect();
-        debug_assert!(self
-            .function
-            .graph()
-            .edge_indices()
-            .all(|e| id.contains_key(&self.function.graph().edge_endpoints(e).unwrap().1)));
+        let (break_code, continue_code) = (nodes.len() + 1, nodes.len() + 2);
 
         let state_local = ast::RcLocal::default();
+        let jump = |target: NodeIndex| -> ast::Statement {
+            if Some(target) == exit {
+                ast::Break {}.into()
+            } else {
+                ast::Assign::new(
+                    vec![ast::LValue::Local(state_local.clone())],
+                    vec![ast::Literal::Number(id[&target] as f64).into()],
+                )
+                .into()
+            }
+        };
 
         // the arms are siblings, so LocalDeclarer would park each `local` inside the
         // one arm that writes it and reads from the others would hit a nil global.
-        // a bare decl at the root dominates every arm
+        // a bare decl ahead of the loop dominates every arm. that redeclares the local,
+        // so it can't be one that's written outside the region, a parameter or an upvalue
         let mut hoist_locals: FxHashSet<ast::RcLocal> = FxHashSet::default();
-        for &n in &nodes {
-            Self::collect_residual_writes(
-                self.function.block(n).unwrap(),
-                &mut hoist_locals,
-            );
+        let mut written_outside: FxHashSet<ast::RcLocal> = FxHashSet::default();
+        for node in self.function.graph().node_indices() {
+            let block = self.function.block(node).unwrap();
+            if id.contains_key(&node) {
+                Self::collect_residual_writes(block, &mut hoist_locals);
+            } else {
+                Self::collect_residual_writes(block, &mut written_outside);
+            }
+        }
+        hoist_locals.retain(|l| !written_outside.contains(l) && !self.outer_locals.contains(l));
+
+        if nodes.iter().any(|&n| {
+            self.function.successor_blocks(n).count() == 2
+                && !matches!(self.function.block(n).unwrap().last(), Some(ast::Statement::If(_)))
+        }) {
+            return false;
         }
 
-        // while the graph is still intact
+        // while the graph is still intact. the arms share their nested blocks with it, so
+        // nothing can bail out after escape_jumps
+        let (mut escapes_break, mut escapes_continue) = (false, false);
         let mut arms: Vec<(usize, ast::Block)> = Vec::new();
-        for &n in &nodes {
+        for &n in nodes {
             let mut body = self.function.block(n).unwrap().clone();
+            let terminated = matches!(
+                body.last(),
+                Some(ast::Statement::Return(_) | ast::Statement::Break(_) | ast::Statement::Continue(_))
+            );
+            Self::escape_jumps(
+                &mut body,
+                &state_local,
+                (break_code, continue_code),
+                (&mut escapes_break, &mut escapes_continue),
+            );
             let succs: Vec<NodeIndex> = self.function.successor_blocks(n).collect();
             match succs.len() {
                 0 => {
-                    if !matches!(body.last(), Some(ast::Statement::Return(_))) {
-                        body.push(ast::Break {}.into());
+                    if !terminated {
+                        // the end of the function, which isn't what follows the region
+                        if exit.is_some() {
+                            body.push(ast::Return::new(Vec::new()).into());
+                        } else {
+                            body.push(ast::Break {}.into());
+                        }
                     }
                 }
-                1 => {
-                    body.push(
-                        ast::Assign::new(
-                            vec![ast::LValue::Local(state_local.clone())],
-                            vec![ast::Literal::Number(id[&succs[0]] as f64).into()],
-                        )
-                        .into(),
-                    );
-                }
+                1 => body.push(jump(succs[0])),
                 2 => {
                     let (then_e, else_e) = self.function.conditional_edges(n).unwrap();
-                    let (t, e) = (id[&then_e.target()], id[&else_e.target()]);
-                    let Ok(if_stat) = body.pop().unwrap().into_if() else {
-                        return false;
+                    let Some(ast::Statement::If(if_stat)) = body.pop() else {
+                        unreachable!()
                     };
                     body.push(
                         ast::If::new(
                             if_stat.condition,
-                            vec![ast::Assign::new(
-                                vec![ast::LValue::Local(state_local.clone())],
-                                vec![ast::Literal::Number(t as f64).into()],
-                            )
-                            .into()]
-                            .into(),
-                            vec![ast::Assign::new(
-                                vec![ast::LValue::Local(state_local.clone())],
-                                vec![ast::Literal::Number(e as f64).into()],
-                            )
-                            .into()]
-                            .into(),
+                            vec![jump(then_e.target())].into(),
+                            vec![jump(else_e.target())].into(),
                         )
                         .into(),
                     );
@@ -563,13 +768,19 @@ impl GraphStructurer {
         }
 
         let mut out_body = ast::Block::default();
-        out_body.push(ast::Comment::new("control flow flattened: this region could not be structured without a
-            `goto` (unsupported in Luau), so it was lowered to the state-machine
-            dispatch loop below to keep the output runnable.".to_string()).into());
+        out_body.push(
+            ast::Comment::new(
+                "control flow flattened: this couldn't be structured without a goto, which Luau doesn't have"
+                    .to_string(),
+            )
+            .into(),
+        );
         if !hoist_locals.is_empty() {
+            // sorted, so the declaration reads the same at any thread count
             let mut hoist = ast::Assign::new(
                 hoist_locals
                     .into_iter()
+                    .sorted()
                     .map(ast::LValue::Local)
                     .collect(),
                 Vec::new(),
@@ -585,20 +796,92 @@ impl GraphStructurer {
         out_body.push(init.into());
         out_body
             .push(ast::While::new(ast::Literal::Boolean(true).into(), acc).into());
-
-        for &n in &nodes {
-            self.function.remove_block(n);
+        for (escapes, code, jump) in [
+            (escapes_break, break_code, ast::Statement::from(ast::Break {})),
+            (escapes_continue, continue_code, ast::Continue {}.into()),
+        ] {
+            if escapes {
+                out_body.push(
+                    ast::If::new(
+                        ast::Binary::new(
+                            ast::RValue::Local(state_local.clone()),
+                            ast::Literal::Number(code as f64).into(),
+                            ast::BinaryOperation::Equal,
+                        )
+                        .into(),
+                        vec![jump].into(),
+                        ast::Block::default(),
+                    )
+                    .into(),
+                );
+            }
         }
+
         let out = self.function.new_block();
         *self.function.block_mut(out).unwrap() = out_body;
-        self.function.set_entry(out);
+        let incoming = self
+            .function
+            .graph()
+            .edges_directed(entry, Direction::Incoming)
+            .filter(|e| !id.contains_key(&e.source()))
+            .map(|e| (e.source(), e.weight().clone()))
+            .collect_vec();
+        for (source, weight) in incoming {
+            self.function.graph_mut().add_edge(source, out, weight);
+        }
+        if let Some(exit) = exit {
+            self.function
+                .set_edges(out, vec![(exit, BlockEdge::new(BranchType::Unconditional))]);
+        }
+        for &n in nodes {
+            self.function.remove_block(n);
+        }
+        if *self.function.entry() == Some(entry) {
+            self.function.set_entry(out);
+        }
         true
+    }
+
+    // rounds of matching in a row that don't get the graph any smaller before giving up.
+    // some matches rewrite the graph without shrinking it, and another match can undo
+    // that, so without a limit the two can take turns forever
+    const STALL_LIMIT: usize = 64;
+
+    fn match_until_fixed(&mut self) {
+        let mut smallest = self.function.graph().node_count();
+        let mut stalled = 0;
+        while self.match_blocks() {
+            let nodes = self.function.graph().node_count();
+            if nodes < smallest {
+                smallest = nodes;
+                stalled = 0;
+            } else {
+                stalled += 1;
+                if stalled == Self::STALL_LIMIT {
+                    break;
+                }
+            }
+        }
     }
 
     fn collapse(&mut self) {
         let mut taildup_rounds = 0u32;
+        let mut smallest = self.function.graph().node_count();
+        let mut stalled = 0;
         loop {
-            while self.match_blocks() {}
+            // same as match_until_fixed, the refinements below can be undone by matching.
+            // giving up leaves gotos, which lift then tries to do better on
+            let nodes = self.function.graph().node_count();
+            if nodes < smallest {
+                smallest = nodes;
+                stalled = 0;
+            } else {
+                stalled += 1;
+                if stalled > Self::STALL_LIMIT {
+                    break;
+                }
+            }
+            self.match_until_fixed();
             if self.function.graph().node_count() == 1 {
                 break;
             }
@@ -606,7 +889,7 @@ impl GraphStructurer {
             let before = self.function.graph().node_count();
             if taildup_rounds < 16 && self.tail_duplicate() {
                 taildup_rounds += 1;
-                while self.match_blocks() {}
+                self.match_until_fixed();
                 if self.function.graph().node_count() == 1 {
                     break;
                 }
@@ -763,6 +1046,62 @@ impl GraphStructurer {
     }
 }
 
-pub fn lift(function: cfg::function::Function) -> ast::Block {
-    GraphStructurer::new(function).structure()
+// Some functions structure into something Luau can't compile: a goto (Luau has none), or a
+// break or continue whose loop got lost. When that happens, structure it again with loop
+// latches kept (see match_inner_loop_continue), which gets some of those loops out cleanly,
+// and keep whichever result has fewer of them.
+//
+// `outer_locals` are the function's parameters and upvalues.
+pub fn lift(
+    function: cfg::function::Function,
+    outer_locals: FxHashSet<ast::RcLocal>,
+) -> ast::Block {
+    // keeping latches only changes anything for a function with loops
+    let mut has_loops = false;
+    depth_first_search(function.graph(), function.entry().iter().copied(), |event| {
+        if let DfsEvent::BackEdge(..) = event {
+            has_loops = true;
+        }
+    });
+    let retry = has_loops.then(|| {
+        let mut retry = function.clone();
+        for block in retry.blocks_mut() {
+            *block = GraphStructurer::deep_clone_block(block);
+        }
+        retry
+    });
+    let block = GraphStructurer::new(function, true, outer_locals.clone()).structure();
+    let invalid = count_invalid_jumps(&block, false);
+    let Some(retry) = retry.filter(|_| invalid > 0) else {
+        return block;
+    };
+    let retried = GraphStructurer::new(retry, false, outer_locals).structure();
+    if count_invalid_jumps(&retried, false) < invalid {
+        retried
+    } else {
+        block
+    }
+}
+
+fn count_invalid_jumps(block: &ast::Block, in_loop: bool) -> usize {
+    block
+        .iter()
+        .map(|statement| match statement {
+            ast::Statement::Goto(_) => 1,
+            ast::Statement::Break(_) | ast::Statement::Continue(_) => usize::from(!in_loop),
+            ast::Statement::If(r#if) => {
+                count_invalid_jumps(&r#if.then_block.lock(), in_loop)
+                    + count_invalid_jumps(&r#if.else_block.lock(), in_loop)
+            }
+            ast::Statement::While(r#while) => count_invalid_jumps(&r#while.block.lock(), true),
+            ast::Statement::Repeat(repeat) => count_invalid_jumps(&repeat.block.lock(), true),
+            ast::Statement::NumericFor(numeric_for) => {
+                count_invalid_jumps(&numeric_for.block.lock(), true)
+            }
+            ast::Statement::GenericFor(generic_for) => {
+                count_invalid_jumps(&generic_for.block.lock(), true)
+            }
+            _ => 0,
+        })
+        .sum()
 }
