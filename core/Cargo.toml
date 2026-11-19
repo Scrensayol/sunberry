@@ -1,0 +1,9 @@
+[package]
+name = "sunberry-core"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+rayon = "1"

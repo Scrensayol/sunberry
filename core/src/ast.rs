@@ -1,0 +1,101 @@
+// The output tree. Locals are numbered per function; upvalues are slots resolved through
+// the capture list of the closure expression that creates the function, so each function
+// can be lifted on its own and names are only decided when printing.
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Expr {
+    Nil,
+    Bool(bool),
+    Number(f64),
+    String(Vec<u8>),
+    Vector([f64; 3]),
+    // `multret` when every value is used; otherwise a single value, which needs parentheses
+    // wherever the position would expand it (last argument, last field, return list)
+    VarArg { multret: bool },
+    Local(u32),
+    Upvalue(u8),
+    Global(Vec<u8>),
+    Index(Box<Expr>, Box<Expr>),
+    Call { func: Box<Expr>, args: Vec<Expr>, multret: bool },
+    MethodCall { object: Box<Expr>, method: Vec<u8>, args: Vec<Expr>, multret: bool },
+    Binary(BinOp, Box<Expr>, Box<Expr>),
+    Unary(UnOp, Box<Expr>),
+    Table(Vec<Field>),
+    Closure(Box<Closure>),
+}
+
+impl Expr {
+    pub fn expands(&self) -> bool {
+        matches!(
+            self,
+            Expr::VarArg { multret: true } | Expr::Call { multret: true, .. } | Expr::MethodCall { multret: true, .. }
+        )
+    }
+
+    pub fn single(self) -> Expr {
+        match self {
+            Expr::VarArg { .. } => Expr::VarArg { multret: false },
+            Expr::Call { func, args, .. } => Expr::Call { func, args, multret: false },
+            Expr::MethodCall { object, method, args, .. } => Expr::MethodCall { object, method, args, multret: false },
+            other => other,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    IDiv,
+    Mod,
+    Pow,
+    Concat,
+    And,
+    Or,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnOp {
+    Not,
+    Neg,
+    Len,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Field {
+    Positional(Expr),
+    Keyed(Expr, Expr),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Closure {
+    pub proto: usize,
+    pub captures: Vec<Capture>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Capture {
+    Local(u32),
+    Upvalue(u8),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Stmt {
+    Local { locals: Vec<u32>, values: Vec<Expr> },
+    // `local function f` — the closure captures `local` itself
+    LocalFunction { local: u32, closure: Closure },
+    Assign { targets: Vec<Expr>, values: Vec<Expr> },
+    Call(Expr),
+    Return(Vec<Expr>),
+}
+
+#[derive(Clone, Debug)]
+pub struct Function {
+    pub params: Vec<u32>,
+    pub is_vararg: bool,
+    pub body: Vec<Stmt>,
+    // debug names (debug level 2), indexed by local
+    pub names: Vec<Option<Vec<u8>>>,
+}
