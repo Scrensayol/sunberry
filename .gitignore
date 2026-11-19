@@ -6,3 +6,6 @@ flamegraph.svg
 result.lua
 
 Tests
+
+# round-trip harness runs: failing cases, reduced programs, reports
+harness/out/

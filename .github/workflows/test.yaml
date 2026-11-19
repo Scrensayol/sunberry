@@ -20,3 +20,22 @@ jobs:
 
       - name: Test
         run: cargo test --release -p ast -p cfg -p restructure -p luau-lifter
+
+      - name: Build round-trip harness
+        run: cargo build --profile harness -p harness
+
+      - name: Round-trip snapshot programs
+        run: target/harness/sunberry-harness check --work harness/out/check
+
+      # fails only on failures missing from harness/baseline.json. after a fix, run
+      # `sunberry-harness fuzz --seeds 200 --baseline harness/baseline.json --update-baseline`
+      - name: Round-trip generated programs
+        run: target/harness/sunberry-harness fuzz --seeds 200 --baseline harness/baseline.json --work harness/out/fuzz
+
+      - name: Upload failing round trips
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: round-trip-failures
+          path: harness/out
+          retention-days: 7

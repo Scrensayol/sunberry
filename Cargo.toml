@@ -9,6 +9,7 @@ members = [
     "restructure",
     "luau-worker",
     "sunberry",
+    "harness",
 ]
 
 [workspace.package]
@@ -32,3 +33,11 @@ lto = true
 inherits = "release"
 debug = false
 strip = true
+
+# the round-trip harness: same code generation as release, but no LTO, so it links in seconds
+[profile.harness]
+inherits = "release"
+debug = false
+lto = false
+codegen-units = 16
+incremental = true
