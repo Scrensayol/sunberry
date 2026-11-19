@@ -4,6 +4,7 @@ pub mod disasm;
 pub mod inline;
 mod lift;
 mod liveness;
+mod names;
 pub mod print;
 
 use rayon::prelude::*;
@@ -46,7 +47,10 @@ pub fn decompile(data: &[u8], key: u8) -> Result<String, Error> {
         .collect::<Vec<_>>()
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
-    let functions = deinline(&chunk, lifted);
+    let mut functions = deinline(&chunk, lifted);
+    for function in &mut functions {
+        names::infer(function);
+    }
     Ok(print::print_chunk(&functions, chunk.main))
 }
 

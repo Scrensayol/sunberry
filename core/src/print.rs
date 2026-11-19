@@ -130,18 +130,76 @@ struct Printer<'a> {
     taken: HashSet<String>,
     counter: usize,
     scopes: Vec<Scope>,
+    // names called with `:` somewhere: a function stored under one is likely a method
+    methods: HashSet<Vec<u8>>,
 }
 
 pub fn print_chunk(functions: &[Function], main: usize) -> String {
     let mut reserved = HashSet::new();
+    let mut methods = HashSet::new();
     for function in functions {
         collect_globals(&function.body, &mut reserved);
+        collect_methods(&function.body, &mut methods);
     }
-    let mut printer = Printer { functions, reserved, taken: HashSet::new(), counter: 0, scopes: Vec::new() };
+    // printed for vector constants
+    reserved.insert(b"Vector3".to_vec());
+    let mut printer = Printer { functions, reserved, taken: HashSet::new(), counter: 0, scopes: Vec::new(), methods };
     printer.scopes.push(Scope { proto: main, locals: vec![None; functions[main].names.len()], upvalues: Vec::new() });
     let mut out = String::new();
     printer.body(&functions[main].body, 0, &mut out);
     out
+}
+
+fn collect_methods(body: &[Stmt], out: &mut HashSet<Vec<u8>>) {
+    fn expr(e: &Expr, out: &mut HashSet<Vec<u8>>) {
+        match e {
+            Expr::MethodCall { object, method, args, .. } => {
+                out.insert(method.clone());
+                expr(object, out);
+                args.iter().for_each(|a| expr(a, out));
+            }
+            Expr::Index(a, b) | Expr::Binary(_, a, b) => {
+                expr(a, out);
+                expr(b, out);
+            }
+            Expr::Unary(_, a) => expr(a, out),
+            Expr::IfElse(a, b, c) => {
+                expr(a, out);
+                expr(b, out);
+                expr(c, out);
+            }
+            Expr::Call { func, args, .. } => {
+                expr(func, out);
+                args.iter().for_each(|a| expr(a, out));
+            }
+            Expr::Table(fields) => fields.iter().for_each(|f| match f {
+                Field::Positional(v) => expr(v, out),
+                Field::Keyed(k, v) => {
+                    expr(k, out);
+                    expr(v, out);
+                }
+            }),
+            _ => {}
+        }
+    }
+    for stmt in body {
+        match stmt {
+            Stmt::Local { values, .. } | Stmt::Return(values) => values.iter().for_each(|v| expr(v, out)),
+            Stmt::Assign { targets, values } => targets.iter().chain(values).for_each(|v| expr(v, out)),
+            Stmt::Call(e) => expr(e, out),
+            Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::Repeat { cond, .. } => expr(cond, out),
+            Stmt::NumericFor { from, to, step, .. } => {
+                expr(from, out);
+                expr(to, out);
+                step.iter().for_each(|s| expr(s, out));
+            }
+            Stmt::GenericFor { values, .. } => values.iter().for_each(|v| expr(v, out)),
+            Stmt::LocalFunction { .. } | Stmt::Break | Stmt::Continue | Stmt::Do(_) => {}
+        }
+        for body in stmt.bodies() {
+            collect_methods(body, out);
+        }
+    }
 }
 
 fn collect_globals(body: &[Stmt], out: &mut HashSet<Vec<u8>>) {
@@ -203,20 +261,20 @@ impl Printer<'_> {
     fn declare(&mut self, local: u32) -> String {
         let proto = self.scopes.last().unwrap().proto;
         let wanted = self.functions[proto].names.get(local as usize).cloned().flatten().filter(|n| is_identifier(n));
-        let name = match wanted {
-            Some(n) if !self.reserved.contains(&n) && !self.taken.contains(std::str::from_utf8(&n).unwrap()) => {
-                String::from_utf8(n).unwrap()
-            }
-            wanted => {
-                let base = wanted.map(|n| String::from_utf8(n).unwrap()).unwrap_or_else(|| "v".into());
-                loop {
-                    self.counter += 1;
-                    let candidate = format!("{base}{}", self.counter);
-                    if !self.taken.contains(&candidate) && !self.reserved.contains(candidate.as_bytes()) {
-                        break candidate;
-                    }
+        let free = |p: &Self, n: &str| !p.taken.contains(n) && !p.reserved.contains(n.as_bytes());
+        let name = match wanted.map(|n| String::from_utf8(n).unwrap()) {
+            // a name of its own, numbered from 2 when it's taken
+            Some(base) => (1..)
+                .map(|i| if i == 1 { base.clone() } else { format!("{base}{i}") })
+                .find(|c| free(self, c))
+                .unwrap(),
+            None => loop {
+                self.counter += 1;
+                let candidate = format!("v{}", self.counter);
+                if free(self, &candidate) {
+                    break candidate;
                 }
-            }
+            },
         };
         self.taken.insert(name.clone());
         self.scopes.last_mut().unwrap().locals[local as usize] = Some(name.clone());
@@ -238,6 +296,34 @@ impl Printer<'_> {
 
     fn stmt(&mut self, stmt: &Stmt, indent: usize) -> String {
         match stmt {
+            // `local f = function` can't see f, so it is `local function f`
+            Stmt::Local { locals, values } if locals.len() == 1 && matches!(values[..], [Expr::Closure(_)]) => {
+                let Expr::Closure(closure) = &values[0] else { unreachable!() };
+                let function = self.closure(closure, indent);
+                let name = self.declare(locals[0]);
+                format!("local function {name}{}", &function["function".len()..])
+            }
+            // nil is what a bare local starts as
+            Stmt::Local { locals, values } if !values.is_empty() && values.len() <= locals.len() && values.iter().all(|v| *v == Expr::Nil) => {
+                let names = locals.iter().map(|&l| self.declare(l)).collect::<Vec<_>>();
+                format!("local {}", names.join(", "))
+            }
+            Stmt::Assign { targets, values } if targets.len() == 1 && matches!(values[..], [Expr::Closure(_)]) && self.path(&targets[0]).is_some() => {
+                let Expr::Closure(closure) = &values[0] else { unreachable!() };
+                let path = self.path(&targets[0]).unwrap();
+                let method = match &targets[0] {
+                    Expr::Index(_, key) => matches!(key.as_ref(), Expr::String(k) if self.is_method(closure, k)),
+                    _ => false,
+                };
+                if method {
+                    let (dot, name) = path.rsplit_once('.').unwrap();
+                    let function = self.closure_as(closure, indent, true);
+                    format!("function {dot}:{name}{}", &function["function".len()..])
+                } else {
+                    let function = self.closure(closure, indent);
+                    format!("function {path}{}", &function["function".len()..])
+                }
+            }
             Stmt::Local { locals, values } => {
                 let values = self.list_for(values, locals.len(), indent);
                 let names = locals.iter().map(|&l| self.declare(l)).collect::<Vec<_>>();
@@ -498,7 +584,48 @@ impl Printer<'_> {
         }
     }
 
+    // `a.b.c` for a place a function statement can name
+    fn path(&self, e: &Expr) -> Option<String> {
+        match e {
+            Expr::Local(l) => self.scopes.last().unwrap().locals[*l as usize].clone(),
+            Expr::Upvalue(u) => self.scopes.last().unwrap().upvalues.get(*u as usize).cloned(),
+            Expr::Global(g) if is_identifier(g) => Some(String::from_utf8_lossy(g).into_owned()),
+            Expr::Index(t, k) => match k.as_ref() {
+                Expr::String(k) if is_identifier(k) => Some(format!("{}.{}", self.path(t)?, String::from_utf8_lossy(k))),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    // `t.m = function(self, ...)` as `function t:m(...)`: when debug info calls the first
+    // parameter self, or the name is called with `:` somewhere. Not when the body sees an
+    // outer `self` (the parameter would hide it) or `self` is a global here.
+    fn is_method(&self, closure: &Closure, name: &[u8]) -> bool {
+        let function = &self.functions[closure.proto];
+        let Some(&first) = function.params.first() else { return false };
+        let named = function.names.get(first as usize).cloned().flatten();
+        let likely = match &named {
+            Some(n) => n == b"self",
+            None => self.methods.contains(name),
+        };
+        let parent = self.scopes.last().unwrap();
+        let outer_self = closure.captures.iter().any(|c| {
+            let n = match c {
+                Capture::Local(l) => parent.locals[*l as usize].clone(),
+                Capture::Upvalue(u) => parent.upvalues.get(*u as usize).cloned(),
+            };
+            n.as_deref() == Some("self")
+        });
+        likely && !outer_self && !self.reserved.contains(&b"self"[..])
+    }
+
     fn closure(&mut self, closure: &Closure, indent: usize) -> String {
+        self.closure_as(closure, indent, false)
+    }
+
+    // a method's first parameter is `self`, left out of the list
+    fn closure_as(&mut self, closure: &Closure, indent: usize, method: bool) -> String {
         let parent = self.scopes.last().unwrap();
         let upvalues = closure
             .captures
@@ -510,7 +637,14 @@ impl Printer<'_> {
             .collect();
         let function = &self.functions[closure.proto];
         self.scopes.push(Scope { proto: closure.proto, locals: vec![None; function.names.len()], upvalues });
-        let mut params = function.params.iter().map(|&p| self.declare(p)).collect::<Vec<_>>();
+        let mut params = Vec::new();
+        for (i, &p) in function.params.iter().enumerate() {
+            if method && i == 0 {
+                self.scopes.last_mut().unwrap().locals[p as usize] = Some("self".into());
+                continue;
+            }
+            params.push(self.declare(p));
+        }
         if function.is_vararg {
             params.push("...".into());
         }

@@ -118,6 +118,12 @@ struct Lifter<'a> {
     // Never rolled back: value paths keep expressions lifted before a restore, and an upvalue
     // nothing reads is harmless
     extra: Vec<usize>,
+    // instructions entered so far, and where to give up (statements instead of a huge value
+    // get a budget); the value region that was too big, and whether big ones are allowed now
+    work: usize,
+    work_limit: usize,
+    too_big: Option<usize>,
+    allow_big: bool,
 }
 
 // where a loop's far exits land, the pcs jumping there, and the flag (see `far_exits`)
@@ -248,6 +254,10 @@ pub fn lift(chunk: &Chunk, proto_id: usize, inline: Option<&Ctx>) -> Result<Lift
         inlining_off: false,
         made: Vec::new(),
         extra: Vec::new(),
+        work: 0,
+        work_limit: usize::MAX,
+        too_big: None,
+        allow_big: false,
     };
     let params = (0..proto.num_params)
         .map(|reg| {
@@ -282,7 +292,10 @@ pub fn lift(chunk: &Chunk, proto_id: usize, inline: Option<&Ctx>) -> Result<Lift
 // assigned it somewhere (or was O0, where nothing folds). The output must not be more
 // foldable than that: such a local is declared bare and then assigned.
 fn pin_constants(body: Vec<Stmt>, by_ref: &[bool]) -> Vec<Stmt> {
-    fn mark(body: &[Stmt], assigned: &mut [bool]) {
+    // Folding only changes a result through `^` (pow() at compile time, POWK's x*x, sqrt
+    // or x*x*x at runtime), so a local needs pinning only if it could fold to a number and
+    // reaches a `^`, directly or through a closure that captures it.
+    fn mark(body: &[Stmt], assigned: &mut [bool], powered: &mut [bool]) {
         for stmt in body {
             if let Stmt::Assign { targets, .. } = stmt {
                 for target in targets {
@@ -291,23 +304,115 @@ fn pin_constants(body: Vec<Stmt>, by_ref: &[bool]) -> Vec<Stmt> {
                     }
                 }
             }
+            stmt_exprs(stmt, &mut |e| powers(e, false, powered));
             for nested in stmt.bodies() {
-                mark(nested, assigned);
+                mark(nested, assigned, powered);
             }
         }
     }
+    fn powers(e: &Expr, inside: bool, powered: &mut [bool]) {
+        match e {
+            Expr::Local(l) if inside => powered[*l as usize] = true,
+            Expr::Binary(op, a, b) => {
+                let inside = inside || *op == BinOp::Pow;
+                powers(a, inside, powered);
+                powers(b, inside, powered);
+            }
+            Expr::Unary(_, a) => powers(a, inside, powered),
+            Expr::Index(a, b) => {
+                powers(a, inside, powered);
+                powers(b, inside, powered);
+            }
+            Expr::IfElse(a, b, c) => {
+                powers(a, inside, powered);
+                powers(b, inside, powered);
+                powers(c, inside, powered);
+            }
+            Expr::Call { func, args, .. } => {
+                powers(func, inside, powered);
+                // a local function's body may use them in `^` once it is inlined again
+                let inlinable = matches!(func.as_ref(), Expr::Local(_) | Expr::Upvalue(_));
+                args.iter().for_each(|a| powers(a, inside || inlinable, powered));
+            }
+            Expr::MethodCall { object, args, .. } => {
+                powers(object, inside, powered);
+                args.iter().for_each(|a| powers(a, inside, powered));
+            }
+            Expr::Table(fields) => fields.iter().for_each(|f| match f {
+                Field::Positional(v) => powers(v, inside, powered),
+                Field::Keyed(k, v) => {
+                    powers(k, inside, powered);
+                    powers(v, inside, powered);
+                }
+            }),
+            // a closure may do anything with what it captures
+            Expr::Closure(c) => {
+                for cap in &c.captures {
+                    if let Capture::Local(l) = cap {
+                        powered[*l as usize] = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     let mut assigned = vec![false; by_ref.len()];
-    mark(&body, &mut assigned);
-    pin(body, &assigned, by_ref)
+    let mut powered = vec![false; by_ref.len()];
+    mark(&body, &mut assigned, &mut powered);
+    let mut constant = vec![false; by_ref.len()];
+    pin(body, &assigned, by_ref, &powered, &mut constant)
 }
 
-fn pin(body: Vec<Stmt>, assigned: &[bool], by_ref: &[bool]) -> Vec<Stmt> {
+// `foldable`, counting locals that may fold too (a constant made of other constants folds)
+fn foldable_with(expr: &Expr, constant: &[bool]) -> bool {
+    match expr {
+        Expr::Local(l) => constant[*l as usize],
+        Expr::Unary(_, e) => foldable_with(e, constant),
+        Expr::Binary(_, a, b) => foldable_with(a, constant) && foldable_with(b, constant),
+        Expr::Index(t, k) => matches!(t.as_ref(), Expr::Global(_)) && foldable_with(k, constant),
+        Expr::Call { func, args, .. } => foldable(func) && args.iter().all(|a| foldable_with(a, constant)),
+        e => foldable(e),
+    }
+}
+
+// every expression a statement holds directly (not inside nested statements)
+fn stmt_exprs(stmt: &Stmt, f: &mut dyn FnMut(&Expr)) {
+    match stmt {
+        Stmt::Local { values, .. } | Stmt::Return(values) => values.iter().for_each(&mut *f),
+        Stmt::Assign { targets, values } => targets.iter().chain(values).for_each(&mut *f),
+        Stmt::Call(e) => f(e),
+        Stmt::LocalFunction { closure, .. } => f(&Expr::Closure(Box::new(closure.clone()))),
+        Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::Repeat { cond, .. } => f(cond),
+        Stmt::NumericFor { from, to, step, .. } => {
+            f(from);
+            f(to);
+            step.iter().for_each(&mut *f);
+        }
+        Stmt::GenericFor { values, .. } => values.iter().for_each(&mut *f),
+        Stmt::Break | Stmt::Continue | Stmt::Do(_) => {}
+    }
+}
+
+// could constant folding turn this into a number
+fn may_be_number(e: &Expr) -> bool {
+    match e {
+        Expr::Number(_) | Expr::Vector(_) => true,
+        Expr::Nil | Expr::Bool(_) | Expr::String(_) => false,
+        Expr::Binary(BinOp::Concat | BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge, ..) => false,
+        Expr::Binary(BinOp::And | BinOp::Or, a, b) => may_be_number(a) || may_be_number(b),
+        Expr::Unary(UnOp::Not, _) => false,
+        Expr::IfElse(_, a, b) => may_be_number(a) || may_be_number(b),
+        _ => true,
+    }
+}
+
+fn pin(body: Vec<Stmt>, assigned: &[bool], by_ref: &[bool], powered: &[bool], constant: &mut [bool]) -> Vec<Stmt> {
     let mut out = Vec::with_capacity(body.len());
     for stmt in body {
         match stmt {
             mut stmt @ (Stmt::If { .. } | Stmt::While { .. } | Stmt::Repeat { .. } | Stmt::NumericFor { .. } | Stmt::GenericFor { .. } | Stmt::Do(_)) => {
                 for nested in stmt.bodies_mut() {
-                    *nested = pin(std::mem::take(nested), assigned, by_ref);
+                    *nested = pin(std::mem::take(nested), assigned, by_ref, powered, constant);
                 }
                 out.push(stmt);
             }
@@ -316,11 +421,17 @@ fn pin(body: Vec<Stmt>, assigned: &[bool], by_ref: &[bool]) -> Vec<Stmt> {
                     && values.len() == 1
                     && !assigned[locals[0] as usize]
                     && !by_ref[locals[0] as usize]
-                    && foldable(&values[0]) =>
+                    && foldable_with(&values[0], constant) =>
             {
                 let local = locals[0];
-                out.push(Stmt::Local { locals, values: Vec::new() });
-                out.push(Stmt::Assign { targets: vec![Expr::Local(local)], values });
+                // a pinned local is a variable from then on: nothing folds through it
+                if powered[local as usize] && may_be_number(&values[0]) {
+                    out.push(Stmt::Local { locals, values: Vec::new() });
+                    out.push(Stmt::Assign { targets: vec![Expr::Local(local)], values });
+                } else {
+                    constant[local as usize] = true;
+                    out.push(Stmt::Local { locals, values });
+                }
             }
             stmt => out.push(stmt),
         }
@@ -1454,6 +1565,10 @@ impl Lifter<'_> {
     fn enter(&mut self, i: usize) -> Result<(), Error> {
         self.pc = self.insns[i].pc;
         self.at = i;
+        self.work += 1;
+        if self.work > self.work_limit {
+            return Err(self.unsupported("too much work"));
+        }
         if self.trace {
             let stack = self.pending.iter().map(|p| format!("R{}{:?}", p.reg, p.span)).collect::<Vec<_>>();
             eprintln!("f{} {:>4} {:<12} pending [{}]", self.proto_id, self.pc, self.insns[i].op.name(), stack.join(" "));
@@ -1529,9 +1644,38 @@ impl Lifter<'_> {
                 continue;
             }
             if is_test(insn.op) {
+                self.too_big = None;
                 if let Some(next) = self.value_region(i, end)? {
                     i = next;
                     continue;
+                }
+                // a value too big to print well: statements, if they come out in reasonable
+                // time, else the value after all
+                if self.too_big == Some(i) {
+                    let start = self.snapshot();
+                    let limit = self.work_limit;
+                    self.work_limit = limit.min(self.work + 200_000);
+                    let attempt = self.statement_if(i, end, exits);
+                    self.work_limit = limit;
+                    match attempt {
+                        Ok(next) => {
+                            i = next;
+                            continue;
+                        }
+                        Err(_) => {
+                            self.restore(&start);
+                            self.allow_big = true;
+                            let value = self.value_region(i, end);
+                            self.allow_big = false;
+                            match value? {
+                                Some(next) => {
+                                    i = next;
+                                    continue;
+                                }
+                                None => return Err(self.unsupported("a value region that went away")),
+                            }
+                        }
+                    }
                 }
                 // a test going to the same place either way (folding leaves these) still has
                 // to compare: an empty `if` does exactly that
@@ -2086,7 +2230,24 @@ impl Lifter<'_> {
                 self.push(result, Span::One, Value::Expr(Expr::Local(l)))?;
             }
         }
-        match self.value_paths(first, join, result) {
+        // paths that join again get copied into every branch of the expression: past a few
+        // times the size of the code, statements say it better (and linearly)
+        // (only the outermost region is judged: one inside another is part of its value)
+        let allow_big = self.allow_big;
+        self.allow_big = true;
+        let paths = self.value_paths(first, join, result);
+        self.allow_big = allow_big;
+        let paths = match paths {
+            Ok(Some(expr)) if !allow_big && expr_size(&expr) > 8 * (join_index - first) + 200 => {
+                self.too_big = Some(first);
+                if self.trace {
+                    eprintln!("       value region at {} would copy paths: statements instead", insn.pc);
+                }
+                Ok(None)
+            }
+            other => other,
+        };
+        match paths {
             Ok(Some(expr)) => {
                 match target {
                     Some(l) => {
@@ -2634,6 +2795,24 @@ fn build_value(tree: Tree) -> Option<Expr> {
 }
 
 // `if p then t else f` in the plainest form that means exactly the same
+fn expr_size(e: &Expr) -> usize {
+    1 + match e {
+        Expr::Index(a, b) | Expr::Binary(_, a, b) => expr_size(a) + expr_size(b),
+        Expr::Unary(_, a) => expr_size(a),
+        Expr::IfElse(a, b, c) => expr_size(a) + expr_size(b) + expr_size(c),
+        Expr::Call { func, args, .. } => expr_size(func) + args.iter().map(expr_size).sum::<usize>(),
+        Expr::MethodCall { object, args, .. } => expr_size(object) + args.iter().map(expr_size).sum::<usize>(),
+        Expr::Table(fields) => fields
+            .iter()
+            .map(|f| match f {
+                Field::Positional(v) => expr_size(v),
+                Field::Keyed(k, v) => expr_size(k) + expr_size(v),
+            })
+            .sum(),
+        _ => 0,
+    }
+}
+
 pub(crate) fn simplify_choice(p: Expr, t: Expr, f: Expr) -> Expr {
     let boolean = p.is_boolean();
     match (t, f) {
@@ -2775,45 +2954,48 @@ impl Lifter<'_> {
                         _ => {}
                     }
                 }
-                let Ok(Some(sub)) = sub else {
+                let Ok(Some(variants)) = sub else {
                     if end == run_end {
                         note(&mut why, "region doesn't lift alone");
                     }
                     continue;
                 };
-                let upvalues = match &captures {
-                    Some(c) => Upvalues::Here(c),
-                    None => Upvalues::Outer { callee, caller: self.proto_id },
-                };
-                let Some(plan) = inline::unify(ctx, callee, upvalues, &sub) else {
-                    if end == run_end {
-                        note(&mut why, "no match");
-                    }
-                    if std::env::var_os("SUNBERRY_TRACE_INLINE").is_some() {
-                        eprintln!("== f{} {at}..{end} vs f{callee}: targets {:?} values {:?}\n   subject {:?}\n   callee {:?}", self.proto_id, sub.targets, sub.values, sub.stmts, ctx.raw[callee].body);
-                    }
-                    continue;
-                };
-                match self.call_inlined(end, func.clone(), &plan, &sub) {
-                    Ok(()) => {
-                        if let Expr::Upvalue(k) = func
-                            && k as usize >= self.proto.num_upvalues as usize
-                            && !self.extra.contains(&callee)
-                        {
-                            self.extra.push(callee);
+                for sub in variants {
+                    let upvalues = match &captures {
+                        Some(c) => Upvalues::Here(c),
+                        None => Upvalues::Outer { callee, caller: self.proto_id },
+                    };
+                    let sub = &sub;
+                    let Some(plan) = inline::unify(ctx, callee, upvalues, sub) else {
+                        if end == run_end {
+                            note(&mut why, "no match");
                         }
-                        if self.trace {
-                            eprintln!("       de-inlined f{callee} at {at}..{end}");
+                        if std::env::var_os("SUNBERRY_TRACE_INLINE").is_some() {
+                            eprintln!("== f{} {at}..{end} vs f{callee}: targets {:?} values {:?}\n   subject {:?}\n   callee {:?}", self.proto_id, sub.targets, sub.values, sub.stmts, ctx.raw[callee].body);
                         }
-                        inline::CALLS_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return Ok(Some(end - at));
-                    }
-                    Err(e) => {
-                        note(&mut why, "call doesn't fit");
-                        if self.trace {
-                            eprintln!("       de-inlining f{callee} at {at}..{end} failed: {e}");
+                        continue;
+                    };
+                    match self.call_inlined(end, func.clone(), &plan, sub) {
+                        Ok(()) => {
+                            if let Expr::Upvalue(k) = func
+                                && k as usize >= self.proto.num_upvalues as usize
+                                && !self.extra.contains(&callee)
+                            {
+                                self.extra.push(callee);
+                            }
+                            if self.trace {
+                                eprintln!("       de-inlined f{callee} at {at}..{end}");
+                            }
+                            inline::CALLS_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return Ok(Some(end - at));
                         }
-                        self.restore(&start);
+                        Err(e) => {
+                            note(&mut why, "call doesn't fit");
+                            if self.trace {
+                                eprintln!("       de-inlining f{callee} at {at}..{end} failed: {e}");
+                            }
+                            self.restore(&start);
+                        }
                     }
                 }
             }
@@ -2825,7 +3007,7 @@ impl Lifter<'_> {
     }
 
     // lifts insns[at..end) as if it were a function body of its own
-    fn sandbox(&mut self, at: usize, end: usize) -> Result<Option<Sub>, Error> {
+    fn sandbox(&mut self, at: usize, end: usize) -> Result<Option<Vec<Sub>>, Error> {
         let before = self.names.len();
         self.flush()?;
         let mut start = HashMap::new();
@@ -2835,7 +3017,7 @@ impl Lifter<'_> {
             }
         }
         let exits = [self.pc_at(end)];
-        let mut stmts = self.sub_body(|l| l.block(at, end, &exits))?;
+        let stmts = self.sub_body(|l| l.block(at, end, &exits))?;
         if stmts.iter().any(Stmt::terminates) {
             return Ok(None);
         }
@@ -2851,6 +3033,9 @@ impl Lifter<'_> {
         let mut values = Vec::new();
         let mut used = Vec::new();
         let mut many = false;
+        // registers of variables from before the region that it wrote: the call's result
+        // when Luau put it straight there (`x = f()`), or the callee assigning its upvalue
+        let mut outer = Vec::new();
         for &r in &targets {
             match self.slots[r as usize] {
                 Slot::Pending(id) => {
@@ -2868,14 +3053,11 @@ impl Lifter<'_> {
                     }
                     used.push(id);
                 }
-                // a result landing on a local: the assignment the region ended with
-                Slot::Local(l) => match stmts.last() {
-                    Some(Stmt::Assign { targets: t, values: v }) if t[..] == [Expr::Local(l)] && v.len() == 1 && start.contains_key(&l) => {
-                        values.push(v[0].clone());
-                        stmts.pop();
-                    }
-                    _ => values.push(Expr::Local(l)),
-                },
+                Slot::Local(l) if start.contains_key(&l) => {
+                    outer.push(r);
+                    values.push(Expr::Local(l));
+                }
+                Slot::Local(l) => values.push(Expr::Local(l)),
                 Slot::Free => return Ok(None),
             }
         }
@@ -2883,7 +3065,39 @@ impl Lifter<'_> {
         if self.pending.iter().any(|p| !used.contains(&p.id)) {
             return Ok(None);
         }
-        Ok(Some(Sub { stmts, values, many, targets, start }))
+        let mut variants = Vec::new();
+        // as results: each one is an assignment at the very end
+        {
+            let mut stmts = stmts.clone();
+            let mut values = values.clone();
+            let mut ok = true;
+            for (i, &r) in targets.iter().enumerate().rev() {
+                if !outer.contains(&r) {
+                    continue;
+                }
+                let Slot::Local(l) = self.slots[r as usize] else { unreachable!() };
+                match stmts.last() {
+                    Some(Stmt::Assign { targets: t, values: v }) if t[..] == [Expr::Local(l)] && v.len() == 1 => {
+                        values[i] = v[0].clone();
+                        stmts.pop();
+                    }
+                    _ => ok = false,
+                }
+            }
+            if ok {
+                variants.push(Sub { stmts, values, many, targets: targets.clone(), start: start.clone() });
+            }
+        }
+        // as the callee's own assignments: not results at all
+        if !outer.is_empty() && !many {
+            let keep = targets.iter().map(|r| !outer.contains(r)).collect::<Vec<_>>();
+            let targets2 = targets.iter().zip(&keep).filter(|(_, k)| **k).map(|(r, _)| *r).collect::<Vec<_>>();
+            if targets2.windows(2).all(|w| w[1] == w[0] + 1) {
+                let values2 = values.iter().zip(&keep).filter(|(_, k)| **k).map(|(v, _)| v.clone()).collect();
+                variants.push(Sub { stmts, values: values2, many, targets: targets2, start });
+            }
+        }
+        Ok(Some(variants))
     }
 
     // the region as a call: arguments from the registers the parameters were bound to
