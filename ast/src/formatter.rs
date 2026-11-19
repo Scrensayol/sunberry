@@ -104,13 +104,26 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
     // (function() end)()
     // (function() end)[1]
     fn should_wrap_left_rvalue(value: &RValue) -> bool {
-        !matches!(
-            value,
-            RValue::Local(_)
-                | RValue::Global(_)
-                | RValue::Index(_)
-                | RValue::Select(Select::Call(_) | Select::MethodCall(_))
-        )
+        match value {
+            RValue::Local(_) | RValue::Global(_) | RValue::Index(_) | RValue::Select(Select::Call(_)) => false,
+            // printed as `` `a{x}` ``, which can't be indexed or called without parentheses
+            RValue::Select(Select::MethodCall(method_call)) => Self::interpolation(method_call).is_some(),
+            _ => true,
+        }
+    }
+
+    // whether `value`, printed as the head of a call, index or method call, begins with `(`,
+    // looking through chains like ("a"):sub(1):upper()
+    fn starts_with_parenthesis(value: &RValue) -> bool {
+        Self::should_wrap_left_rvalue(value)
+            || match value {
+                RValue::Index(index) => Self::starts_with_parenthesis(&index.left),
+                RValue::Select(Select::Call(call)) => Self::starts_with_parenthesis(&call.value),
+                RValue::Select(Select::MethodCall(method_call)) => {
+                    Self::starts_with_parenthesis(&method_call.value)
+                }
+                _ => false,
+            }
     }
 
     fn format_block(&mut self, block: &Block) -> fmt::Result {
@@ -138,6 +151,8 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         if let Some(next_statement) =
             block.iter().skip(i + 1).find(|s| s.as_comment().is_none())
         {
+            // whether the printed value ends in a name, `)` or `]`, which a `(` on the next
+            // line would call
             fn is_ambiguous(r: &RValue) -> bool {
                 match r {
                     RValue::Local(_)
@@ -145,8 +160,11 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                     | RValue::Index(_)
                     | RValue::Call(_)
                     | RValue::MethodCall(_)
-                    | RValue::Select(Select::Call(_) | Select::MethodCall(_)) => true,
-                    RValue::Binary(binary) => is_ambiguous(&binary.right),
+                    | RValue::Select(_) => true,
+                    // printed as (1/0) and (0/0)
+                    RValue::Literal(Literal::Number(n)) => !n.is_finite(),
+                    RValue::Unary(unary) => unary.group() || is_ambiguous(&unary.value),
+                    RValue::Binary(binary) => binary.right_group() || is_ambiguous(&binary.right),
                     _ => false,
                 }
             }
@@ -173,14 +191,14 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                         ..
                     }) => {
                         if let Some(index) = left[0].as_index() {
-                            Self::should_wrap_left_rvalue(&index.left)
+                            Self::starts_with_parenthesis(&index.left)
                         } else {
                             false
                         }
                     }
                     Statement::Call(Call { value, .. })
                     | Statement::MethodCall(MethodCall { value, .. }) => {
-                        Self::should_wrap_left_rvalue(value)
+                        Self::starts_with_parenthesis(value)
                     }
                     Statement::Comment(_) => unimplemented!(),
                     _ => false,
@@ -204,20 +222,11 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             return true;
         }
 
-        let keys_vec = table
-            .0
-            .iter()
-            .filter(|(k, _)| !k.is_none())
-            .map(|(k, _)| k)
-            .collect_vec();
-        if keys_vec.is_empty() {
-            false
-        } else {
-            keys_vec.iter().enumerate().all(|(i, k)| {
-                matches!(k, Some(RValue::Literal(Literal::Number(x)))
-                        if (x - 1f64) as usize == i)
-            })
-        }
+        // keys can only be dropped when every entry is keyed 1, 2, 3...; next to a positional
+        // entry a key keeps its own slot (`{[1] = "a", "b"}`)
+        table.0.iter().enumerate().all(|(i, (k, _))| {
+            matches!(k, Some(RValue::Literal(Literal::Number(x))) if *x == (i + 1) as f64)
+        })
     }
 
     fn contains_table(table: &Table) -> bool {
