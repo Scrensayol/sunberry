@@ -8,10 +8,13 @@
 // first, oldest first. Either way every value is evaluated in the order the bytecode
 // computed it, which is what keeps the output's side effects in the original order.
 
+use std::collections::HashMap;
+
 use crate::{
     Error,
     ast::{BinOp, Capture, Closure, Expr, Field, Function, Stmt, UnOp},
     bytecode::{Chunk, Constant, Insn, Op, Proto},
+    inline::{self, Bind, Ctx, Sub, Upvalues},
     liveness::{self, Regs},
     print::is_identifier,
 };
@@ -105,6 +108,16 @@ struct Lifter<'a> {
     joins: Vec<Vec<u8>>,
     loops: Vec<LoopCtx>,
     trace: bool,
+    // de-inlining (see inline.rs): what the first lift of every function found, whether it's
+    // switched off (while checking a candidate), and closures created so far with the local
+    // each went into
+    inline: Option<&'a Ctx>,
+    inlining_off: bool,
+    made: Vec<(usize, u32, Vec<Capture>)>,
+    // functions this one calls through upvalues it doesn't have yet (numbered after its own).
+    // Never rolled back: value paths keep expressions lifted before a restore, and an upvalue
+    // nothing reads is harmless
+    extra: Vec<usize>,
 }
 
 // where a loop's far exits land, the pcs jumping there, and the flag (see `far_exits`)
@@ -138,6 +151,7 @@ struct Snapshot {
     ever_by_ref: Vec<bool>,
     fastcall: Option<Fastcall>,
     namecall: Option<(u8, Vec<u8>)>,
+    made: usize,
     // where lifting was: liveness questions are asked about the current instruction
     pc: usize,
     at: usize,
@@ -197,7 +211,15 @@ fn is_expression(insn: &Insn) -> bool {
     }
 }
 
-pub fn lift(chunk: &Chunk, proto_id: usize) -> Result<Function, Error> {
+pub struct Lifted {
+    pub function: Function,
+    // the body before the output-only passes, for comparing inlined copies against
+    pub raw: Vec<Stmt>,
+    // functions called through new upvalues (see `Lifter::extra`)
+    pub extra: Vec<usize>,
+}
+
+pub fn lift(chunk: &Chunk, proto_id: usize, inline: Option<&Ctx>) -> Result<Lifted, Error> {
     let proto = &chunk.protos[proto_id];
     let mut lifter = Lifter {
         proto_id,
@@ -222,6 +244,10 @@ pub fn lift(chunk: &Chunk, proto_id: usize) -> Result<Function, Error> {
         joins: Vec::new(),
         loops: Vec::new(),
         trace: std::env::var_os("SUNBERRY_TRACE").is_some(),
+        inline,
+        inlining_off: false,
+        made: Vec::new(),
+        extra: Vec::new(),
     };
     let params = (0..proto.num_params)
         .map(|reg| {
@@ -244,9 +270,10 @@ pub fn lift(chunk: &Chunk, proto_id: usize) -> Result<Function, Error> {
     lifter.index_of = index_of;
     lifter.block(0, lifter.insns.len(), &[proto.code.len()])?;
     lifter.flush()?;
+    let raw = lifter.body.clone();
     let body = pin_constants(lifter.body, &lifter.ever_by_ref);
     let body = limit_locals(body, proto.num_params as usize);
-    Ok(Function { params, is_vararg: proto.is_vararg, body, names: lifter.names })
+    Ok(Lifted { function: Function { params, is_vararg: proto.is_vararg, body, names: lifter.names }, raw, extra: lifter.extra })
 }
 
 // From O1 up, Luau folds a local that is never assigned and starts as a constant into every
@@ -491,6 +518,9 @@ impl Lifter<'_> {
     // its register holds is declared now, and one ending frees its register
     fn scope_changes(&mut self) -> Result<(), Error> {
         let pc = self.pc;
+        // an inlined call's parameters are declared where its body starts: if it turns back
+        // into a call, they're its arguments, not locals
+        let candidate = self.inline.is_some_and(|c| c.callees[self.proto_id].contains_key(&self.at)) && !self.inlining_off;
         let starting = self
             .proto
             .locals
@@ -500,7 +530,8 @@ impl Lifter<'_> {
                 Slot::Pending(id) => Some((self.index_of(id), l.register)),
                 _ => None,
             })
-            .max();
+            .max()
+            .filter(|_| !candidate);
         if let Some((index, reg)) = starting {
             self.flush_keeping(index + 1, &[reg])?;
         }
@@ -676,7 +707,10 @@ impl Lifter<'_> {
                     self.slots[reg as usize] = Slot::Local(local);
                     local
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            if let (Expr::Closure(c), [local]) = (&value, &locals[..]) {
+                self.made.push((c.proto, *local, c.captures.clone()));
+            }
             self.body.push(Stmt::Local { locals, values: vec![value] });
         }
         kept.append(&mut self.pending);
@@ -990,7 +1024,10 @@ impl Lifter<'_> {
         }
         let closure = Closure { proto, captures: list };
         match local {
-            Some(local) => self.emit(Stmt::LocalFunction { local, closure })?,
+            Some(local) => {
+                self.made.push((proto, local, closure.captures.clone()));
+                self.emit(Stmt::LocalFunction { local, closure })?
+            }
             None => self.write(target, Expr::Closure(Box::new(closure)))?,
         }
         Ok(1 + captures.len())
@@ -1436,6 +1473,7 @@ impl Lifter<'_> {
             ever_by_ref: self.ever_by_ref.clone(),
             fastcall: self.fastcall.clone(),
             namecall: self.namecall.clone(),
+            made: self.made.len(),
             pc: self.pc,
             at: self.at,
         }
@@ -1452,6 +1490,7 @@ impl Lifter<'_> {
         self.ever_by_ref.clone_from(&s.ever_by_ref);
         self.fastcall.clone_from(&s.fastcall);
         self.namecall.clone_from(&s.namecall);
+        self.made.truncate(s.made);
         self.pc = s.pc;
         self.at = s.at;
     }
@@ -1469,6 +1508,10 @@ impl Lifter<'_> {
                 return Ok(());
             }
             self.enter(i)?;
+            if let Some(n) = self.try_inline(i)? {
+                i += n;
+                continue;
+            }
             let insn = self.insns[i];
             match insn.op {
                 Op::FORNPREP => {
@@ -1946,6 +1989,8 @@ impl Lifter<'_> {
                 Op::LOADB if i.c != 0 => i.target(),
                 op if is_test(op) => i.target(),
                 _ if is_expression(&i) => None,
+                // a call that may turn out to be an inlined function's body
+                _ if self.inline.is_some_and(|c| c.callees[self.proto_id].contains_key(&k)) && !self.inlining_off => None,
                 _ => return Ok(None),
             };
             if let Some(t) = target {
@@ -2117,6 +2162,13 @@ impl Lifter<'_> {
             }
             self.enter(i)?;
             let clean = |l: &Self| l.body.len() == fork.body && l.names.len() == fork.names;
+            if let Some(n) = self.try_inline(i)? {
+                if !clean(self) {
+                    return Err(self.unsupported("statement inside an expression"));
+                }
+                i += n;
+                continue;
+            }
             // an `x and y` of its own inside this path is just a value here
             if is_test(insn.op) && insn.a != result {
                 let join_index = self.idx(join)?;
@@ -2582,7 +2634,7 @@ fn build_value(tree: Tree) -> Option<Expr> {
 }
 
 // `if p then t else f` in the plainest form that means exactly the same
-fn simplify_choice(p: Expr, t: Expr, f: Expr) -> Expr {
+pub(crate) fn simplify_choice(p: Expr, t: Expr, f: Expr) -> Expr {
     let boolean = p.is_boolean();
     match (t, f) {
         (Expr::Bool(true), Expr::Bool(false)) if boolean => p,
@@ -2643,4 +2695,246 @@ fn pure_constant(e: &Expr) -> bool {
 
 fn table(fields: Vec<Field>) -> Expr {
     Expr::Table(fields)
+}
+
+// ---- de-inlining (see inline.rs) ----
+impl Lifter<'_> {
+    // insns[at..] may be an inlined copy of a function: if it is one exactly, it becomes a
+    // call to that function; returns how many instructions that took
+    fn try_inline(&mut self, at: usize) -> Result<Option<usize>, Error> {
+        let Some(ctx) = self.inline else { return Ok(None) };
+        if self.inlining_off {
+            return Ok(None);
+        }
+        let Some(run) = ctx.run_at(self.proto_id, at) else { return Ok(None) };
+        // (anywhere in a run: the caller's own code around an inlined call keeps the callee's
+        // line until the next statement)
+        let run_end = run.end;
+        if at == run.start {
+            inline::RUNS_TRIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let callees = ctx.callees[self.proto_id].get(&at).cloned().unwrap_or_default();
+        // diagnostics: the first callee's reason when nothing matches
+        let mut why: Option<&'static str> = None;
+        let note = |why: &mut Option<&'static str>, w: &'static str| {
+            if why.is_none() {
+                *why = Some(w);
+            }
+        };
+        let flow = |b: &[Stmt]| b.iter().any(|s| !s.bodies().is_empty() || matches!(s, Stmt::Return(_)) && !std::ptr::eq(s, b.last().unwrap()));
+        for callee in callees {
+            if flow(&ctx.raw[callee].body) {
+                note(&mut why, "callee has control flow");
+            }
+            // the callee's closure has to be somewhere the call can name it
+            if let Some(index) = self.pending.iter().position(|p| matches!(&p.value, Value::Expr(Expr::Closure(c)) if c.proto == callee)) {
+                if self.pending[index].span != Span::One {
+                    continue;
+                }
+                self.flush_oldest(index + 1)?;
+            }
+            // created here: named by its local, its upvalues are its captures; created in an
+            // enclosing function: named by this function's upvalue for that local
+            let (func, captures) = match self.made.iter().rev().find(|m| m.0 == callee) {
+                Some((_, local, captures)) => (Expr::Local(*local), Some(captures.clone())),
+                None => {
+                    let Some(holder) = ctx.holder[callee] else {
+                        note(&mut why, if ctx.site[callee].is_none() { "callee created in several places" } else { "callee not kept in a local" });
+                        continue;
+                    };
+                    // every call was inlined, so nothing captured it: it gets a new upvalue
+                    let k = match ctx.origin[self.proto_id].iter().position(|o| *o == Some(holder)) {
+                        Some(k) => k,
+                        None => self.proto.num_upvalues as usize + self.extra.iter().position(|&p| p == callee).unwrap_or(self.extra.len()),
+                    };
+                    if k > 255 {
+                        continue;
+                    }
+                    if ctx.site[self.proto_id].is_none() {
+                        note(&mut why, "caller created in several places");
+                    }
+                    (Expr::Upvalue(k as u8), None)
+                }
+            };
+            // the longest copy that matches: a shorter one can match by leaving the result out.
+            // A copy is about as long as the callee (moves to the result instead of RETURN)
+            let longest = run_end.min(at + 2 * self.chunk.protos[callee].code.len() + 8);
+            for end in (at + 1..=longest).rev() {
+                if !self.closed_region(at, end) {
+                    continue;
+                }
+                let start = self.snapshot();
+                self.inlining_off = true;
+                let sub = self.sandbox(at, end);
+                self.inlining_off = false;
+                self.restore(&start);
+                if std::env::var_os("SUNBERRY_TRACE_INLINE").is_some() {
+                    match &sub {
+                        Err(e) => eprintln!("   sandbox f{} {at}..{end}: {e}", self.proto_id),
+                        Ok(None) => eprintln!("   sandbox f{} {at}..{end}: no shape", self.proto_id),
+                        _ => {}
+                    }
+                }
+                let Ok(Some(sub)) = sub else {
+                    if end == run_end {
+                        note(&mut why, "region doesn't lift alone");
+                    }
+                    continue;
+                };
+                let upvalues = match &captures {
+                    Some(c) => Upvalues::Here(c),
+                    None => Upvalues::Outer { callee, caller: self.proto_id },
+                };
+                let Some(plan) = inline::unify(ctx, callee, upvalues, &sub) else {
+                    if end == run_end {
+                        note(&mut why, "no match");
+                    }
+                    if std::env::var_os("SUNBERRY_TRACE_INLINE").is_some() {
+                        eprintln!("== f{} {at}..{end} vs f{callee}: targets {:?} values {:?}\n   subject {:?}\n   callee {:?}", self.proto_id, sub.targets, sub.values, sub.stmts, ctx.raw[callee].body);
+                    }
+                    continue;
+                };
+                match self.call_inlined(end, func.clone(), &plan, &sub) {
+                    Ok(()) => {
+                        if let Expr::Upvalue(k) = func
+                            && k as usize >= self.proto.num_upvalues as usize
+                            && !self.extra.contains(&callee)
+                        {
+                            self.extra.push(callee);
+                        }
+                        if self.trace {
+                            eprintln!("       de-inlined f{callee} at {at}..{end}");
+                        }
+                        inline::CALLS_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(Some(end - at));
+                    }
+                    Err(e) => {
+                        note(&mut why, "call doesn't fit");
+                        if self.trace {
+                            eprintln!("       de-inlining f{callee} at {at}..{end} failed: {e}");
+                        }
+                        self.restore(&start);
+                    }
+                }
+            }
+        }
+        if at == run.start {
+            inline::reason(why.unwrap_or("no callee"));
+        }
+        Ok(None)
+    }
+
+    // lifts insns[at..end) as if it were a function body of its own
+    fn sandbox(&mut self, at: usize, end: usize) -> Result<Option<Sub>, Error> {
+        let before = self.names.len();
+        self.flush()?;
+        let mut start = HashMap::new();
+        for (r, slot) in self.slots.iter().enumerate() {
+            if let Slot::Local(l) = *slot {
+                start.entry(l).or_insert((r as u8, l as usize >= before));
+            }
+        }
+        let exits = [self.pc_at(end)];
+        let mut stmts = self.sub_body(|l| l.block(at, end, &exits))?;
+        if stmts.iter().any(Stmt::terminates) {
+            return Ok(None);
+        }
+        let mut written = Regs::default();
+        for i in at..end {
+            written = written.union(liveness::writes(&self.insns[i]));
+        }
+        let live = self.live_in.get(end).copied().unwrap_or_default();
+        let targets = written.intersect(live).iter().collect::<Vec<_>>();
+        if targets.windows(2).any(|w| w[1] != w[0] + 1) {
+            return Ok(None);
+        }
+        let mut values = Vec::new();
+        let mut used = Vec::new();
+        let mut many = false;
+        for &r in &targets {
+            match self.slots[r as usize] {
+                Slot::Pending(id) => {
+                    let p = &self.pending[self.index_of(id)];
+                    match (&p.span, &p.value) {
+                        (Span::One, Value::Expr(e)) => values.push(e.clone()),
+                        (Span::One, Value::Table(fields, _)) => values.push(table(fields.clone())),
+                        (Span::Many(n), Value::Expr(e)) if p.reg == targets[0] && *n as usize == targets.len() => {
+                            if r == targets[0] {
+                                values.push(e.clone());
+                                many = true;
+                            }
+                        }
+                        _ => return Ok(None),
+                    }
+                    used.push(id);
+                }
+                // a result landing on a local: the assignment the region ended with
+                Slot::Local(l) => match stmts.last() {
+                    Some(Stmt::Assign { targets: t, values: v }) if t[..] == [Expr::Local(l)] && v.len() == 1 && start.contains_key(&l) => {
+                        values.push(v[0].clone());
+                        stmts.pop();
+                    }
+                    _ => values.push(Expr::Local(l)),
+                },
+                Slot::Free => return Ok(None),
+            }
+        }
+        // anything else the region computed and left behind isn't the callee's
+        if self.pending.iter().any(|p| !used.contains(&p.id)) {
+            return Ok(None);
+        }
+        Ok(Some(Sub { stmts, values, many, targets, start }))
+    }
+
+    // the region as a call: arguments from the registers the parameters were bound to
+    fn call_inlined(&mut self, end: usize, func: Expr, plan: &inline::Plan, sub: &Sub) -> Result<(), Error> {
+        // operands are read as of the region's end
+        self.at = end - 1;
+        self.pc = self.insns[end - 1].pc;
+        let regs = plan.binds.iter().filter_map(|b| if let Bind::Reg(r) = b { Some(*r) } else { None }).collect::<Vec<_>>();
+        let operands = self.take_exprs(&regs)?;
+        let mut operands = operands.into_iter();
+        let mut args = plan
+            .binds
+            .iter()
+            .map(|b| match b {
+                Bind::Unbound => Expr::Nil,
+                Bind::Const(c) => c.clone(),
+                Bind::Reg(_) => operands.next().unwrap(),
+            })
+            .collect::<Vec<_>>();
+        while args.last() == Some(&Expr::Nil) {
+            args.pop();
+        }
+        let n = sub.targets.len();
+        let call = Expr::Call { func: Box::new(func), args, multret: sub.many || n > 1 };
+        match n {
+            0 => self.emit(Stmt::Call(call)),
+            1 => self.write(sub.targets[0], call),
+            n => self.results(sub.targets[0], n as u8, call),
+        }
+    }
+}
+
+impl Lifter<'_> {
+    // whether insns[at..end) can be a body of its own: its jumps stay inside or go to its end
+    // (or where Luau threaded that), and nothing outside jumps into its middle
+    fn closed_region(&self, at: usize, end: usize) -> bool {
+        let (lo, hi) = (self.pc_at(at), self.pc_at(end));
+        let exits = self.exits_from(end);
+        // a FASTCALL belongs with the CALL it guards
+        let split_call = (at..end).any(|k| {
+            let i = self.insns[k];
+            matches!(i.op, Op::FASTCALL | Op::FASTCALL1 | Op::FASTCALL2 | Op::FASTCALL2K | Op::FASTCALL3 | Op::FASTPCALL)
+                && self.idx(i.pc + 1 + i.c as usize).map_or(true, |call| call >= end)
+        });
+        if split_call {
+            return false;
+        }
+        let inside = (at..end).all(|k| match self.insns[k].target() {
+            Some(t) => (t > lo && t < hi) || exits.contains(&t) || (t == lo && k > at),
+            None => true,
+        });
+        inside && !self.insns.iter().enumerate().any(|(k, i)| (k < at || k >= end) && i.target().is_some_and(|t| t > lo && t < hi))
+    }
 }
