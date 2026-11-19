@@ -86,7 +86,14 @@ pub fn run(bytecode: &[u8]) -> Observation {
     let print = {
         let log = log.clone();
         lua.create_function(move |_, args: MultiValue| {
-            let parts = args.iter().map(|v| v.to_string().unwrap_or_else(|e| format!("<{e}>"))).collect::<Vec<_>>();
+            let parts = args
+                .iter()
+                .map(|v| match v {
+                    // bytes as they are: decompilers get compared on values, not on UTF-8
+                    mlua::Value::String(s) => String::from_utf8_lossy(&s.as_bytes()).into_owned(),
+                    v => v.to_string().unwrap_or_else(|e| format!("<{e}>")),
+                })
+                .collect::<Vec<_>>();
             log.borrow_mut().push(parts.join("\t"));
             Ok(())
         })

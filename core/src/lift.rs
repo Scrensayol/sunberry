@@ -32,7 +32,7 @@ enum Span {
     All,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Value {
     Expr(Expr),
     // fields in the order their stores ran (Luau flushes positional values before each keyed
@@ -42,7 +42,7 @@ enum Value {
     Method(Expr, Vec<u8>),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Pending {
     id: u64,
     reg: u8,
@@ -64,6 +64,7 @@ impl Operand {
     }
 }
 
+#[derive(Clone)]
 struct Fastcall {
     call_pc: usize,
     // pending values created before the FASTCALL keep their order; the fallback code after
@@ -93,9 +94,85 @@ struct Lifter<'a> {
     namecall: Option<(u8, Vec<u8>)>,
     pc: usize,
     at: usize,
+    // registers read again after each instruction, and on entry to it
     live: Vec<Regs>,
+    live_in: Vec<Regs>,
     insns: Vec<Insn>,
+    // pc -> instruction index (usize::MAX on AUX words); code.len() maps to insns.len()
+    index_of: Vec<usize>,
+    // registers each enclosing branch writes that are read after it joins: writes to them
+    // assign the variable declared before the `if`
+    joins: Vec<Vec<u8>>,
     trace: bool,
+}
+
+// everything a speculative path can change, to put back if it doesn't work out
+struct Snapshot {
+    slots: Vec<Slot>,
+    pending: Vec<Pending>,
+    next_id: u64,
+    body: usize,
+    names: usize,
+    by_value: Vec<bool>,
+    by_ref: Vec<bool>,
+    ever_by_ref: Vec<bool>,
+    fastcall: Option<Fastcall>,
+    namecall: Option<(u8, Vec<u8>)>,
+    // where lifting was: liveness questions are asked about the current instruction
+    pc: usize,
+    at: usize,
+}
+
+struct Test {
+    pred: Expr,
+    // whether the jump is taken when `pred` is truthy (else when it is falsy)
+    jump_when: bool,
+    // the pending value a JUMPIF/JUMPIFNOT tested in the region's result register: on the
+    // jump path that register still holds it (`x and y`, `x or y`)
+    subject: Option<u64>,
+}
+
+enum Tree {
+    Value(Expr),
+    Test { pred: Expr, jump_when: bool, subject: Option<u64>, fall: Box<Tree>, jump: Box<Tree> },
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Succ {
+    Node(usize),
+    Then,
+    Else,
+}
+
+struct CondNode {
+    pred: Expr,
+    // where control goes when `pred` is truthy / falsy
+    t: Succ,
+    f: Succ,
+}
+
+fn is_test(op: Op) -> bool {
+    use Op::*;
+    matches!(
+        op,
+        JUMPIF | JUMPIFNOT | JUMPIFEQ | JUMPIFLE | JUMPIFLT | JUMPIFNOTEQ | JUMPIFNOTLE | JUMPIFNOTLT | JUMPXEQKNIL
+            | JUMPXEQKB | JUMPXEQKN | JUMPXEQKS
+    )
+}
+
+// instructions that only ever compute values into registers
+fn is_expression(insn: &Insn) -> bool {
+    use Op::*;
+    match insn.op {
+        CALL | CALLFB => insn.c != 1,
+        LOADB => insn.c == 0,
+        LOADNIL | LOADN | LOADK | LOADKX | MOVE | GETGLOBAL | GETUPVAL | GETIMPORT | GETTABLE | GETTABLEKS | GETTABLEN
+        | GETUDATAKS | NEWCLOSURE | DUPCLOSURE | CAPTURE | NAMECALL | NAMECALLUDATA | ADD | SUB | MUL | DIV | MOD | POW
+        | IDIV | ADDK | SUBK | MULK | DIVK | MODK | POWK | IDIVK | SUBRK | DIVRK | AND | OR | ANDK | ORK | CONCAT | NOT
+        | MINUS | LENGTH | NEWTABLE | DUPTABLE | SETLIST | SETTABLE | SETTABLEKS | SETTABLEN | SETUDATAKS | GETVARARGS
+        | FASTCALL | FASTCALL1 | FASTCALL2 | FASTCALL2K | FASTCALL3 | FASTPCALL | NOP | COVERAGE => true,
+        _ => false,
+    }
 }
 
 pub fn lift(chunk: &Chunk, proto_id: usize) -> Result<Function, Error> {
@@ -117,7 +194,10 @@ pub fn lift(chunk: &Chunk, proto_id: usize) -> Result<Function, Error> {
         pc: 0,
         at: 0,
         live: Vec::new(),
+        live_in: Vec::new(),
         insns: Vec::new(),
+        index_of: Vec::new(),
+        joins: Vec::new(),
         trace: std::env::var_os("SUNBERRY_TRACE").is_some(),
     };
     let params = (0..proto.num_params)
@@ -129,20 +209,17 @@ pub fn lift(chunk: &Chunk, proto_id: usize) -> Result<Function, Error> {
         .collect();
 
     let insns = proto.insns();
-    lifter.live = liveness::live_after(&insns);
-    lifter.insns = insns.clone();
-    let trace = lifter.trace;
-    let mut i = 0;
-    while i < insns.len() {
-        lifter.pc = insns[i].pc;
-        lifter.at = i;
-        if trace {
-            let stack = lifter.pending.iter().map(|p| format!("R{}{:?}", p.reg, p.span)).collect::<Vec<_>>();
-            eprintln!("f{proto_id} {:>4} {:<12} pending [{}]", insns[i].pc, insns[i].op.name(), stack.join(" "));
-        }
-        lifter.scope_changes()?;
-        i += lifter.step(&insns, i)?;
+    let mut index_of = vec![usize::MAX; proto.code.len() + 1];
+    for (i, insn) in insns.iter().enumerate() {
+        index_of[insn.pc] = i;
     }
+    index_of[proto.code.len()] = insns.len();
+    let liveness = liveness::analyze(&insns, &index_of);
+    lifter.live = liveness.live_after;
+    lifter.live_in = liveness.live_in;
+    lifter.insns = insns;
+    lifter.index_of = index_of;
+    lifter.block(0, lifter.insns.len(), &[proto.code.len()])?;
     lifter.flush()?;
     let body = pin_constants(lifter.body, &lifter.ever_by_ref);
     Ok(Function { params, is_vararg: proto.is_vararg, body, names: lifter.names })
@@ -154,19 +231,38 @@ pub fn lift(chunk: &Chunk, proto_id: usize) -> Result<Function, Error> {
 // assigned it somewhere (or was O0, where nothing folds). The output must not be more
 // foldable than that: such a local is declared bare and then assigned.
 fn pin_constants(body: Vec<Stmt>, by_ref: &[bool]) -> Vec<Stmt> {
-    let mut assigned = vec![false; by_ref.len()];
-    for stmt in &body {
-        if let Stmt::Assign { targets, .. } = stmt {
-            for target in targets {
-                if let Expr::Local(l) = target {
-                    assigned[*l as usize] = true;
+    fn mark(body: &[Stmt], assigned: &mut [bool]) {
+        for stmt in body {
+            match stmt {
+                Stmt::Assign { targets, .. } => {
+                    for target in targets {
+                        if let Expr::Local(l) = target {
+                            assigned[*l as usize] = true;
+                        }
+                    }
                 }
+                Stmt::If { then_body, else_body, .. } => {
+                    mark(then_body, assigned);
+                    mark(else_body, assigned);
+                }
+                _ => {}
             }
         }
     }
+    let mut assigned = vec![false; by_ref.len()];
+    mark(&body, &mut assigned);
+    pin(body, &assigned, by_ref)
+}
+
+fn pin(body: Vec<Stmt>, assigned: &[bool], by_ref: &[bool]) -> Vec<Stmt> {
     let mut out = Vec::with_capacity(body.len());
     for stmt in body {
         match stmt {
+            Stmt::If { cond, then_body, else_body } => out.push(Stmt::If {
+                cond,
+                then_body: pin(then_body, assigned, by_ref),
+                else_body: pin(else_body, assigned, by_ref),
+            }),
             Stmt::Local { locals, values }
                 if locals.len() == 1
                     && values.len() == 1
@@ -253,10 +349,12 @@ impl Lifter<'_> {
     // Whether a write to `reg` is an assignment to the local it holds. In straight-line code
     // a new local is always equivalent unless a closure captured the old one by reference
     // and would see the assignment; debug info says which one the source had.
-    // TODO(M2): inside branches a write can only be a new local if no path reads the old
-    // variable afterwards.
     fn assigns(&self, reg: u8) -> Option<u32> {
         let Slot::Local(l) = self.slots[reg as usize] else { return None };
+        // read after the branch it's in joins: the variable from before the `if`
+        if self.joins.iter().any(|j| j.contains(&reg)) {
+            return Some(l);
+        }
         if self.by_value[l as usize] || self.starts_local(reg) {
             return None;
         }
@@ -269,6 +367,14 @@ impl Lifter<'_> {
     fn clear(&mut self, reg: u8) -> Result<(), Error> {
         if let Slot::Pending(id) = self.slots[reg as usize] {
             let index = self.index_of(id);
+            // a constant nobody reads has nothing to evaluate
+            if self.pending[index].span == Span::One
+                && matches!(&self.pending[index].value, Value::Expr(e) if pure_constant(e))
+            {
+                self.pending.remove(index);
+                self.slots[reg as usize] = Slot::Free;
+                return Ok(());
+            }
             self.flush_keeping(index + 1, &[reg])?;
         }
         self.release(reg);
@@ -465,13 +571,18 @@ impl Lifter<'_> {
 
     // the values `regs` hold, in order; a NAMECALL pair counts as one operand
     fn take(&mut self, regs: &[u8]) -> Result<Vec<Operand>, Error> {
+        self.take_ignoring(regs, None)
+    }
+
+    // `ignore`: a register whose later reads the caller accounts for itself
+    fn take_ignoring(&mut self, regs: &[u8], ignore: Option<u8>) -> Result<Vec<Operand>, Error> {
         // a value read again later can't be folded into this reader: it becomes a local
         // (a register this instruction overwrites is read later only as its new value)
         let live = self.live[self.at];
         let overwritten = liveness::writes(&self.insns[self.at]);
         let reused = regs
             .iter()
-            .filter(|&&r| live.has(r) && !overwritten.has(r))
+            .filter(|&&r| live.has(r) && !overwritten.has(r) && Some(r) != ignore)
             .filter_map(|&r| match self.slots[r as usize] {
                 Slot::Pending(id) => Some(self.index_of(id)),
                 _ => None,
@@ -576,9 +687,8 @@ impl Lifter<'_> {
     }
 
     fn write(&mut self, reg: u8, expr: Expr) -> Result<(), Error> {
-        if let Slot::Pending(id) = self.slots[reg as usize] {
-            let index = self.index_of(id);
-            self.flush_keeping(index + 1, &[reg])?;
+        if let Slot::Pending(_) = self.slots[reg as usize] {
+            self.clear(reg)?;
         }
         match self.assigns(reg) {
             Some(l) => self.emit(Stmt::Assign { targets: vec![Expr::Local(l)], values: vec![expr] }),
@@ -657,8 +767,8 @@ impl Lifter<'_> {
         self.emit(Stmt::Assign { targets: vec![Expr::Index(Box::new(table), Box::new(key))], values: vec![value] })
     }
 
-    fn closure(&mut self, insns: &[Insn], at: usize, target: u8, proto: usize) -> Result<usize, Error> {
-        let captures = insns[at + 1..].iter().take_while(|i| i.op == Op::CAPTURE).collect::<Vec<_>>();
+    fn closure(&mut self, at: usize, target: u8, proto: usize) -> Result<usize, Error> {
+        let captures = self.insns[at + 1..].iter().take_while(|i| i.op == Op::CAPTURE).copied().collect::<Vec<_>>();
         let self_capture = captures.iter().any(|c| c.a != 2 && c.b == target) && self.slots[target as usize] == Slot::Free;
         // captured registers have to hold locals: their values (and everything older) become
         // locals, the rest can stay pending
@@ -713,9 +823,9 @@ impl Lifter<'_> {
     }
 
     // handles insns[at]; returns how many instructions it used
-    fn step(&mut self, insns: &[Insn], at: usize) -> Result<usize, Error> {
+    fn step(&mut self, at: usize) -> Result<usize, Error> {
         use Op::*;
-        let i = insns[at];
+        let i = self.insns[at];
         let (a, b, c) = (i.a, i.b, i.c);
         let binary = |op| match op {
             ADD | ADDK | SUBRK => BinOp::Add,
@@ -792,13 +902,13 @@ impl Lifter<'_> {
             SETTABLEN => self.store(b, None, Some(Expr::Number(c as f64 + 1.0)), a)?,
             NEWCLOSURE => {
                 let child = *self.proto.children.get(i.d() as usize).ok_or_else(|| self.unsupported("child out of range"))?;
-                return self.closure(insns, at, a, child);
+                return self.closure(at, a, child);
             }
             DUPCLOSURE => {
                 let Some(Constant::Closure(child)) = self.proto.constants.get(i.d() as usize) else {
                     return Err(self.unsupported("DUPCLOSURE of a non-closure constant"));
                 };
-                return self.closure(insns, at, a, *child as usize);
+                return self.closure(at, a, *child as usize);
             }
             // Luau evaluates the object into the call's base register, then the arguments,
             // and only then looks the method up: the object's pending value turns into the
@@ -836,7 +946,7 @@ impl Lifter<'_> {
                     // a local already sitting in the base register gets overwritten by the method
                     Slot::Local(l) if self.slots[a as usize] == Slot::Free || (b == a && !self.by_ref[l as usize]) => {
                         // just below this call's own arguments (the CALL always comes next)
-                        let call = insns.get(at + 1).filter(|c| matches!(c.op, CALL | CALLFB));
+                        let call = self.insns.get(at + 1).copied().filter(|c| matches!(c.op, CALL | CALLFB));
                         let Some(call) = call else { return Err(self.unsupported("NAMECALL not followed by CALL")) };
                         let last_arg = if call.b == 0 { 255 } else { a as usize + call.b as usize - 1 };
                         let index = self
@@ -889,12 +999,23 @@ impl Lifter<'_> {
             }
             ADD | SUB | MUL | DIV | MOD | POW | IDIV | AND | OR => {
                 let mut v = self.take_exprs(&[b, c])?.into_iter();
-                let (l, r) = (v.next().unwrap(), v.next().unwrap());
+                let (mut l, mut r) = (v.next().unwrap(), v.next().unwrap());
+                // a runtime `x ^ y` is pow(); with y a constant 2, 0.5 or 3 the recompiled code
+                // would use POWK's x*x, sqrt or x*x*x instead, so y stays in a variable
+                if i.op == POW && power_special(&r) {
+                    l = self.pin(l)?;
+                    r = self.pin(r)?;
+                }
                 self.write(a, Expr::Binary(binary(i.op), Box::new(l), Box::new(r)))?
             }
             ADDK | SUBK | MULK | DIVK | MODK | POWK | IDIVK | ANDK | ORK => {
-                let l = self.take1(b)?;
+                let mut l = self.take1(b)?;
                 let r = self.constant(c as u32)?;
+                // POWK special-cases ^2, ^0.5 and ^3 at runtime, but a constant base would let
+                // Luau fold the whole thing with pow() (sqrt(-0) is -0, pow(-0, 0.5) is 0)
+                if i.op == POWK && power_special(&r) && foldable(&l) {
+                    l = self.pin(l)?;
+                }
                 self.write(a, Expr::Binary(binary(i.op), Box::new(l), Box::new(r)))?
             }
             SUBRK | DIVRK => {
@@ -941,9 +1062,25 @@ impl Lifter<'_> {
             FASTCALL | FASTCALL1 | FASTCALL2 | FASTCALL2K | FASTCALL3 | FASTPCALL => {
                 self.fastcall = Some(Fastcall { call_pc: i.pc + 1 + c as usize, first_after: self.next_id });
             }
-            op => return Err(self.unsupported(format!("{} (control flow comes in M2)", op.name()))),
+            op => return Err(self.unsupported(format!("{} (loops come in M3)", op.name()))),
         }
         Ok(1)
+    }
+
+    // a value Luau can't fold: a local assigned after its declaration
+    fn pin(&mut self, expr: Expr) -> Result<Expr, Error> {
+        if matches!(expr, Expr::Local(_)) || !foldable(&expr) {
+            return Ok(expr);
+        }
+        let local = self.new_local(u8::MAX, self.pc);
+        // literals and operators on them read nothing, so they can go ahead of whatever is
+        // still pending; anything else waits its turn
+        if !literal(&expr) {
+            self.flush_for_statement()?;
+        }
+        self.body.push(Stmt::Local { locals: vec![local], values: Vec::new() });
+        self.body.push(Stmt::Assign { targets: vec![Expr::Local(local)], values: vec![expr] });
+        Ok(Expr::Local(local))
     }
 
     fn results(&mut self, reg: u8, count: u8, expr: Expr) -> Result<(), Error> {
@@ -1025,6 +1162,840 @@ impl Lifter<'_> {
         }
         Ok(())
     }
+}
+
+// Control flow. Luau lays every construct out as a contiguous range of code in source
+// order, so structure is recovered by recursive descent over instruction ranges. From O1 up
+// Luau threads jumps through unconditional JUMPs, so a region's "end" is a set of pcs: where
+// it continues, and the targets of the JUMPs chained from there (`exits`).
+impl Lifter<'_> {
+    fn idx(&self, pc: usize) -> Result<usize, Error> {
+        match self.index_of.get(pc) {
+            Some(&i) if i != usize::MAX => Ok(i),
+            _ => Err(self.unsupported(format!("jump into the middle of an instruction at {pc}"))),
+        }
+    }
+
+    // A jump target as this region sees it: the region's end for anything that leads there,
+    // and for a RETURN elsewhere the last identical RETURN in the region (Luau copies a
+    // RETURN over a jump to it, so the original can sit outside); returning from either
+    // returns the same registers.
+    fn normalize(&self, target: usize, first: usize, end: usize, exits: &[usize]) -> usize {
+        if exits.contains(&target) {
+            return exits[0];
+        }
+        if target > exits[0]
+            && let Some(&i) = self.index_of.get(target)
+            && let Some(insn) = self.insns.get(i)
+            && insn.op == Op::RETURN
+            && let Some(copy) = (first + 1..end).rev().find(|&j| self.insns[j].op == Op::RETURN && self.insns[j].a == insn.a && self.insns[j].b == insn.b)
+        {
+            return self.insns[copy].pc;
+        }
+        target
+    }
+
+    fn jumped_to(&self, index: usize) -> bool {
+        let pc = self.insns[index].pc;
+        self.insns.iter().any(|i| i.target() == Some(pc))
+    }
+
+    fn pc_at(&self, index: usize) -> usize {
+        self.insns.get(index).map_or(self.proto.code.len(), |i| i.pc)
+    }
+
+    fn exits_from(&self, index: usize) -> Vec<usize> {
+        let mut pc = self.pc_at(index);
+        let mut out = vec![pc];
+        while let Some(&i) = self.index_of.get(pc)
+            && let Some(insn) = self.insns.get(i)
+            && matches!(insn.op, Op::JUMP | Op::JUMPX)
+            && let Some(t) = insn.target()
+            && t > pc
+        {
+            out.push(t);
+            pc = t;
+        }
+        out
+    }
+
+    fn enter(&mut self, i: usize) -> Result<(), Error> {
+        self.pc = self.insns[i].pc;
+        self.at = i;
+        if self.trace {
+            let stack = self.pending.iter().map(|p| format!("R{}{:?}", p.reg, p.span)).collect::<Vec<_>>();
+            eprintln!("f{} {:>4} {:<12} pending [{}]", self.proto_id, self.pc, self.insns[i].op.name(), stack.join(" "));
+        }
+        self.scope_changes()
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            slots: self.slots.clone(),
+            pending: self.pending.clone(),
+            next_id: self.next_id,
+            body: self.body.len(),
+            names: self.names.len(),
+            by_value: self.by_value.clone(),
+            by_ref: self.by_ref.clone(),
+            ever_by_ref: self.ever_by_ref.clone(),
+            fastcall: self.fastcall.clone(),
+            namecall: self.namecall.clone(),
+            pc: self.pc,
+            at: self.at,
+        }
+    }
+
+    fn restore(&mut self, s: &Snapshot) {
+        self.slots.clone_from(&s.slots);
+        self.pending.clone_from(&s.pending);
+        self.next_id = s.next_id;
+        self.body.truncate(s.body);
+        self.names.truncate(s.names);
+        self.by_value.clone_from(&s.by_value);
+        self.by_ref.clone_from(&s.by_ref);
+        self.ever_by_ref.clone_from(&s.ever_by_ref);
+        self.fastcall.clone_from(&s.fastcall);
+        self.namecall.clone_from(&s.namecall);
+        self.pc = s.pc;
+        self.at = s.at;
+    }
+
+    // lifts insns[start..end); `exits` are the pcs meaning "the end of this region"
+    fn block(&mut self, start: usize, end: usize, exits: &[usize]) -> Result<(), Error> {
+        let mut i = start;
+        while i < end {
+            // after a return nothing in the region runs (Luau leaves threaded RETURN copies
+            // there), unless something jumps in
+            if matches!(self.body.last(), Some(Stmt::Return(_))) {
+                if (i..end).any(|j| self.jumped_to(j)) {
+                    return Err(self.unsupported("code after a return that something jumps to"));
+                }
+                return Ok(());
+            }
+            self.enter(i)?;
+            let insn = self.insns[i];
+            if is_test(insn.op) {
+                if let Some(next) = self.value_region(i, end)? {
+                    i = next;
+                    continue;
+                }
+                // a test going to the same place either way (folding leaves these) still has
+                // to compare: an empty `if` does exactly that
+                if insn.target() == Some(self.pc_at(i + 1)) {
+                    let test = self.test(i, None)?;
+                    self.emit(Stmt::If { cond: test.pred, then_body: Vec::new(), else_body: Vec::new() })?;
+                    i += 1;
+                    continue;
+                }
+                i = self.statement_if(i, end, exits)?;
+                continue;
+            }
+            match insn.op {
+                Op::JUMP | Op::JUMPX => {
+                    let target = insn.target().unwrap();
+                    if target == insn.pc + 1 || (i + 1 == end && exits.contains(&target)) {
+                        i += 1;
+                    } else if exits.contains(&target) && !(i + 1..end).any(|j| self.jumped_to(j)) {
+                        // leaving the region early: what follows is dead (constant folding
+                        // leaves this behind)
+                        return Ok(());
+                    } else if target > insn.pc
+                        && let Ok(t) = self.idx(target)
+                        && t <= end
+                        && !(i + 1..t).any(|j| self.jumped_to(j))
+                    {
+                        // jumping over code nothing else reaches
+                        i = t;
+                    } else if target <= insn.pc {
+                        return Err(self.unsupported("loops come in M3"));
+                    } else {
+                        return Err(self.unsupported("a jump out of its region"));
+                    }
+                }
+                _ => i += self.step(i)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn test(&mut self, i: usize, result: Option<u8>) -> Result<Test, Error> {
+        use Op::*;
+        let insn = self.insns[i];
+        let (a, aux) = (insn.a, insn.aux);
+        Ok(match insn.op {
+            JUMPIF | JUMPIFNOT => {
+                let pending = match self.slots[a as usize] {
+                    Slot::Pending(id) if result == Some(a) => Some(id),
+                    _ => None,
+                };
+                let pred = self.take_ignoring(&[a], pending.map(|_| a))?.pop().unwrap().expr();
+                let subject = pending.filter(|_| self.slots[a as usize] == Slot::Free);
+                Test { pred, jump_when: insn.op == JUMPIF, subject }
+            }
+            JUMPIFEQ | JUMPIFLE | JUMPIFLT | JUMPIFNOTEQ | JUMPIFNOTLE | JUMPIFNOTLT => {
+                let b = (aux & 0xff) as u8;
+                let (op, jump_when) = match insn.op {
+                    JUMPIFEQ => (BinOp::Eq, true),
+                    JUMPIFNOTEQ => (BinOp::Eq, false),
+                    JUMPIFLT => (BinOp::Lt, true),
+                    JUMPIFNOTLT => (BinOp::Lt, false),
+                    JUMPIFLE => (BinOp::Le, true),
+                    _ => (BinOp::Le, false),
+                };
+                // `x > y` compiles to y < x with the operands still evaluated x first; keep
+                // that order by printing it the way round it was evaluated
+                let swapped = self.foldable(&[a, b]).is_none() && self.foldable(&[b, a]).is_some();
+                let pred = if swapped {
+                    let mut v = self.take_exprs(&[b, a])?.into_iter();
+                    let (rb, ra) = (v.next().unwrap(), v.next().unwrap());
+                    let flipped = match op {
+                        BinOp::Lt => BinOp::Gt,
+                        BinOp::Le => BinOp::Ge,
+                        other => other,
+                    };
+                    Expr::Binary(flipped, Box::new(rb), Box::new(ra))
+                } else {
+                    let mut v = self.take_exprs(&[a, b])?.into_iter();
+                    let (ra, rb) = (v.next().unwrap(), v.next().unwrap());
+                    Expr::Binary(op, Box::new(ra), Box::new(rb))
+                };
+                // never `not (x < y)` turned into `x >= y`: NaN makes them differ
+                Test { pred, jump_when, subject: None }
+            }
+            JUMPXEQKNIL | JUMPXEQKB | JUMPXEQKN | JUMPXEQKS => {
+                let constant = match insn.op {
+                    JUMPXEQKNIL => Expr::Nil,
+                    JUMPXEQKB => Expr::Bool(aux & 1 != 0),
+                    _ => self.constant(aux & 0xff_ffff)?,
+                };
+                let value = self.take1(a)?;
+                Test { pred: Expr::Binary(BinOp::Eq, Box::new(value), Box::new(constant)), jump_when: aux >> 31 == 0, subject: None }
+            }
+            op => return Err(self.unsupported(format!("{} is not a test", op.name()))),
+        })
+    }
+
+    // ---- statement `if` ----
+
+    fn statement_if(&mut self, first: usize, end: usize, exits: &[usize]) -> Result<usize, Error> {
+        // the tests that could make up the condition, and the unconditional jumps a constant
+        // part of one folds to, across a run of expression code; which of them really are the
+        // condition's is checked per candidate
+        let mut tests = vec![first];
+        let mut j = first + 1;
+        while j < end {
+            let insn = self.insns[j];
+            let forward_jump = matches!(insn.op, Op::JUMP | Op::JUMPX) && insn.target().is_some_and(|t| t > insn.pc);
+            if is_test(insn.op) || forward_jump {
+                tests.push(j);
+            } else if !is_expression(&insn) && insn.op != Op::LOADB {
+                break;
+            }
+            j += 1;
+        }
+        let start = self.snapshot();
+        let end_pc = exits[0];
+        let normalized = tests
+            .iter()
+            .filter_map(|&t| self.insns[t].target())
+            .map(|t| (t, self.normalize(t, first, end, exits)))
+            .collect::<Vec<_>>();
+        let normalize = move |t: usize| normalized.iter().find(|(from, _)| *from == t).map_or(t, |(_, to)| *to);
+        // the longest condition that works: a nested `if` with the same exits is the same code
+        for n in (1..=tests.len()).rev() {
+            let then_index = tests[n - 1] + 1;
+            let then_pc = self.pc_at(then_index);
+            let Some(nodes) = self.condition_nodes(&tests[..n], then_pc, &normalize) else { continue };
+            let mut else_pc = None;
+            let mut valid = true;
+            for &t in &nodes {
+                let target = normalize(self.insns[t].target().unwrap());
+                if target <= then_pc {
+                    continue;
+                }
+                if target <= end_pc && else_pc.is_none_or(|e| e == target) {
+                    else_pc = Some(target);
+                } else {
+                    valid = false;
+                }
+            }
+            let Some(else_pc) = else_pc.filter(|_| valid) else {
+                if self.trace {
+                    eprintln!("       condition {nodes:?} then {then_pc}: no single else (region ends {end_pc}, exits {exits:?})");
+                }
+                continue;
+            };
+            match self.condition(&nodes, then_pc, else_pc, &normalize) {
+                Ok(cond) => return self.finish_if(cond, then_index, else_pc, end, exits),
+                Err(e) => {
+                    if self.trace {
+                        eprintln!("       condition {nodes:?} then {then_pc} else {else_pc} failed: {e}");
+                    }
+                    self.restore(&start)
+                }
+            }
+        }
+        Err(self.unsupported("a condition that isn't an expression"))
+    }
+
+    // Which tests are the condition's own and which belong to a value inside one of its parts
+    // (`x == (a and b)`): a condition test goes to the then branch, the else branch, or the
+    // start of another condition test; anything else is part of an expression.
+    fn condition_nodes(&self, tests: &[usize], then_pc: usize, normalize: &dyn Fn(usize) -> usize) -> Option<Vec<usize>> {
+        let mut nodes = tests.to_vec();
+        loop {
+            let starts = nodes
+                .iter()
+                .enumerate()
+                .map(|(n, &t)| if n == 0 { self.insns[t].pc } else { self.pc_at(nodes[n - 1] + 1) })
+                .collect::<Vec<_>>();
+            let first_pc = self.insns[nodes[0]].pc;
+            let inner = nodes.iter().copied().find(|&t| {
+                let target = normalize(self.insns[t].target().unwrap());
+                target > first_pc && target < then_pc && !starts.contains(&target)
+            });
+            match inner {
+                // the last test decides the then branch; the first starts the condition
+                Some(t) if t == *nodes.last().unwrap() || t == nodes[0] => return None,
+                Some(t) => nodes.retain(|&n| n != t),
+                None => return Some(nodes),
+            }
+        }
+    }
+
+    fn condition(&mut self, tests: &[usize], then_pc: usize, else_pc: usize, normalize: &dyn Fn(usize) -> usize) -> Result<Expr, Error> {
+        let starts = tests.iter().enumerate().map(|(n, &t)| if n == 0 { self.insns[t].pc } else { self.pc_at(tests[n - 1] + 1) }).collect::<Vec<_>>();
+        let mut nodes = Vec::new();
+        for (n, &k) in tests.iter().enumerate() {
+            let (body, names) = (self.body.len(), self.names.len());
+            if n > 0 {
+                // a later test's own code only runs when the condition gets that far, so it
+                // must stay inside the condition: no statements, nothing left over
+                let mut j = tests[n - 1] + 1;
+                while j < k {
+                    self.enter(j)?;
+                    if is_test(self.insns[j].op) {
+                        j = self.value_region(j, k)?.ok_or_else(|| self.unsupported("a test inside a condition part"))?;
+                    } else {
+                        j += self.step(j)?;
+                    }
+                }
+                self.enter(k)?;
+            }
+            let test = if is_test(self.insns[k].op) {
+                self.test(k, None)?
+            } else {
+                // a constant part: which way it always goes is decided below
+                Test { pred: Expr::Bool(true), jump_when: true, subject: None }
+            };
+            if n == 0 {
+                // what was still pending runs before the `if`
+                self.flush()?;
+            } else if self.body.len() != body || self.names.len() != names || !self.pending.is_empty() {
+                return Err(self.unsupported("condition code with statements"));
+            }
+            let succ = |pc: usize| -> Result<Succ, Error> {
+                let pc = normalize(pc);
+                if pc == then_pc {
+                    Ok(Succ::Then)
+                } else if pc == else_pc {
+                    Ok(Succ::Else)
+                } else {
+                    match starts.iter().position(|&s| s == pc) {
+                        Some(m) if m > n => Ok(Succ::Node(m)),
+                        _ => Err(self.unsupported("a condition jump to the middle of a test")),
+                    }
+                }
+            };
+            let fall = if n + 1 < tests.len() { Succ::Node(n + 1) } else { Succ::Then };
+            let jump = succ(self.insns[k].target().unwrap())?;
+            if !is_test(self.insns[k].op) {
+                // `x and false` folds to JUMPIFNOT x / JUMP else, and prints back the same way
+                // the side it never takes still points on, so the chain stays connected
+                let node = match jump {
+                    Succ::Then => CondNode { pred: Expr::Bool(true), t: Succ::Then, f: fall },
+                    Succ::Else => CondNode { pred: Expr::Bool(false), t: fall, f: Succ::Else },
+                    Succ::Node(_) => return Err(self.unsupported("a constant jump inside a condition")),
+                };
+                nodes.push(Some(node));
+                continue;
+            }
+            let (t, f) = if test.jump_when { (jump, fall) } else { (fall, jump) };
+            nodes.push(Some(CondNode { pred: test.pred, t, f }));
+        }
+        reduce_condition(nodes).ok_or_else(|| self.unsupported("a condition with no and/or shape"))
+    }
+
+    fn finish_if(&mut self, cond: Expr, then_index: usize, else_pc: usize, end: usize, exits: &[usize]) -> Result<usize, Error> {
+        let end_pc = exits[0];
+        let first = then_index.saturating_sub(1);
+        let normalize = |t: usize| self.normalize(t, first, end, exits);
+        // then [then_index, then_end), else [else_range), and where they meet
+        let (then_end, else_range, join) = if else_pc == end_pc {
+            (end, None, end)
+        } else {
+            let else_index = self.idx(else_pc)?;
+            let last = self.insns[else_index - 1];
+            match (last.op, last.target()) {
+                (Op::JUMP | Op::JUMPX, Some(t)) if else_index - 1 >= then_index && t > else_pc => {
+                    let joined = normalize(t);
+                    if joined > end_pc {
+                        return Err(self.unsupported("an else branch past its region"));
+                    }
+                    let join = if joined == end_pc { end } else { self.idx(joined)? };
+                    (else_index - 1, Some((else_index, join)), join)
+                }
+                // no jump over an else: a then branch that returns, or no else at all
+                _ => (else_index, None, else_index),
+            }
+        };
+
+        // registers a branch writes and something after the join reads are one variable on
+        // both paths, declared before the `if`
+        let mut written = Regs::default();
+        for i in then_index..then_end {
+            written = written.union(liveness::writes(&self.insns[i]));
+        }
+        if let Some((s, e)) = else_range {
+            for i in s..e {
+                written = written.union(liveness::writes(&self.insns[i]));
+            }
+        }
+        let live = self.live_in.get(join).copied().unwrap_or_default();
+        let joined = written.intersect(live).iter().collect::<Vec<_>>();
+        for &r in &joined {
+            let assignable = matches!(self.slots[r as usize], Slot::Local(l) if !self.by_value[l as usize]);
+            if !assignable {
+                let local = self.new_local(r, self.pc);
+                self.body.push(Stmt::Local { locals: vec![local], values: Vec::new() });
+                self.slots[r as usize] = Slot::Local(local);
+            }
+        }
+        self.joins.push(joined);
+
+        let before = self.slots.clone();
+        let outer = std::mem::take(&mut self.body);
+        let then_exits = if then_end == end { exits.to_vec() } else { self.exits_from(then_end) };
+        self.block(then_index, then_end, &then_exits)?;
+        self.flush_branch()?;
+        let then_body = std::mem::take(&mut self.body);
+        let then_slots = std::mem::replace(&mut self.slots, before.clone());
+        let mut else_body = Vec::new();
+        let mut else_slots = before;
+        if let Some((s, e)) = else_range {
+            let else_exits = if e == end { exits.to_vec() } else { self.exits_from(e) };
+            self.block(s, e, &else_exits)?;
+            self.flush_branch()?;
+            else_body = std::mem::take(&mut self.body);
+            else_slots = self.slots.clone();
+        }
+        self.body = outer;
+        let (then_returns, else_returns) = (matches!(then_body.last(), Some(Stmt::Return(_))), matches!(else_body.last(), Some(Stmt::Return(_))));
+        for r in 0..self.slots.len() {
+            self.slots[r] = if then_returns {
+                else_slots[r]
+            } else if else_returns || then_slots[r] == else_slots[r] {
+                then_slots[r]
+            } else {
+                Slot::Free
+            };
+        }
+        self.joins.pop();
+        self.body.push(Stmt::If { cond, then_body, else_body });
+        Ok(join)
+    }
+
+    // the end of a branch: what it left pending runs inside it
+    fn flush_branch(&mut self) -> Result<(), Error> {
+        let constants = self
+            .pending
+            .iter()
+            .filter(|p| p.span == Span::One && matches!(&p.value, Value::Expr(e) if pure_constant(e)))
+            .map(|p| (p.id, p.reg))
+            .collect::<Vec<_>>();
+        for (id, reg) in constants {
+            self.pending.retain(|p| p.id != id);
+            self.slots[reg as usize] = Slot::Free;
+        }
+        self.flush()
+    }
+
+    // ---- value regions: `x and y`, `x or y`, `if c then a else b`, `a < b` as a value ----
+
+    // A test whose paths all meet again with one temporary register holding the result, and
+    // no statements on the way, is an expression. Each path is lifted in a fork of the state;
+    // anything that doesn't fit puts everything back and the caller makes an `if` of it.
+    fn value_region(&mut self, first: usize, end: usize) -> Result<Option<usize>, Error> {
+        let insn = self.insns[first];
+        let Some(mut join) = insn.target() else { return Ok(None) };
+        let mut k = first + 1;
+        while k < self.insns.len() && self.insns[k].pc < join {
+            let i = self.insns[k];
+            let target = match i.op {
+                Op::JUMP | Op::JUMPX => i.target(),
+                Op::LOADB if i.c != 0 => i.target(),
+                op if is_test(op) => i.target(),
+                _ if is_expression(&i) => None,
+                _ => return Ok(None),
+            };
+            if let Some(t) = target {
+                if t <= i.pc {
+                    return Ok(None);
+                }
+                join = join.max(t);
+            }
+            k += 1;
+        }
+        let Some(&join_index) = self.index_of.get(join).filter(|&&j| j != usize::MAX && j <= end) else {
+            if self.trace {
+                eprintln!("       no value region at {}: join {join} past the region", insn.pc);
+            }
+            return Ok(None);
+        };
+        let mut written = Regs::default();
+        for i in first..join_index {
+            written = written.union(liveness::writes(&self.insns[i]));
+        }
+        // (`x and y` tests the temporary it leaves its result in, and writes y there too)
+        let live = self.live_in.get(join_index).copied().unwrap_or_default();
+        let mut results = written.intersect(live).iter().collect::<Vec<_>>();
+        // a value nothing reads still has to be computed: the register the last instruction
+        // before the join writes
+        if results.is_empty() && join_index > first + 1 {
+            results = liveness::writes(&self.insns[join_index - 1]).iter().collect();
+        }
+        let [result] = results[..] else {
+            if self.trace {
+                eprintln!("       no value region at {}: results {results:?}", insn.pc);
+            }
+            return Ok(None);
+        };
+        // A region can compute a local's new value (`x = x and y`). While it runs, a pending
+        // copy of the local's current value stands in the register; its value is assigned
+        // after. Not for a local some closure can assign mid-region.
+        let mut target = None;
+        if let Slot::Local(l) = self.slots[result as usize] {
+            // an open capture would see a write the region makes before running more code; a
+            // write that is each path's last step (`x = a < b`) it can't tell apart
+            let last_steps = (first..join_index).all(|k| {
+                let i = self.insns[k];
+                !liveness::writes(&i).has(result)
+                    || (i.op == Op::LOADB && i.c != 0 && i.target() == Some(join))
+                    || self.pc_at(k + 1) == join
+                    || matches!(self.insns.get(k + 1), Some(n) if matches!(n.op, Op::JUMP | Op::JUMPX) && n.target() == Some(join))
+            });
+            if self.by_ref[l as usize] && !last_steps {
+                if self.trace {
+                    eprintln!("       no value region at {}: result R{result} is captured", insn.pc);
+                }
+                return Ok(None);
+            }
+            if self.assigns(result).is_none() && !self.live_in[first].has(result) {
+                self.release(result);
+            } else {
+                target = Some(l);
+            }
+        }
+        // a value still pending in the result register that the region never reads is
+        // settled before it starts (it still has to be evaluated, just not in here)
+        if let Slot::Pending(_) = self.slots[result as usize]
+            && !self.live_in[first].has(result)
+        {
+            self.clear(result)?;
+        }
+        // older values the region reads (besides what the first test consumes) are locals by
+        // then: they were evaluated before it, and reading them out of order inside it would
+        // take a statement
+        let mut written_before = Regs::default();
+        let mut from_outside = Regs::default();
+        for i in first + 1..join_index {
+            from_outside = from_outside.union(liveness::reads(&self.insns[i]).without(written_before));
+            written_before = written_before.union(liveness::writes(&self.insns[i]));
+        }
+        let newest = from_outside
+            .iter()
+            .filter(|&r| r != result)
+            .filter_map(|r| match self.slots[r as usize] {
+                Slot::Pending(id) => Some(self.index_of(id)),
+                _ => None,
+            })
+            .max();
+        if let Some(index) = newest {
+            self.flush_oldest(index + 1)?;
+        }
+
+        let start = self.snapshot();
+        if let Some(l) = target {
+            self.slots[result as usize] = Slot::Free;
+            if self.live_in[first].has(result) {
+                self.push(result, Span::One, Value::Expr(Expr::Local(l)))?;
+            }
+        }
+        match self.value_paths(first, join, result) {
+            Ok(Some(expr)) => {
+                match target {
+                    Some(l) => {
+                        self.slots[result as usize] = Slot::Local(l);
+                        self.write(result, expr)?;
+                    }
+                    None => self.push(result, Span::One, Value::Expr(expr))?,
+                }
+                Ok(Some(join_index))
+            }
+            failed => {
+                if self.trace {
+                    let why = match failed {
+                        Err(e) => e.to_string(),
+                        _ => "no expression shape".into(),
+                    };
+                    eprintln!("       value region at {} ({first}..{join}) failed: {why}", insn.pc);
+                }
+                self.restore(&start);
+                Ok(None)
+            }
+        }
+    }
+
+    fn value_paths(&mut self, first: usize, join: usize, result: u8) -> Result<Option<Expr>, Error> {
+        let test = self.test(first, Some(result))?;
+        // whatever the first test made pending runs before the region, so it may flush; the
+        // paths after it may not
+        let fork = self.snapshot();
+        let base = self.pending.iter().map(|p| p.id).collect::<Vec<_>>();
+        let old = match self.slots[result as usize] {
+            Slot::Pending(id) => Some(id),
+            _ => None,
+        };
+        let mut budget = 2000;
+        let fall = self.value_path(first + 1, join, result, &fork, &base, old, &mut budget)?;
+        self.restore(&fork);
+        if let Some(id) = test.subject {
+            self.push(result, Span::One, Value::Expr(Expr::Tested(id)))?;
+        }
+        let target = self.idx(self.insns[first].target().unwrap())?;
+        let jump = self.value_path(target, join, result, &fork, &base, old, &mut budget)?;
+        self.restore(&fork);
+        let tree = Tree::Test { pred: test.pred, jump_when: test.jump_when, subject: test.subject, fall: Box::new(fall), jump: Box::new(jump) };
+        let Some(expr) = build_value(tree) else { return Ok(None) };
+        // the result register's old value, if the region started from one, is part of it now
+        if let Some(id) = old {
+            self.pending.retain(|p| p.id != id);
+            self.slots[result as usize] = Slot::Free;
+        }
+        Ok(Some(expr))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn value_path(
+        &mut self,
+        mut i: usize,
+        join: usize,
+        result: u8,
+        fork: &Snapshot,
+        base: &[u64],
+        old: Option<u64>,
+        budget: &mut usize,
+    ) -> Result<Tree, Error> {
+        loop {
+            *budget = budget.checked_sub(1).ok_or_else(|| self.unsupported("value region too large"))?;
+            let insn = *self.insns.get(i).ok_or_else(|| self.unsupported("value region runs off the end"))?;
+            if insn.pc == join {
+                return self.region_value(result, base, old).map(Tree::Value);
+            }
+            if insn.pc > join {
+                return Err(self.unsupported("value path past its join"));
+            }
+            self.enter(i)?;
+            let clean = |l: &Self| l.body.len() == fork.body && l.names.len() == fork.names;
+            // an `x and y` of its own inside this path is just a value here
+            if is_test(insn.op) && insn.a != result {
+                let join_index = self.idx(join)?;
+                if let Some(next) = self.value_region(i, join_index)? {
+                    if !clean(self) {
+                        return Err(self.unsupported("statement inside an expression"));
+                    }
+                    i = next;
+                    continue;
+                }
+            }
+            if is_test(insn.op) {
+                let test = self.test(i, Some(result))?;
+                if !clean(self) {
+                    return Err(self.unsupported("statement inside an expression"));
+                }
+                let here = self.snapshot();
+                let fall = self.value_path(i + 1, join, result, fork, base, old, budget)?;
+                self.restore(&here);
+                if let Some(id) = test.subject {
+                    self.push(result, Span::One, Value::Expr(Expr::Tested(id)))?;
+                }
+                let target = self.idx(insn.target().unwrap())?;
+                let jump = self.value_path(target, join, result, fork, base, old, budget)?;
+                self.restore(&here);
+                return Ok(Tree::Test { pred: test.pred, jump_when: test.jump_when, subject: test.subject, fall: Box::new(fall), jump: Box::new(jump) });
+            }
+            match insn.op {
+                Op::JUMP | Op::JUMPX => i = self.idx(insn.target().unwrap())?,
+                Op::LOADB if insn.c != 0 => {
+                    self.write(insn.a, Expr::Bool(insn.b != 0))?;
+                    i = self.idx(insn.target().unwrap())?;
+                }
+                _ => i += self.step(i)?,
+            }
+            if !clean(self) {
+                return Err(self.unsupported("statement inside an expression"));
+            }
+        }
+    }
+
+    // at the join: the result register holds the newest pending value and everything else
+    // is as the region found it
+    fn region_value(&mut self, result: u8, base: &[u64], old: Option<u64>) -> Result<Expr, Error> {
+        let Slot::Pending(id) = self.slots[result as usize] else { return Err(self.unsupported("no value at the join")) };
+        let ids = self.pending.iter().map(|p| p.id).filter(|&p| p != id).collect::<Vec<_>>();
+        let expected = base.iter().copied().filter(|&p| Some(p) != old).collect::<Vec<_>>();
+        if ids != expected || self.pending.last().map(|p| p.id) != Some(id) {
+            return Err(self.unsupported("a value region that leaves other values behind"));
+        }
+        match &self.pending.last().unwrap() {
+            Pending { span: Span::One, value: Value::Expr(e), .. } => Ok(e.clone()),
+            Pending { span: Span::One, value: Value::Table(fields, _), .. } => Ok(table(fields.clone())),
+            _ => Err(self.unsupported("a value region ending in a value list")),
+        }
+    }
+}
+
+// Each test sends control to two places: another test, the then branch, or the else branch.
+// Luau's conditions are and/or trees, so a test whose successor has no other predecessor
+// folds into it, until one test with then/else is left. No code is duplicated.
+fn reduce_condition(mut nodes: Vec<Option<CondNode>>) -> Option<Expr> {
+    let not = |e: Expr| Expr::Unary(UnOp::Not, Box::new(e));
+    loop {
+        let mut changed = false;
+        for a in 0..nodes.len() {
+            let Some(node) = &nodes[a] else { continue };
+            let preds = |b: usize, nodes: &[Option<CondNode>]| {
+                nodes.iter().flatten().filter(|n| n.t == Succ::Node(b) || n.f == Succ::Node(b)).count()
+            };
+            let (t, f) = (node.t, node.f);
+            let merge = match (t, f) {
+                (Succ::Node(b), _) if preds(b, &nodes) == 1 => {
+                    let nb = nodes[b].as_ref().unwrap();
+                    if f == nb.f {
+                        Some((b, true, false))
+                    } else if f == nb.t {
+                        Some((b, true, true))
+                    } else {
+                        None
+                    }
+                }
+                (_, Succ::Node(b)) if preds(b, &nodes) == 1 => {
+                    let nb = nodes[b].as_ref().unwrap();
+                    if t == nb.t {
+                        Some((b, false, false))
+                    } else if t == nb.f {
+                        Some((b, false, true))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some((b, through_true, negated)) = merge {
+                let na = nodes[a].take().unwrap();
+                let nb = nodes[b].take().unwrap();
+                let pred = match (through_true, negated) {
+                    // a truthy goes on to b, falsy agrees with b falsy: a and b
+                    (true, false) => Expr::Binary(BinOp::And, Box::new(na.pred), Box::new(nb.pred)),
+                    // a falsy lands where b truthy does: (not a) or b
+                    (true, true) => Expr::Binary(BinOp::Or, Box::new(not(na.pred)), Box::new(nb.pred)),
+                    // a truthy agrees with b truthy, falsy goes on to b: a or b
+                    (false, false) => Expr::Binary(BinOp::Or, Box::new(na.pred), Box::new(nb.pred)),
+                    // a truthy lands where b falsy does: (not a) and b
+                    (false, true) => Expr::Binary(BinOp::And, Box::new(not(na.pred)), Box::new(nb.pred)),
+                };
+                nodes[a] = Some(CondNode { pred, t: nb.t, f: nb.f });
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut alive = nodes.into_iter().flatten();
+    let node = alive.next()?;
+    if alive.next().is_some() {
+        return None;
+    }
+    match (node.t, node.f) {
+        (Succ::Then, Succ::Else) => Some(node.pred),
+        (Succ::Else, Succ::Then) => Some(not(node.pred)),
+        _ => None,
+    }
+}
+
+fn build_value(tree: Tree) -> Option<Expr> {
+    match tree {
+        Tree::Value(e) => Some(e),
+        Tree::Test { pred, jump_when, subject, fall, jump } => {
+            let (t, f) = if jump_when { (jump, fall) } else { (fall, jump) };
+            let (t, f) = (build_value(*t)?, build_value(*f)?);
+            if let Some(id) = subject {
+                if t == Expr::Tested(id) && !f.contains_tested(id) {
+                    return Some(Expr::Binary(BinOp::Or, Box::new(pred), Box::new(f)));
+                }
+                if f == Expr::Tested(id) && !t.contains_tested(id) {
+                    return Some(Expr::Binary(BinOp::And, Box::new(pred), Box::new(t)));
+                }
+                if t.contains_tested(id) || f.contains_tested(id) {
+                    return None;
+                }
+            }
+            Some(simplify_choice(pred, t, f))
+        }
+    }
+}
+
+// `if p then t else f` in the plainest form that means exactly the same
+fn simplify_choice(p: Expr, t: Expr, f: Expr) -> Expr {
+    let boolean = p.is_boolean();
+    match (t, f) {
+        (Expr::Bool(true), Expr::Bool(false)) if boolean => p,
+        (Expr::Bool(true), Expr::Bool(false)) => Expr::Unary(UnOp::Not, Box::new(Expr::Unary(UnOp::Not, Box::new(p)))),
+        (Expr::Bool(false), Expr::Bool(true)) => Expr::Unary(UnOp::Not, Box::new(p)),
+        (t, Expr::Bool(false)) if boolean => Expr::Binary(BinOp::And, Box::new(p), Box::new(t)),
+        (Expr::Bool(true), f) if boolean => Expr::Binary(BinOp::Or, Box::new(p), Box::new(f)),
+        // reading a local twice is reading it once
+        (t, f) if f == p && matches!(p, Expr::Local(_)) => Expr::Binary(BinOp::And, Box::new(p), Box::new(t)),
+        (t, f) if t == p && matches!(p, Expr::Local(_)) => Expr::Binary(BinOp::Or, Box::new(p), Box::new(f)),
+        // `if p then x or f else f` is `p and x or f`: `a and b or c` compiles to this
+        (Expr::Binary(BinOp::Or, x, y), f) if *y == f => {
+            Expr::Binary(BinOp::Or, Box::new(Expr::Binary(BinOp::And, Box::new(p), x)), y)
+        }
+        (t, f) => Expr::IfElse(Box::new(p), Box::new(t), Box::new(f)),
+    }
+}
+
+fn literal(e: &Expr) -> bool {
+    match e {
+        Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_) | Expr::Vector(_) => true,
+        Expr::Unary(_, a) => literal(a),
+        Expr::Binary(_, a, b) => literal(a) && literal(b),
+        _ => false,
+    }
+}
+
+// exponents POWK computes differently from pow() (or that might fold to one)
+fn power_special(e: &Expr) -> bool {
+    match e {
+        Expr::Number(n) => *n == 2.0 || *n == 0.5 || *n == 3.0,
+        e => foldable(e),
+    }
+}
+
+fn pure_constant(e: &Expr) -> bool {
+    matches!(e, Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_) | Expr::Vector(_) | Expr::Tested(_))
 }
 
 fn table(fields: Vec<Field>) -> Expr {

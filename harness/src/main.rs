@@ -219,6 +219,7 @@ fn main() -> ExitCode {
             let generator = match grammar {
                 Grammar::Full => generator::GENERATOR_VERSION.to_string(),
                 Grammar::Straight => format!("{}-straight", generator::GENERATOR_VERSION),
+                Grammar::Branches => format!("{}-branches", generator::GENERATOR_VERSION),
             };
             run(&common, cases, reduce, &generator)
         }

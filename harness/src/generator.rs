@@ -214,6 +214,7 @@ struct Gen {
     walking: Vec<usize>,
     call_depth: u32,
     straight: bool,
+    no_loops: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -221,6 +222,8 @@ pub enum Grammar {
     Full,
     // no jumps at all: no branches, loops, comparisons, and/or or if-expressions
     Straight,
+    // everything but loops
+    Branches,
 }
 
 pub fn generate(seed: u64, grammar: Grammar) -> Program {
@@ -234,6 +237,7 @@ pub fn generate(seed: u64, grammar: Grammar) -> Program {
         walking: Vec::new(),
         call_depth: 0,
         straight: grammar == Grammar::Straight,
+        no_loops: grammar != Grammar::Full,
     };
     let units = (0..g.rng.range(4, 8)).map(|_| g.unit()).collect();
     Program { units }
@@ -554,10 +558,10 @@ impl Gen {
                 out.push(o)
             }
             50..=57 if depth > 0 => self.if_stmt(depth, out),
-            58..=62 if depth > 0 => self.numeric_for(depth, out),
-            63..=65 if depth > 0 => self.while_stmt(depth, out),
-            66..=67 if depth > 0 => self.repeat_stmt(depth, out),
-            68..=71 if depth > 0 => self.for_in(depth, out),
+            58..=62 if depth > 0 && !self.no_loops => self.numeric_for(depth, out),
+            63..=65 if depth > 0 && !self.no_loops => self.while_stmt(depth, out),
+            66..=67 if depth > 0 && !self.no_loops => self.repeat_stmt(depth, out),
+            68..=71 if depth > 0 && !self.no_loops => self.for_in(depth, out),
             72..=78 if depth > 0 => self.function_stmt(depth, out),
             79..=80 if depth > 0 => {
                 let body = self.block(depth - 1, 4);
@@ -938,6 +942,23 @@ impl Gen {
             out.push(Node::leaf(lines.join("\n")));
             return;
         }
+        if self.no_loops {
+            let lines = match self.rng.below(11) {
+                0 => self.fam_counter(),
+                1 => self.fam_class(),
+                2 => self.fam_proxy(),
+                3 => self.fam_errors(),
+                4 => self.fam_varargs(),
+                5 => self.fam_constructors(),
+                6 => self.fam_order(),
+                7 => self.fam_numbers(),
+                8 => self.fam_strings(),
+                9 => self.fam_if_chain(),
+                _ => self.fam_and_or(),
+            };
+            out.push(Node::leaf(lines.join("\n")));
+            return;
+        }
         let lines = match self.rng.below(15) {
             0 => self.fam_loop_closures(),
             1 => self.fam_counter(),
@@ -1257,7 +1278,7 @@ impl Gen {
             "local r7 = (a and b) == (c and d)".into(),
             "local r8 = not (a and b) or not c".into(),
             "if a and not b or c then r1 = \"then\" elseif not (c or d) then r1 = \"elseif\" end".into(),
-            "while a and b do a = nil end".into(),
+            if self.no_loops { "if a and b then a = nil end".into() } else { "while a and b do a = nil end".into() },
             format!("out({label}, r1, r2, r3, r4, r5, r6, r7, r8, a)"),
         ]
     }

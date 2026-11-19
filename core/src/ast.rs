@@ -22,6 +22,10 @@ pub enum Expr {
     Unary(UnOp, Box<Expr>),
     Table(Vec<Field>),
     Closure(Box<Closure>),
+    IfElse(Box<Expr>, Box<Expr>, Box<Expr>),
+    // while lifting a value region: the value a test just looked at, where `x and y` or
+    // `x or y` keeps it; never left in a finished tree
+    Tested(u64),
 }
 
 impl Expr {
@@ -54,6 +58,45 @@ pub enum BinOp {
     Concat,
     And,
     Or,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl BinOp {
+    pub fn compares(self) -> bool {
+        matches!(self, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
+    }
+}
+
+impl Expr {
+    // always true or false, so `if e then true else false` is `e` itself
+    pub fn is_boolean(&self) -> bool {
+        match self {
+            Expr::Bool(_) | Expr::Unary(UnOp::Not, _) => true,
+            Expr::Binary(op, a, b) => op.compares() || (matches!(op, BinOp::And | BinOp::Or) && a.is_boolean() && b.is_boolean()),
+            _ => false,
+        }
+    }
+
+    pub fn contains_tested(&self, id: u64) -> bool {
+        match self {
+            Expr::Tested(t) => *t == id,
+            Expr::Index(a, b) | Expr::Binary(_, a, b) => a.contains_tested(id) || b.contains_tested(id),
+            Expr::Unary(_, a) => a.contains_tested(id),
+            Expr::IfElse(a, b, c) => a.contains_tested(id) || b.contains_tested(id) || c.contains_tested(id),
+            Expr::Call { func, args, .. } => func.contains_tested(id) || args.iter().any(|a| a.contains_tested(id)),
+            Expr::MethodCall { object, args, .. } => object.contains_tested(id) || args.iter().any(|a| a.contains_tested(id)),
+            Expr::Table(fields) => fields.iter().any(|f| match f {
+                Field::Positional(v) => v.contains_tested(id),
+                Field::Keyed(k, v) => k.contains_tested(id) || v.contains_tested(id),
+            }),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +132,7 @@ pub enum Stmt {
     Assign { targets: Vec<Expr>, values: Vec<Expr> },
     Call(Expr),
     Return(Vec<Expr>),
+    If { cond: Expr, then_body: Vec<Stmt>, else_body: Vec<Stmt> },
 }
 
 #[derive(Clone, Debug)]

@@ -16,8 +16,10 @@ pub fn is_identifier(name: &[u8]) -> bool {
 }
 
 // Precedence, loosest first. Atoms and prefix expressions sit above every operator.
+const IF_ELSE: u8 = 0;
 const OR: u8 = 1;
 const AND: u8 = 2;
+const COMPARE: u8 = 3;
 const CONCAT: u8 = 4;
 const ADD: u8 = 5;
 const MUL: u8 = 6;
@@ -37,15 +39,24 @@ fn binary_precedence(op: BinOp) -> (u8, bool, &'static str) {
         BinOp::IDiv => (MUL, false, "//"),
         BinOp::Mod => (MUL, false, "%"),
         BinOp::Pow => (POW, true, "^"),
+        BinOp::Eq => (COMPARE, false, "=="),
+        BinOp::Ne => (COMPARE, false, "~="),
+        BinOp::Lt => (COMPARE, false, "<"),
+        BinOp::Le => (COMPARE, false, "<="),
+        BinOp::Gt => (COMPARE, false, ">"),
+        BinOp::Ge => (COMPARE, false, ">="),
     }
 }
 
 fn precedence(expr: &Expr) -> u8 {
     match expr {
         Expr::Binary(op, ..) => binary_precedence(*op).0,
+        // printed as `a ~= b`
+        Expr::Unary(UnOp::Not, inner) if matches!(inner.as_ref(), Expr::Binary(BinOp::Eq | BinOp::Ne, ..)) => COMPARE,
         Expr::Unary(..) => UNARY,
         Expr::Number(n) if n.is_finite() && n.is_sign_negative() => UNARY,
         Expr::Number(n) if n.is_nan() && n.is_sign_positive() => UNARY,
+        Expr::IfElse(..) => IF_ELSE,
         _ => ATOM,
     }
 }
@@ -144,6 +155,11 @@ fn collect_globals(body: &[Stmt], out: &mut HashSet<Vec<u8>>) {
                 expr(b, out);
             }
             Expr::Unary(_, a) => expr(a, out),
+            Expr::IfElse(a, b, c) => {
+                expr(a, out);
+                expr(b, out);
+                expr(c, out);
+            }
             Expr::Call { func, args, .. } => {
                 expr(func, out);
                 args.iter().for_each(|a| expr(a, out));
@@ -168,6 +184,11 @@ fn collect_globals(body: &[Stmt], out: &mut HashSet<Vec<u8>>) {
             Stmt::Assign { targets, values } => targets.iter().chain(values).for_each(|v| expr(v, out)),
             Stmt::Call(e) => expr(e, out),
             Stmt::LocalFunction { .. } => {}
+            Stmt::If { cond, then_body, else_body } => {
+                expr(cond, out);
+                collect_globals(then_body, out);
+                collect_globals(else_body, out);
+            }
         }
     }
 }
@@ -206,21 +227,7 @@ impl Printer<'_> {
             Some(Stmt::Return(values)) if values.is_empty() => &body[..body.len() - 1],
             _ => body,
         };
-        let pad = "\t".repeat(indent);
-        let mut previous_end = None;
-        for stmt in body {
-            let text = self.stmt(stmt, indent);
-            // a statement starting with `(` would otherwise continue the previous line as a call
-            if text.starts_with('(')
-                && let Some(end) = previous_end
-            {
-                out.insert(end, ';');
-            }
-            out.push_str(&pad);
-            out.push_str(&text);
-            previous_end = Some(out.len());
-            out.push('\n');
-        }
+        self.block(body, indent, out);
     }
 
     fn stmt(&mut self, stmt: &Stmt, indent: usize) -> String {
@@ -249,6 +256,59 @@ impl Printer<'_> {
                 let values = self.list(values, indent);
                 if values.is_empty() { "return".into() } else { format!("return {values}") }
             }
+            Stmt::If { cond, then_body, else_body } => {
+                let mut out = String::new();
+                self.if_chain(cond, then_body, else_body, indent, &mut out);
+                out
+            }
+        }
+    }
+
+    fn if_chain(&mut self, cond: &Expr, then_body: &[Stmt], else_body: &[Stmt], indent: usize, out: &mut String) {
+        // `if not c then a else b end` reads better the other way round
+        if let Expr::Unary(UnOp::Not, inner) = cond
+            && !else_body.is_empty()
+            && !matches!(else_body, [Stmt::If { .. }])
+        {
+            return self.if_chain(inner, else_body, then_body, indent, out);
+        }
+        let pad = "\t".repeat(indent);
+        let cond = self.operand(cond, precedence(cond) == IF_ELSE, indent);
+        out.push_str(&format!("if {cond} then\n"));
+        self.block(then_body, indent + 1, out);
+        match else_body {
+            [] => {}
+            [Stmt::If { cond, then_body, else_body }] => {
+                out.push_str(&pad);
+                out.push_str("else");
+                return self.if_chain(cond, then_body, else_body, indent, out);
+            }
+            body => {
+                out.push_str(&pad);
+                out.push_str("else\n");
+                self.block(body, indent + 1, out);
+            }
+        }
+        out.push_str(&pad);
+        out.push_str("end");
+    }
+
+    // a nested block: unlike a function body, a trailing bare `return` is kept
+    fn block(&mut self, body: &[Stmt], indent: usize, out: &mut String) {
+        let pad = "\t".repeat(indent);
+        let mut previous_end = None;
+        for stmt in body {
+            let text = self.stmt(stmt, indent);
+            // a statement starting with `(` would otherwise continue the previous line as a call
+            if text.starts_with('(')
+                && let Some(end) = previous_end
+            {
+                out.insert(end, ';');
+            }
+            out.push_str(&pad);
+            out.push_str(&text);
+            previous_end = Some(out.len());
+            out.push('\n');
         }
     }
 
@@ -325,9 +385,17 @@ impl Printer<'_> {
             Expr::Binary(op, left, right) => {
                 let (p, right_assoc, symbol) = binary_precedence(*op);
                 let (lp, rp) = (precedence(left), precedence(right));
-                let left = self.operand(left, lp < p || (lp == p && right_assoc), indent);
-                let right = self.operand(right, rp < p || (rp == p && !right_assoc), indent);
+                let compare = p == COMPARE;
+                let left = self.operand(left, lp < p || (lp == p && (right_assoc || compare)), indent);
+                let right = self.operand(right, rp < p || (rp == p && (!right_assoc || compare)), indent);
                 format!("{left} {symbol} {right}")
+            }
+            // `a ~= b` is defined as `not (a == b)`, metamethods included (unlike `<`, where
+            // NaN makes `not (a < b)` and `a >= b` differ)
+            Expr::Unary(UnOp::Not, inner) if matches!(inner.as_ref(), Expr::Binary(BinOp::Eq | BinOp::Ne, ..)) => {
+                let Expr::Binary(op, a, b) = inner.as_ref() else { unreachable!() };
+                let flipped = if *op == BinOp::Eq { BinOp::Ne } else { BinOp::Eq };
+                self.expr(&Expr::Binary(flipped, a.clone(), b.clone()), indent)
             }
             Expr::Unary(op, operand) => {
                 // `- -x` would start a comment, so a negated negation keeps its parentheses
@@ -341,6 +409,14 @@ impl Printer<'_> {
             }
             Expr::Table(fields) => self.table(fields, indent),
             Expr::Closure(closure) => self.closure(closure, indent),
+            Expr::IfElse(cond, a, b) => {
+                let cond = self.operand(cond, precedence(cond) == IF_ELSE, indent);
+                // `else` swallows everything to its right, so a nested one there is fine bare
+                let a = self.operand(a, precedence(a) == IF_ELSE, indent);
+                let b = self.expr(b, indent);
+                format!("if {cond} then {a} else {b}")
+            }
+            Expr::Tested(_) => unreachable!("value regions never leave a tested placeholder"),
         }
     }
 
