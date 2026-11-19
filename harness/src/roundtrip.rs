@@ -11,6 +11,8 @@ pub enum Kind {
     Pass,
     // the input itself didn't compile or ran out of steps, so it says nothing about the decompiler
     Unusable,
+    // the decompiler declined, saying the input is unsupported: no output, but no wrong one
+    Refused,
     DecompileFailed,
     RecompileFailed,
     Mismatch,
@@ -54,7 +56,10 @@ pub fn check(source: &str, profile: Profile, decompiler: &dyn Decompiler) -> Ver
 
     let output = match decompiler.decompile(&bytecode) {
         Ok(o) => o,
-        Err(e) => return Verdict { want: Some(want), ..Verdict::new(Kind::DecompileFailed, e) },
+        Err(e) => {
+            let kind = if e.starts_with("unsupported") { Kind::Refused } else { Kind::DecompileFailed };
+            return Verdict { want: Some(want), ..Verdict::new(kind, e) };
+        }
     };
     let recompiled = match luau::compile(&output, profile) {
         Ok(b) => b,

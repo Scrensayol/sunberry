@@ -26,6 +26,22 @@ impl Decompiler for Sunberry {
     }
 }
 
+// the new core, in process
+pub struct Next;
+
+impl Decompiler for Next {
+    fn name(&self) -> &str {
+        "next"
+    }
+
+    fn decompile(&self, bytecode: &[u8]) -> Result<String, String> {
+        match panic::catch_unwind(|| sunberry_core::decompile(bytecode, 1)) {
+            Ok(result) => result.map_err(|e| e.to_string()),
+            Err(e) => Err(format!("panic: {}", e.downcast_ref::<String>().map(String::as_str).or_else(|| e.downcast_ref::<&str>().copied()).unwrap_or("unknown"))),
+        }
+    }
+}
+
 // Any other decompiler, run as `name=program args...` where `{}` is replaced by the path
 // of a raw bytecode file (appended when absent). The decompiled source is read from stdout.
 pub struct External {

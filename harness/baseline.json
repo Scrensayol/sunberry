@@ -1,5 +1,5 @@
 {
-  "generator": "typed-v1",
+  "generator": "typed-v2",
   "failing": {
     "sunberry": [
       "seed0 O1g1",
@@ -240,6 +240,8 @@
       "seed197 O1g2",
       "seed197 O2g1",
       "seed197 O2g2",
+      "seed21 O0g1",
+      "seed21 O0g2",
       "seed23 O1g1",
       "seed23 O1g2",
       "seed23 O2g1",

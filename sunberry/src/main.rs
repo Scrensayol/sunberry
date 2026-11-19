@@ -29,7 +29,9 @@ async fn main() -> Result<(), std::io::Error> {
             encode_key,
             lua51,
             name,
-        } => decompile(&input, &output, encode_key, lua51, name)?,
+            core,
+        } => decompile(&input, &output, encode_key, lua51, name, core)?,
+        commands::Commands::Disasm { input, encode_key } => commands::disasm(&input, encode_key)?,
         commands::Commands::Serve { port, luau, lua51 } => serve(port, luau, lua51).await?,
     }
 

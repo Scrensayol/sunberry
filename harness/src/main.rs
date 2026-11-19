@@ -14,6 +14,7 @@ use std::{
 
 use clap::{Args, Parser, Subcommand};
 use decompiler::{Decompiler, External, Sunberry};
+use generator::Grammar;
 use luau::Profile;
 use rayon::prelude::*;
 use roundtrip::{Kind, Verdict};
@@ -45,19 +46,40 @@ enum Command {
         /// Shrink each failing program to a minimal one that fails the same way
         #[arg(long)]
         reduce: bool,
+        #[arg(long, value_enum, default_value = "full")]
+        grammar: Grammar,
     },
     /// Print the program a seed generates
-    Gen { seed: u64 },
+    Gen {
+        seed: u64,
+        #[arg(long, value_enum, default_value = "full")]
+        grammar: Grammar,
+    },
+    /// Compile a .luau file (or a seed's program) with the harness's Luau, to reproduce a case
+    Compile {
+        /// a .luau file, or seed<N> for a generated program
+        input: String,
+        #[arg(long, default_value = "O1g1")]
+        profile: String,
+        #[arg(long, value_enum, default_value = "full")]
+        grammar: Grammar,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// Check that every .lua file under a directory compiles
+    Syntax { dir: PathBuf },
     /// Check that generated programs compile, finish and don't error at top level
     Selfcheck {
         #[arg(long, default_value = "500")]
         seeds: String,
+        #[arg(long, value_enum, default_value = "full")]
+        grammar: Grammar,
     },
 }
 
 #[derive(Args)]
 struct Common {
-    /// sunberry (in-process), or name=command where {} is the bytecode path, e.g.
+    /// sunberry or next (the new core), both in-process, or name=command where {} is the bytecode path, e.g.
     /// tovek='/path/luau-lifter {}'. Repeat to compare several.
     #[arg(long = "decompiler", default_value = "sunberry")]
     decompilers: Vec<String>,
@@ -98,11 +120,46 @@ fn main() -> ExitCode {
     }));
 
     match Cli::parse().command {
-        Command::Gen { seed } => {
-            print!("{}", generator::generate(seed).render());
+        Command::Gen { seed, grammar } => {
+            print!("{}", generator::generate(seed, grammar).render());
             ExitCode::SUCCESS
         }
-        Command::Selfcheck { seeds } => {
+        Command::Compile { input, profile, grammar, output } => {
+            let Some(profile) = Profile::parse(&profile) else {
+                eprintln!("profiles look like O1g1");
+                return ExitCode::from(2);
+            };
+            let source = match input.strip_prefix("seed").and_then(|n| n.parse().ok()) {
+                Some(seed) => generator::generate(seed, grammar).render(),
+                None => fs::read_to_string(&input).expect("read input"),
+            };
+            match luau::compile(&source, profile) {
+                Ok(bytecode) => {
+                    fs::write(&output, bytecode).expect("write output");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Syntax { dir } => {
+            let files = fs::read_dir(&dir).expect("read dir").flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "lua")).collect::<Vec<_>>();
+            let bad = files
+                .par_iter()
+                .filter_map(|f| {
+                    let text = fs::read_to_string(f).ok()?;
+                    luau::compile(&text, Profile { opt: 1, debug: 1 }).err().map(|e| format!("{}: {}", f.display(), e.lines().next().unwrap_or_default()))
+                })
+                .collect::<Vec<_>>();
+            println!("{} files, {} don't compile", files.len(), bad.len());
+            for b in bad.iter().take(10) {
+                println!("  {b}");
+            }
+            if bad.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+        }
+        Command::Selfcheck { seeds, grammar } => {
             let Some(seeds) = parse_seeds(&seeds) else {
                 eprintln!("--seeds takes a count or a range like 100..200");
                 return ExitCode::from(2);
@@ -110,7 +167,7 @@ fn main() -> ExitCode {
             let problems = seeds
                 .into_par_iter()
                 .flat_map_iter(|seed| {
-                    let source = generator::generate(seed).render();
+                    let source = generator::generate(seed, grammar).render();
                     Profile::ALL.into_iter().filter_map(move |profile| {
                         let problem = match luau::compile(&source, profile) {
                             Err(e) => format!("compile: {e}"),
@@ -151,15 +208,19 @@ fn main() -> ExitCode {
                 .into_iter()
                 .map(|p| Case { name: p.file_stem().unwrap().to_string_lossy().into_owned(), source: Source::File(p) })
                 .collect();
-            run(&common, cases, false)
+            run(&common, cases, false, generator::GENERATOR_VERSION)
         }
-        Command::Fuzz { common, seeds, reduce } => {
+        Command::Fuzz { common, seeds, reduce, grammar } => {
             let Some(seeds) = parse_seeds(&seeds) else {
                 eprintln!("--seeds takes a count or a range like 100..200");
                 return ExitCode::from(2);
             };
-            let cases = seeds.map(|seed| Case { name: format!("seed{seed}"), source: Source::Seed(seed) }).collect();
-            run(&common, cases, reduce)
+            let cases = seeds.map(|seed| Case { name: format!("seed{seed}"), source: Source::Seed(seed, grammar) }).collect();
+            let generator = match grammar {
+                Grammar::Full => generator::GENERATOR_VERSION.to_string(),
+                Grammar::Straight => format!("{}-straight", generator::GENERATOR_VERSION),
+            };
+            run(&common, cases, reduce, &generator)
         }
     }
 }
@@ -183,7 +244,7 @@ fn collect_luau(path: &Path, out: &mut Vec<PathBuf>) {
 
 enum Source {
     File(PathBuf),
-    Seed(u64),
+    Seed(u64, Grammar),
 }
 
 struct Case {
@@ -195,7 +256,7 @@ impl Case {
     fn text(&self) -> String {
         match &self.source {
             Source::File(p) => fs::read_to_string(p).unwrap_or_default(),
-            Source::Seed(s) => generator::generate(*s).render(),
+            Source::Seed(s, g) => generator::generate(*s, *g).render(),
         }
     }
 }
@@ -212,7 +273,7 @@ struct Failure {
 
 #[derive(Serialize)]
 struct Report {
-    generator: &'static str,
+    generator: String,
     cases: usize,
     profiles: Vec<String>,
     // decompiler -> kind -> count
@@ -226,12 +287,16 @@ fn decompilers(specs: &[String]) -> Result<Vec<Box<dyn Decompiler>>, String> {
     specs
         .iter()
         .map(|spec| -> Result<Box<dyn Decompiler>, String> {
-            if spec == "sunberry" { Ok(Box::new(Sunberry)) } else { Ok(Box::new(External::parse(spec)?)) }
+            if spec == "sunberry" {
+                Ok(Box::new(Sunberry))
+            } else if spec == "next" {
+                Ok(Box::new(decompiler::Next))
+            } else { Ok(Box::new(External::parse(spec)?)) }
         })
         .collect()
 }
 
-fn run(common: &Common, cases: Vec<Case>, reduce: bool) -> ExitCode {
+fn run(common: &Common, cases: Vec<Case>, reduce: bool, generator_version: &str) -> ExitCode {
     let profiles = if common.profiles == "all" {
         Profile::ALL.to_vec()
     } else {
@@ -265,10 +330,10 @@ fn run(common: &Common, cases: Vec<Case>, reduce: bool) -> ExitCode {
             let verdict = roundtrip::check(&source, profile, decompiler);
             let mut reduced = None;
             if verdict.kind.is_failure() {
-                if reduce && let Source::Seed(seed) = case.source {
+                if reduce && let Source::Seed(seed, grammar) = case.source {
                     let kind = verdict.kind;
                     let (program, _) = reduce::reduce(
-                        &generator::generate(seed),
+                        &generator::generate(seed, grammar),
                         |p| roundtrip::check(&p.render(), profile, decompiler).kind == kind,
                         400,
                     );
@@ -283,13 +348,18 @@ fn run(common: &Common, cases: Vec<Case>, reduce: bool) -> ExitCode {
         .collect::<Vec<_>>();
 
     let mut report = Report {
-        generator: generator::GENERATOR_VERSION,
+        generator: generator_version.to_string(),
         cases: cases.len(),
         profiles: profiles.iter().map(Profile::to_string).collect(),
         totals: BTreeMap::new(),
         by_profile: BTreeMap::new(),
         failures: BTreeMap::new(),
     };
+    let refusals = results
+        .iter()
+        .filter(|r| r.3 == Kind::Refused)
+        .map(|(case, profile, d, kind, detail, _)| (case.name.clone(), *profile, *d, *kind, detail.clone()))
+        .collect::<Vec<_>>();
     for (case, profile, d, kind, detail, reduced_lines) in results {
         let name = decompilers[d].name().to_string();
         *report.totals.entry(name.clone()).or_default().entry(kind).or_default() += 1;
@@ -312,11 +382,12 @@ fn run(common: &Common, cases: Vec<Case>, reduce: bool) -> ExitCode {
         let count = |k| totals.get(&k).copied().unwrap_or(0);
         let usable = totals.values().sum::<usize>() - count(Kind::Unusable);
         println!(
-            "{name}: {}/{usable} pass | {} mismatch, {} don't recompile, {} decompile failures | {} unusable inputs",
+            "{name}: {}/{usable} pass | {} mismatch, {} don't recompile, {} decompile failures, {} refused | {} unusable inputs",
             count(Kind::Pass),
             count(Kind::Mismatch),
             count(Kind::RecompileFailed),
             count(Kind::DecompileFailed),
+            count(Kind::Refused),
             count(Kind::Unusable),
         );
         if let Some(by_profile) = report.by_profile.get(name) {
@@ -330,6 +401,19 @@ fn run(common: &Common, cases: Vec<Case>, reduce: bool) -> ExitCode {
             println!("  {} {} {:?}{reduced}: {detail}", failure.case, failure.profile, failure.kind);
         }
         failed |= report.failures.contains_key(name);
+        let mut reasons = BTreeMap::<String, (usize, String)>::new();
+        for (case, profile, d, kind, detail) in &refusals {
+            if decompilers[*d].name() == name {
+                let key = detail.chars().map(|c| if c.is_ascii_digit() { 'N' } else { c }).collect::<String>().replace("NN", "N").replace("NN", "N");
+                reasons.entry(key).or_insert((0, format!("{case} {profile}"))).0 += 1;
+                let _ = kind;
+            }
+        }
+        let mut reasons = reasons.into_iter().collect::<Vec<_>>();
+        reasons.sort_by(|a, b| b.1.0.cmp(&a.1.0).then(a.0.cmp(&b.0)));
+        for (reason, (count, example)) in reasons.iter().take(8) {
+            println!("  refused {count:5}x  {reason}  (e.g. {example})");
+        }
     }
     println!("{} round trips in {:.1}s", jobs.len(), started.elapsed().as_secs_f64());
 
@@ -339,7 +423,7 @@ fn run(common: &Common, cases: Vec<Case>, reduce: bool) -> ExitCode {
 
     if let Some(path) = &common.baseline {
         let current = Baseline {
-            generator: generator::GENERATOR_VERSION.into(),
+            generator: generator_version.to_string(),
             failing: report
                 .failures
                 .iter()

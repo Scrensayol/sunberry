@@ -6,9 +6,11 @@ use std::rc::Rc;
 
 use crate::rng::Rng;
 
-pub const GENERATOR_VERSION: &str = "typed-v1";
+pub const GENERATOR_VERSION: &str = "typed-v2";
 
-const PRELUDE: &str = r##"local function describe(v, depth)
+// Installed in the VM before every program as the global `out`, so it's no part of what
+// gets decompiled.
+pub const PRELUDE: &str = r##"local function describe(v, depth)
 	local kind = type(v)
 	if kind == "number" then
 		if v ~= v then
@@ -34,7 +36,7 @@ const PRELUDE: &str = r##"local function describe(v, depth)
 	end
 	return tostring(v)
 end
-local function out(label, ...)
+function out(label, ...)
 	local count = select("#", ...)
 	local parts = table.create(count)
 	for index = 1, count do
@@ -123,7 +125,7 @@ pub struct Program {
 
 impl Program {
     pub fn render(&self) -> String {
-        let mut out = String::from(PRELUDE);
+        let mut out = String::new();
         for unit in &self.units {
             render_node(unit, 0, &mut out);
         }
@@ -211,9 +213,17 @@ struct Gen {
     // arrays being walked by a loop: appending to one would never end
     walking: Vec<usize>,
     call_depth: u32,
+    straight: bool,
 }
 
-pub fn generate(seed: u64) -> Program {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Grammar {
+    Full,
+    // no jumps at all: no branches, loops, comparisons, and/or or if-expressions
+    Straight,
+}
+
+pub fn generate(seed: u64, grammar: Grammar) -> Program {
     let mut g = Gen {
         rng: Rng::new(seed),
         scopes: vec![Vec::new()],
@@ -223,6 +233,7 @@ pub fn generate(seed: u64) -> Program {
         stmts_left: 0,
         walking: Vec::new(),
         call_depth: 0,
+        straight: grammar == Grammar::Straight,
     };
     let units = (0..g.rng.range(4, 8)).map(|_| g.unit()).collect();
     Program { units }
@@ -369,7 +380,7 @@ impl Gen {
             7 => format!("math.{}({})", self.rng.pick(&["floor", "abs", "ceil", "sign", "round"]), self.num(d)),
             8 => format!("math.{}({}, {})", self.rng.pick(&["max", "min"]), self.num(d), self.num(d)),
             9 => format!("(#{})", self.string_operand(d)),
-            10 => format!("(if {} then {} else {})", self.boolean(d), self.num(d), self.num(d)),
+            10 if !self.straight => format!("(if {} then {} else {})", self.boolean(d), self.num(d), self.num(d)),
             11 => format!("math.clamp({}, -4, 4)", self.num(d)),
             12 if self.fns.last().unwrap().vararg => "select(\"#\", ...)".to_string(),
             13 => format!("tonumber({})", self.rng.pick(&["\"10\"", "\"0x1F\"", "\"-3.5\"", "\"1e3\"", "\" 7 \""])),
@@ -412,12 +423,19 @@ impl Gen {
                 let (a, b) = (self.any(d), self.num(d));
                 format!("`{}{{{a}}}{}{{{b}}}`", self.rng.pick(&parts), self.rng.pick(&parts))
             }
-            11 => format!("(if {} then {} else {})", self.boolean(d), self.string(d), self.string(d)),
+            11 if !self.straight => format!("(if {} then {} else {})", self.boolean(d), self.string(d), self.string(d)),
             _ => self.read(&Ty::Str).unwrap_or_else(|| self.rng.pick(STRS).to_string()),
         }
     }
 
     fn boolean(&mut self, d: u32) -> String {
+        if self.straight && d > 0 {
+            return match self.rng.below(3) {
+                0 => format!("not {}", self.boolean(d - 1)),
+                1 => format!("rawequal({}, {})", self.any(d - 1), self.any(d - 1)),
+                _ => self.boolean(0),
+            };
+        }
         if d == 0 || self.rng.chance(20) {
             if self.rng.chance(50)
                 && let Some(read) = self.read(&Ty::Bool)
@@ -447,6 +465,16 @@ impl Gen {
     }
 
     fn any(&mut self, d: u32) -> String {
+        if self.straight && d > 0 {
+            return match self.rng.below(3) {
+                0 => format!("not {}", self.any(d - 1)),
+                1 => {
+                    let ty = self.scalar_ty();
+                    self.expr(&ty, d - 1)
+                }
+                _ => self.any(0),
+            };
+        }
         if d == 0 || self.rng.chance(25) {
             if self.rng.chance(40)
                 && let Some(read) = self.read(&Ty::Any)
@@ -500,6 +528,24 @@ impl Gen {
         self.stmts_left = self.stmts_left.saturating_sub(1);
         let in_loop = !self.fns.last().unwrap().loops.is_empty();
         let in_fn = self.fns.last().unwrap().rets.is_some();
+        if self.straight {
+            return match self.rng.below(100) {
+                0..=27 => self.local_stmt(out),
+                28..=43 => self.assign_stmt(out),
+                44..=63 => {
+                    let o = self.out_stmt();
+                    out.push(o)
+                }
+                64..=75 if depth > 0 => self.function_stmt(depth, out),
+                76..=79 if depth > 0 => {
+                    let body = self.block(depth - 1, 4);
+                    out.push(Node::block("do", body, "end"))
+                }
+                80..=87 => self.multi_assign(out),
+                88..=97 => self.call_stmt(out),
+                _ => self.local_stmt(out),
+            };
+        }
         match self.rng.below(100) {
             0..=21 => self.local_stmt(out),
             22..=35 => self.assign_stmt(out),
@@ -882,6 +928,16 @@ impl Gen {
     // ---- templates for bug classes random statements rarely line up ----
 
     fn family(&mut self, out: &mut Vec<Node>) {
+        if self.straight {
+            let lines = match self.rng.below(4) {
+                0 => self.fam_counter(),
+                1 => self.fam_varargs(),
+                2 => self.fam_constructors(),
+                _ => self.fam_pressure(),
+            };
+            out.push(Node::leaf(lines.join("\n")));
+            return;
+        }
         let lines = match self.rng.below(15) {
             0 => self.fam_loop_closures(),
             1 => self.fam_counter(),

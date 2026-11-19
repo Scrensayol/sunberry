@@ -32,6 +32,10 @@ jobs:
       - name: Round-trip generated programs
         run: target/harness/sunberry-harness fuzz --seeds 200 --baseline harness/baseline.json --work harness/out/fuzz
 
+      # the new core may refuse what it can't do yet, but never print something wrong
+      - name: Round-trip the new core on straight-line programs
+        run: target/harness/sunberry-harness fuzz --seeds 200 --grammar straight --decompiler next --work harness/out/next
+
       - name: Upload failing round trips
         if: failure()
         uses: actions/upload-artifact@v4

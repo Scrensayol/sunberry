@@ -1,6 +1,14 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Core {
+    /// the current decompiler
+    Old,
+    /// the rewrite in progress: refuses what it can't do yet instead of guessing
+    Next,
+}
 
 mod decompile;
 pub use decompile::*;
@@ -31,6 +39,19 @@ pub enum Commands {
         /// the input file's name
         #[arg(short, long)]
         name: Option<String>,
+
+        /// Which decompiler core to use for Luau
+        #[arg(long, value_enum, default_value_t = Core::Old)]
+        core: Core,
+    },
+
+    /// Disassemble Luau bytecode (raw or base64) with the new core's reader
+    Disasm {
+        #[arg(short, long)]
+        input: PathBuf,
+
+        #[arg(short, long, default_value_t = default_encode_key())]
+        encode_key: u8,
     },
 
     /// Start a simple web server to handle decompiling.

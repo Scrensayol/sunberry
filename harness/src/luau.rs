@@ -107,6 +107,10 @@ pub fn run(bytecode: &[u8]) -> Observation {
         });
     }
 
+    static PRELUDE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let prelude = PRELUDE.get_or_init(|| compile(crate::generator::PRELUDE, Profile { opt: 1, debug: 1 }).expect("prelude compiles"));
+    lua.load(&prelude[..]).set_mode(ChunkMode::Binary).set_name("=prelude").exec().expect("prelude runs");
+
     let result = lua.load(bytecode).set_mode(ChunkMode::Binary).set_name("=prog").exec();
     let ending = if steps.get() > STEP_BUDGET {
         Ending::TimedOut
