@@ -103,8 +103,20 @@ struct Lifter<'a> {
     // registers each enclosing branch writes that are read after it joins: writes to them
     // assign the variable declared before the `if`
     joins: Vec<Vec<u8>>,
+    loops: Vec<LoopCtx>,
     trace: bool,
 }
+
+// the loop being lifted: where a `break` and a `continue` jump to
+struct LoopCtx {
+    breaks: Vec<usize>,
+    cont: usize,
+    continued: bool,
+}
+
+// jump targets standing for `break` and `continue` once normalized
+const BREAK: usize = usize::MAX - 1;
+const CONTINUE: usize = usize::MAX - 2;
 
 // everything a speculative path can change, to put back if it doesn't work out
 struct Snapshot {
@@ -198,6 +210,7 @@ pub fn lift(chunk: &Chunk, proto_id: usize) -> Result<Function, Error> {
         insns: Vec::new(),
         index_of: Vec::new(),
         joins: Vec::new(),
+        loops: Vec::new(),
         trace: std::env::var_os("SUNBERRY_TRACE").is_some(),
     };
     let params = (0..proto.num_params)
@@ -222,6 +235,7 @@ pub fn lift(chunk: &Chunk, proto_id: usize) -> Result<Function, Error> {
     lifter.block(0, lifter.insns.len(), &[proto.code.len()])?;
     lifter.flush()?;
     let body = pin_constants(lifter.body, &lifter.ever_by_ref);
+    let body = limit_locals(body);
     Ok(Function { params, is_vararg: proto.is_vararg, body, names: lifter.names })
 }
 
@@ -233,19 +247,15 @@ pub fn lift(chunk: &Chunk, proto_id: usize) -> Result<Function, Error> {
 fn pin_constants(body: Vec<Stmt>, by_ref: &[bool]) -> Vec<Stmt> {
     fn mark(body: &[Stmt], assigned: &mut [bool]) {
         for stmt in body {
-            match stmt {
-                Stmt::Assign { targets, .. } => {
-                    for target in targets {
-                        if let Expr::Local(l) = target {
-                            assigned[*l as usize] = true;
-                        }
+            if let Stmt::Assign { targets, .. } = stmt {
+                for target in targets {
+                    if let Expr::Local(l) = target {
+                        assigned[*l as usize] = true;
                     }
                 }
-                Stmt::If { then_body, else_body, .. } => {
-                    mark(then_body, assigned);
-                    mark(else_body, assigned);
-                }
-                _ => {}
+            }
+            for nested in stmt.bodies() {
+                mark(nested, assigned);
             }
         }
     }
@@ -258,11 +268,12 @@ fn pin(body: Vec<Stmt>, assigned: &[bool], by_ref: &[bool]) -> Vec<Stmt> {
     let mut out = Vec::with_capacity(body.len());
     for stmt in body {
         match stmt {
-            Stmt::If { cond, then_body, else_body } => out.push(Stmt::If {
-                cond,
-                then_body: pin(then_body, assigned, by_ref),
-                else_body: pin(else_body, assigned, by_ref),
-            }),
+            mut stmt @ (Stmt::If { .. } | Stmt::While { .. } | Stmt::Repeat { .. } | Stmt::NumericFor { .. } | Stmt::GenericFor { .. } | Stmt::Do(_)) => {
+                for nested in stmt.bodies_mut() {
+                    *nested = pin(std::mem::take(nested), assigned, by_ref);
+                }
+                out.push(stmt);
+            }
             Stmt::Local { locals, values }
                 if locals.len() == 1
                     && values.len() == 1
@@ -278,6 +289,132 @@ fn pin(body: Vec<Stmt>, assigned: &[bool], by_ref: &[bool]) -> Vec<Stmt> {
         }
     }
     out
+}
+
+// Luau allows 200 locals in scope at once. The source kept that by scoping them in blocks,
+// which only show in the bytecode as registers being reused; a block declaring many locals
+// is cut where everything declared since the last cut is never mentioned again (closures
+// mention what they capture), and each run goes in `do ... end`.
+const LOCALS_BEFORE_SCOPING: usize = 150;
+
+fn limit_locals(mut body: Vec<Stmt>) -> Vec<Stmt> {
+    for stmt in &mut body {
+        for nested in stmt.bodies_mut() {
+            *nested = limit_locals(std::mem::take(nested));
+        }
+    }
+    let declared = body.iter().map(|s| declares(s).len()).sum::<usize>();
+    if declared <= LOCALS_BEFORE_SCOPING {
+        return body;
+    }
+    // the last statement mentioning each local
+    let mut last = std::collections::HashMap::new();
+    for (i, stmt) in body.iter().enumerate() {
+        let mut refs = Vec::new();
+        stmt_refs(stmt, &mut refs);
+        for l in refs {
+            last.insert(l, i);
+        }
+    }
+    // how far each statement's own locals reach
+    let n = body.len();
+    let reach = body
+        .iter()
+        .enumerate()
+        .map(|(i, s)| declares(s).iter().map(|l| last.get(l).copied().unwrap_or(i)).max().unwrap_or(i))
+        .collect::<Vec<_>>();
+    let mut items = body.into_iter().map(Some).collect::<Vec<_>>();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        // the shortest run from here that everything declared in it is done with by its end;
+        // locals living to the end of the block stay outside
+        let mut end = reach[i];
+        let mut k = i;
+        while k <= end {
+            end = end.max(reach[k]);
+            k += 1;
+        }
+        let declaring = !declares(items[i].as_ref().unwrap()).is_empty();
+        if declaring && end + 1 < n {
+            let run = items[i..=end].iter_mut().map(|s| s.take().unwrap()).collect::<Vec<_>>();
+            out.push(Stmt::Do(limit_locals(run)));
+            i = end + 1;
+        } else {
+            out.push(items[i].take().unwrap());
+            i += 1;
+        }
+    }
+    out
+}
+
+fn declares(stmt: &Stmt) -> Vec<u32> {
+    match stmt {
+        Stmt::Local { locals, .. } => locals.clone(),
+        Stmt::LocalFunction { local, .. } => vec![*local],
+        _ => Vec::new(),
+    }
+}
+
+fn stmt_refs(stmt: &Stmt, out: &mut Vec<u32>) {
+    match stmt {
+        Stmt::Local { values, .. } | Stmt::Return(values) => values.iter().for_each(|v| expr_refs(v, out)),
+        Stmt::LocalFunction { local, closure } => {
+            out.push(*local);
+            closure_refs(closure, out);
+        }
+        Stmt::Assign { targets, values } => targets.iter().chain(values).for_each(|v| expr_refs(v, out)),
+        Stmt::Call(e) | Stmt::If { cond: e, .. } | Stmt::While { cond: e, .. } | Stmt::Repeat { cond: e, .. } => expr_refs(e, out),
+        Stmt::NumericFor { from, to, step, .. } => [Some(from), Some(to), step.as_ref()].into_iter().flatten().for_each(|v| expr_refs(v, out)),
+        Stmt::GenericFor { values, .. } => values.iter().for_each(|v| expr_refs(v, out)),
+        Stmt::Break | Stmt::Continue | Stmt::Do(_) => {}
+    }
+    for nested in stmt.bodies() {
+        for s in nested {
+            stmt_refs(s, out);
+        }
+    }
+}
+
+fn closure_refs(closure: &Closure, out: &mut Vec<u32>) {
+    for capture in &closure.captures {
+        if let Capture::Local(l) = capture {
+            out.push(*l);
+        }
+    }
+}
+
+fn expr_refs(e: &Expr, out: &mut Vec<u32>) {
+    match e {
+        Expr::Local(l) => out.push(*l),
+        Expr::Closure(c) => closure_refs(c, out),
+        Expr::Index(a, b) | Expr::Binary(_, a, b) => {
+            expr_refs(a, out);
+            expr_refs(b, out);
+        }
+        Expr::Unary(_, a) => expr_refs(a, out),
+        Expr::IfElse(a, b, c) => {
+            expr_refs(a, out);
+            expr_refs(b, out);
+            expr_refs(c, out);
+        }
+        Expr::Call { func, args, .. } => {
+            expr_refs(func, out);
+            args.iter().for_each(|a| expr_refs(a, out));
+        }
+        Expr::MethodCall { object, args, .. } => {
+            expr_refs(object, out);
+            args.iter().for_each(|a| expr_refs(a, out));
+        }
+        Expr::Table(fields) => fields.iter().for_each(|f| match f {
+            Field::Positional(v) => expr_refs(v, out),
+            Field::Keyed(k, v) => {
+                expr_refs(k, out);
+                expr_refs(v, out);
+            }
+        }),
+        _ => {}
+    }
 }
 
 // what Luau's constant folding might turn into a constant (an overestimate is only uglier):
@@ -523,8 +660,8 @@ impl Lifter<'_> {
     }
 
     fn emit(&mut self, stmt: Stmt) -> Result<(), Error> {
-        // nothing may follow a return in its block
-        if let Stmt::Return(_) = stmt {
+        // nothing may follow a return, break or continue in its block
+        if stmt.terminates() {
             self.flush()?;
         } else {
             self.flush_for_statement()?;
@@ -571,18 +708,18 @@ impl Lifter<'_> {
 
     // the values `regs` hold, in order; a NAMECALL pair counts as one operand
     fn take(&mut self, regs: &[u8]) -> Result<Vec<Operand>, Error> {
-        self.take_ignoring(regs, None)
+        self.take_ignoring(regs, &[])
     }
 
-    // `ignore`: a register whose later reads the caller accounts for itself
-    fn take_ignoring(&mut self, regs: &[u8], ignore: Option<u8>) -> Result<Vec<Operand>, Error> {
+    // `ignore`: registers whose later reads the caller accounts for itself
+    fn take_ignoring(&mut self, regs: &[u8], ignore: &[u8]) -> Result<Vec<Operand>, Error> {
         // a value read again later can't be folded into this reader: it becomes a local
         // (a register this instruction overwrites is read later only as its new value)
         let live = self.live[self.at];
         let overwritten = liveness::writes(&self.insns[self.at]);
         let reused = regs
             .iter()
-            .filter(|&&r| live.has(r) && !overwritten.has(r) && Some(r) != ignore)
+            .filter(|&&r| live.has(r) && !overwritten.has(r) && !ignore.contains(&r))
             .filter_map(|&r| match self.slots[r as usize] {
                 Slot::Pending(id) => Some(self.index_of(id)),
                 _ => None,
@@ -1184,6 +1321,14 @@ impl Lifter<'_> {
         if exits.contains(&target) {
             return exits[0];
         }
+        if let Some(lp) = self.loops.last() {
+            if lp.breaks.contains(&target) {
+                return BREAK;
+            }
+            if target == lp.cont {
+                return CONTINUE;
+            }
+        }
         if target > exits[0]
             && let Some(&i) = self.index_of.get(target)
             && let Some(insn) = self.insns.get(i)
@@ -1195,9 +1340,10 @@ impl Lifter<'_> {
         target
     }
 
-    fn jumped_to(&self, index: usize) -> bool {
-        let pc = self.insns[index].pc;
-        self.insns.iter().any(|i| i.target() == Some(pc))
+    // whether code outside insns[from..to) jumps into it (if not, it's dead)
+    fn entered(&self, from: usize, to: usize) -> bool {
+        let (lo, hi) = (self.pc_at(from), self.pc_at(to));
+        self.insns.iter().enumerate().any(|(k, i)| (k < from || k >= to) && i.target().is_some_and(|t| t >= lo && t < hi))
     }
 
     fn pc_at(&self, index: usize) -> usize {
@@ -1267,14 +1413,29 @@ impl Lifter<'_> {
         while i < end {
             // after a return nothing in the region runs (Luau leaves threaded RETURN copies
             // there), unless something jumps in
-            if matches!(self.body.last(), Some(Stmt::Return(_))) {
-                if (i..end).any(|j| self.jumped_to(j)) {
+            if self.body.last().is_some_and(Stmt::terminates) {
+                if self.entered(i, end) {
                     return Err(self.unsupported("code after a return that something jumps to"));
                 }
                 return Ok(());
             }
             self.enter(i)?;
             let insn = self.insns[i];
+            match insn.op {
+                Op::FORNPREP => {
+                    i = self.numeric_for(i)?;
+                    continue;
+                }
+                Op::FORGPREP | Op::FORGPREP_INEXT | Op::FORGPREP_NEXT => {
+                    i = self.generic_for(i)?;
+                    continue;
+                }
+                _ => {}
+            }
+            if let Some(back) = self.back_edge(i, end) {
+                i = self.jumpback_loop(i, back)?;
+                continue;
+            }
             if is_test(insn.op) {
                 if let Some(next) = self.value_region(i, end)? {
                     i = next;
@@ -1294,16 +1455,24 @@ impl Lifter<'_> {
             match insn.op {
                 Op::JUMP | Op::JUMPX => {
                     let target = insn.target().unwrap();
+                    let loop_target = self.loops.last().map(|l| (l.breaks.contains(&target), l.cont == target));
                     if target == insn.pc + 1 || (i + 1 == end && exits.contains(&target)) {
                         i += 1;
-                    } else if exits.contains(&target) && !(i + 1..end).any(|j| self.jumped_to(j)) {
+                    } else if let Some((true, _)) = loop_target {
+                        self.emit(Stmt::Break)?;
+                        i += 1;
+                    } else if let Some((_, true)) = loop_target {
+                        self.loops.last_mut().unwrap().continued = true;
+                        self.emit(Stmt::Continue)?;
+                        i += 1;
+                    } else if exits.contains(&target) && !self.entered(i + 1, end) {
                         // leaving the region early: what follows is dead (constant folding
                         // leaves this behind)
                         return Ok(());
                     } else if target > insn.pc
                         && let Ok(t) = self.idx(target)
                         && t <= end
-                        && !(i + 1..t).any(|j| self.jumped_to(j))
+                        && !self.entered(i + 1, t)
                     {
                         // jumping over code nothing else reaches
                         i = t;
@@ -1329,7 +1498,8 @@ impl Lifter<'_> {
                     Slot::Pending(id) if result == Some(a) => Some(id),
                     _ => None,
                 };
-                let pred = self.take_ignoring(&[a], pending.map(|_| a))?.pop().unwrap().expr();
+                let ignore = pending.map(|_| a).into_iter().collect::<Vec<_>>();
+                let pred = self.take_ignoring(&[a], &ignore)?.pop().unwrap().expr();
                 let subject = pending.filter(|_| self.slots[a as usize] == Slot::Free);
                 Test { pred, jump_when: insn.op == JUMPIF, subject }
             }
@@ -1414,7 +1584,7 @@ impl Lifter<'_> {
                 if target <= then_pc {
                     continue;
                 }
-                if target <= end_pc && else_pc.is_none_or(|e| e == target) {
+                if (target <= end_pc || target >= CONTINUE) && else_pc.is_none_or(|e| e == target) {
                     else_pc = Some(target);
                 } else {
                     valid = false;
@@ -1528,6 +1698,17 @@ impl Lifter<'_> {
     }
 
     fn finish_if(&mut self, cond: Expr, then_index: usize, else_pc: usize, end: usize, exits: &[usize]) -> Result<usize, Error> {
+        // `if c then break end` compiles to one jump to the loop's end when c holds
+        if else_pc == BREAK || else_pc == CONTINUE {
+            let stmt = if else_pc == BREAK {
+                Stmt::Break
+            } else {
+                self.loops.last_mut().unwrap().continued = true;
+                Stmt::Continue
+            };
+            self.body.push(Stmt::If { cond: tidy_condition(negate(cond)), then_body: vec![stmt], else_body: Vec::new() });
+            return Ok(then_index);
+        }
         let end_pc = exits[0];
         let first = then_index.saturating_sub(1);
         let normalize = |t: usize| self.normalize(t, first, end, exits);
@@ -1538,7 +1719,8 @@ impl Lifter<'_> {
             let else_index = self.idx(else_pc)?;
             let last = self.insns[else_index - 1];
             match (last.op, last.target()) {
-                (Op::JUMP | Op::JUMPX, Some(t)) if else_index - 1 >= then_index && t > else_pc => {
+                // (a `break` or `continue` ending the then branch is no jump over an else)
+                (Op::JUMP | Op::JUMPX, Some(t)) if else_index - 1 >= then_index && t > else_pc && normalize(t) < CONTINUE => {
                     let joined = normalize(t);
                     if joined > end_pc {
                         return Err(self.unsupported("an else branch past its region"));
@@ -1591,7 +1773,7 @@ impl Lifter<'_> {
             else_slots = self.slots.clone();
         }
         self.body = outer;
-        let (then_returns, else_returns) = (matches!(then_body.last(), Some(Stmt::Return(_))), matches!(else_body.last(), Some(Stmt::Return(_))));
+        let (then_returns, else_returns) = (then_body.last().is_some_and(Stmt::terminates), else_body.last().is_some_and(Stmt::terminates));
         for r in 0..self.slots.len() {
             self.slots[r] = if then_returns {
                 else_slots[r]
@@ -1602,7 +1784,7 @@ impl Lifter<'_> {
             };
         }
         self.joins.pop();
-        self.body.push(Stmt::If { cond, then_body, else_body });
+        self.body.push(Stmt::If { cond: tidy_condition(cond), then_body, else_body });
         Ok(join)
     }
 
@@ -1863,6 +2045,200 @@ impl Lifter<'_> {
             Pending { span: Span::One, value: Value::Table(fields, _), .. } => Ok(table(fields.clone())),
             _ => Err(self.unsupported("a value region ending in a value list")),
         }
+    }
+}
+
+
+// ---- loops ----
+// Each loop is one range closed by its back-edge (FORNLOOP, FORGLOOP or JUMPBACK). `break`
+// jumps to just past it (Luau threads that through JUMPs), `continue` to the back-edge.
+impl Lifter<'_> {
+    // a backward jump to here from inside the region: a while or repeat loop starts here
+    fn back_edge(&self, head: usize, end: usize) -> Option<usize> {
+        let pc = self.insns[head].pc;
+        (head..end).rev().find(|&b| {
+            let i = self.insns[b];
+            matches!(i.op, Op::JUMPBACK | Op::JUMP | Op::JUMPX) && i.target() == Some(pc) && i.pc >= pc
+        })
+    }
+
+    // Lifts a loop's body. Registers it writes that the next iteration or the code after the
+    // loop reads are one variable around it, declared before it, like a branch's joins.
+    fn loop_body(
+        &mut self,
+        start: usize,
+        back: usize,
+        exit: usize,
+        breaks: Vec<usize>,
+        internal: Regs,
+        vars: &[(u8, u32)],
+    ) -> Result<(Vec<Stmt>, bool), Error> {
+        self.flush()?;
+        let mut written = Regs::default();
+        for i in start..back {
+            written = written.union(liveness::writes(&self.insns[i]));
+        }
+        let live = self.live_in[start].union(self.live_in.get(exit).copied().unwrap_or_default());
+        let joined = written.intersect(live).without(internal).iter().collect::<Vec<_>>();
+        for &r in &joined {
+            let assignable = matches!(self.slots[r as usize], Slot::Local(l) if !self.by_value[l as usize]);
+            if !assignable {
+                let local = self.new_local(r, self.pc);
+                self.body.push(Stmt::Local { locals: vec![local], values: Vec::new() });
+                self.slots[r as usize] = Slot::Local(local);
+            }
+        }
+        self.joins.push(joined);
+        self.loops.push(LoopCtx { breaks, cont: self.insns[back].pc, continued: false });
+        let before = self.slots.clone();
+        let outer = std::mem::take(&mut self.body);
+        for &(reg, local) in vars {
+            self.slots[reg as usize] = Slot::Local(local);
+        }
+        let exits = self.exits_from(back);
+        self.block(start, back, &exits)?;
+        self.flush_branch()?;
+        let body = std::mem::replace(&mut self.body, outer);
+        let ctx = self.loops.pop().unwrap();
+        self.joins.pop();
+        self.slots = before;
+        Ok((body, ctx.continued))
+    }
+
+    fn breaks_from(&self, exit: usize) -> Vec<usize> {
+        let mut breaks = self.exits_from(exit);
+        // a repeat's condition exits through the CLOSEUPVALS for its body's locals
+        if let Some(i) = self.insns.get(exit)
+            && i.op == Op::CLOSEUPVALS
+        {
+            breaks.extend(self.exits_from(exit + 1));
+        }
+        breaks
+    }
+
+    fn numeric_for(&mut self, prep: usize) -> Result<usize, Error> {
+        let insn = self.insns[prep];
+        let a = insn.a;
+        // the FORNPREP's skip is threaded past JUMPs after the loop, so find the back-edge by
+        // its registers: nested loops always use higher ones
+        let Some(back) = (prep + 1..self.insns.len()).find(|&k| self.insns[k].op == Op::FORNLOOP && self.insns[k].a == a) else {
+            return Err(self.unsupported("FORNPREP without its FORNLOOP"));
+        };
+        let exit = back + 1;
+        // (the back-edge is threaded too: through JUMPs at the top of the body)
+        let top = self.exits_from(prep + 1);
+        if self.insns[back].op != Op::FORNLOOP || !self.insns[back].target().is_some_and(|t| top.contains(&t)) {
+            return Err(self.unsupported("FORNPREP without its FORNLOOP"));
+        }
+        // evaluated from, to, step: the order the source has them
+        // (the loop instruction reads its registers on every iteration: that's the loop, not
+        // a reason to keep the values in locals)
+        let header = [a + 2, a, a + 1];
+        let mut v = self.take_ignoring(&header, &header)?.into_iter().map(Operand::expr);
+        let (from, to, step) = (v.next().unwrap(), v.next().unwrap(), v.next().unwrap());
+        let step = (step != Expr::Number(1.0)).then_some(step);
+        let var = self.new_local(a + 2, self.insns[prep + 1].pc);
+        let mut internal = Regs::default();
+        internal.add_range(a as usize, a as usize + 3);
+        let (body, _) = self.loop_body(prep + 1, back, exit, self.breaks_from(exit), internal, &[(a + 2, var)])?;
+        self.emit(Stmt::NumericFor { var, from, to, step, body })?;
+        Ok(exit)
+    }
+
+    fn generic_for(&mut self, prep: usize) -> Result<usize, Error> {
+        let insn = self.insns[prep];
+        let a = insn.a;
+        let back = self.idx(insn.target().unwrap())?;
+        let looping = self.insns[back];
+        let top = self.exits_from(prep + 1);
+        if looping.op != Op::FORGLOOP || !looping.target().is_some_and(|t| top.contains(&t)) {
+            return Err(self.unsupported("FORGPREP without its FORGLOOP"));
+        }
+        let exit = back + 1;
+        // the generator, state and control: one call's three results, or values one by one
+        let values = match self.slots[a as usize] {
+            Slot::Pending(id) if matches!(self.pending[self.index_of(id)], Pending { reg, span: Span::Many(3), .. } if reg == a) => {
+                let index = self.index_of(id);
+                if index + 1 != self.pending.len() {
+                    self.flush_oldest(index)?;
+                }
+                let pending = self.pending.pop().unwrap();
+                for r in a..a + 3 {
+                    self.slots[r as usize] = Slot::Free;
+                }
+                let Value::Expr(e) = pending.value else { return Err(self.unsupported("generic for over a value list")) };
+                vec![e]
+            }
+            _ => {
+                let header = [a, a + 1, a + 2];
+                let mut values = self.take_ignoring(&header, &header)?.into_iter().map(Operand::expr).collect::<Vec<_>>();
+                while values.len() > 1 && values.last() == Some(&Expr::Nil) {
+                    values.pop();
+                }
+                values
+            }
+        };
+        let count = (looping.aux & 0xff) as u8;
+        let vars = (0..count).map(|k| (a + 3 + k, self.new_local(a + 3 + k, self.insns[prep + 1].pc))).collect::<Vec<_>>();
+        let mut internal = Regs::default();
+        internal.add_range(a as usize, a as usize + 3 + (count as usize).max(2));
+        let (body, _) = self.loop_body(prep + 1, back, exit, self.breaks_from(exit), internal, &vars)?;
+        self.emit(Stmt::GenericFor { vars: vars.iter().map(|v| v.1).collect(), values, body })?;
+        Ok(exit)
+    }
+
+    // `while` and `repeat` are both one range closed by a JUMPBACK. Lifted as `while true`,
+    // a leading `if c then break end` makes it `while not c`, and a trailing one (with no
+    // `continue`, which would skip it) `repeat ... until c`.
+    fn jumpback_loop(&mut self, head: usize, back: usize) -> Result<usize, Error> {
+        let exit = back + 1;
+        let (mut body, continued) = self.loop_body(head, back, exit, self.breaks_from(exit), Regs::default(), &[])?;
+        let breaks_if = |s: Option<&Stmt>| matches!(s, Some(Stmt::If { then_body, else_body, .. }) if matches!(then_body[..], [Stmt::Break]) && else_body.is_empty());
+        let stmt = if breaks_if(body.first()) {
+            let Stmt::If { cond, .. } = body.remove(0) else { unreachable!() };
+            Stmt::While { cond: tidy_condition(negate(cond)), body }
+        } else if !continued && breaks_if(body.last()) {
+            let Some(Stmt::If { cond, .. }) = body.pop() else { unreachable!() };
+            Stmt::Repeat { body, cond }
+        } else {
+            Stmt::While { cond: Expr::Bool(true), body }
+        };
+        self.emit(stmt)?;
+        Ok(exit)
+    }
+}
+
+fn negate(e: Expr) -> Expr {
+    match e {
+        Expr::Unary(UnOp::Not, inner) => *inner,
+        e => Expr::Unary(UnOp::Not, Box::new(e)),
+    }
+}
+
+fn count_nots(e: &Expr) -> usize {
+    match e {
+        Expr::Unary(UnOp::Not, a) => 1 + count_nots(a),
+        Expr::Binary(BinOp::And | BinOp::Or, a, b) => count_nots(a) + count_nots(b),
+        _ => 0,
+    }
+}
+
+// A condition with fewer `not`s. Only truthiness matters to a condition, so `not not x` is
+// `x` here; De Morgan holds anywhere, as `not` always gives a boolean.
+fn tidy_condition(e: Expr) -> Expr {
+    match e {
+        Expr::Unary(UnOp::Not, inner) => match *inner {
+            Expr::Unary(UnOp::Not, x) => tidy_condition(*x),
+            Expr::Binary(op @ (BinOp::And | BinOp::Or), a, b) => {
+                let flipped = if op == BinOp::And { BinOp::Or } else { BinOp::And };
+                let pushed = Expr::Binary(flipped, Box::new(tidy_condition(negate(*a.clone()))), Box::new(tidy_condition(negate(*b.clone()))));
+                let kept = Expr::Unary(UnOp::Not, Box::new(Expr::Binary(op, Box::new(tidy_condition(*a)), Box::new(tidy_condition(*b)))));
+                if count_nots(&pushed) < count_nots(&kept) { pushed } else { kept }
+            }
+            other => Expr::Unary(UnOp::Not, Box::new(tidy_condition(other))),
+        },
+        Expr::Binary(op @ (BinOp::And | BinOp::Or), a, b) => Expr::Binary(op, Box::new(tidy_condition(*a)), Box::new(tidy_condition(*b))),
+        e => e,
     }
 }
 

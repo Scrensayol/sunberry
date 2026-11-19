@@ -184,11 +184,17 @@ fn collect_globals(body: &[Stmt], out: &mut HashSet<Vec<u8>>) {
             Stmt::Assign { targets, values } => targets.iter().chain(values).for_each(|v| expr(v, out)),
             Stmt::Call(e) => expr(e, out),
             Stmt::LocalFunction { .. } => {}
-            Stmt::If { cond, then_body, else_body } => {
-                expr(cond, out);
-                collect_globals(then_body, out);
-                collect_globals(else_body, out);
+            Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::Repeat { cond, .. } => expr(cond, out),
+            Stmt::NumericFor { from, to, step, .. } => {
+                expr(from, out);
+                expr(to, out);
+                step.iter().for_each(|s| expr(s, out));
             }
+            Stmt::GenericFor { values, .. } => values.iter().for_each(|v| expr(v, out)),
+            Stmt::Break | Stmt::Continue | Stmt::Do(_) => {}
+        }
+        for body in stmt.bodies() {
+            collect_globals(body, out);
         }
     }
 }
@@ -259,6 +265,51 @@ impl Printer<'_> {
             Stmt::If { cond, then_body, else_body } => {
                 let mut out = String::new();
                 self.if_chain(cond, then_body, else_body, indent, &mut out);
+                out
+            }
+            Stmt::While { cond, body } => {
+                let cond = self.operand(cond, precedence(cond) == IF_ELSE, indent);
+                let mut out = format!("while {cond} do\n");
+                self.block(body, indent + 1, &mut out);
+                out.push_str(&"\t".repeat(indent));
+                out.push_str("end");
+                out
+            }
+            Stmt::Repeat { body, cond } => {
+                let mut out = "repeat\n".to_string();
+                self.block(body, indent + 1, &mut out);
+                // the condition sees the body's locals, so it is printed after them
+                let cond = self.expr(cond, indent);
+                out.push_str(&"\t".repeat(indent));
+                out.push_str(&format!("until {cond}"));
+                out
+            }
+            Stmt::NumericFor { var, from, to, step, body } => {
+                let (from, to) = (self.expr(from, indent), self.expr(to, indent));
+                let step = step.as_ref().map(|s| format!(", {}", self.expr(s, indent))).unwrap_or_default();
+                let var = self.declare(*var);
+                let mut out = format!("for {var} = {from}, {to}{step} do\n");
+                self.block(body, indent + 1, &mut out);
+                out.push_str(&"\t".repeat(indent));
+                out.push_str("end");
+                out
+            }
+            Stmt::GenericFor { vars, values, body } => {
+                let values = self.list(values, indent);
+                let vars = vars.iter().map(|&v| self.declare(v)).collect::<Vec<_>>();
+                let mut out = format!("for {} in {values} do\n", vars.join(", "));
+                self.block(body, indent + 1, &mut out);
+                out.push_str(&"\t".repeat(indent));
+                out.push_str("end");
+                out
+            }
+            Stmt::Break => "break".into(),
+            Stmt::Continue => "continue".into(),
+            Stmt::Do(body) => {
+                let mut out = "do\n".to_string();
+                self.block(body, indent + 1, &mut out);
+                out.push_str(&"\t".repeat(indent));
+                out.push_str("end");
                 out
             }
         }

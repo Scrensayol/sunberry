@@ -133,6 +133,37 @@ pub enum Stmt {
     Call(Expr),
     Return(Vec<Expr>),
     If { cond: Expr, then_body: Vec<Stmt>, else_body: Vec<Stmt> },
+    While { cond: Expr, body: Vec<Stmt> },
+    Repeat { body: Vec<Stmt>, cond: Expr },
+    NumericFor { var: u32, from: Expr, to: Expr, step: Option<Expr>, body: Vec<Stmt> },
+    GenericFor { vars: Vec<u32>, values: Vec<Expr>, body: Vec<Stmt> },
+    Break,
+    Continue,
+    Do(Vec<Stmt>),
+}
+
+impl Stmt {
+    // the statement lists nested directly in this one
+    pub fn bodies(&self) -> Vec<&Vec<Stmt>> {
+        match self {
+            Stmt::If { then_body, else_body, .. } => vec![then_body, else_body],
+            Stmt::While { body, .. } | Stmt::Repeat { body, .. } | Stmt::NumericFor { body, .. } | Stmt::GenericFor { body, .. } | Stmt::Do(body) => vec![body],
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn bodies_mut(&mut self) -> Vec<&mut Vec<Stmt>> {
+        match self {
+            Stmt::If { then_body, else_body, .. } => vec![then_body, else_body],
+            Stmt::While { body, .. } | Stmt::Repeat { body, .. } | Stmt::NumericFor { body, .. } | Stmt::GenericFor { body, .. } | Stmt::Do(body) => vec![body],
+            _ => Vec::new(),
+        }
+    }
+
+    // control never continues past it
+    pub fn terminates(&self) -> bool {
+        matches!(self, Stmt::Return(_) | Stmt::Break | Stmt::Continue)
+    }
 }
 
 #[derive(Clone, Debug)]

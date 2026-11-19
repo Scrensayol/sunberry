@@ -96,6 +96,9 @@ pub fn writes(i: &Insn) -> Regs {
         // an open result list replaces everything from its base up
         CALL | CALLFB => r.add_range(a, if c == 0 { 256 } else { a + c - 1 }),
         GETVARARGS => r.add_range(a, if b == 0 { 256 } else { a + b - 1 }),
+        // the index, and for a generic loop its variables
+        FORNLOOP => r.add(a + 2),
+        FORGLOOP => r.add_range(a + 2, a + 3 + (i.aux as usize & 0xff)),
         _ => {}
     }
     r

@@ -39,6 +39,9 @@ jobs:
       - name: Round-trip the new core on branching programs
         run: target/harness/sunberry-harness fuzz --seeds 200 --grammar branches --decompiler next --work harness/out/next-branches
 
+      - name: Round-trip the new core on everything
+        run: target/harness/sunberry-harness fuzz --seeds 200 --decompiler next --work harness/out/next-full
+
       - name: Upload failing round trips
         if: failure()
         uses: actions/upload-artifact@v4
