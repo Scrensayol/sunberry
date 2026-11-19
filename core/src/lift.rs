@@ -107,16 +107,24 @@ struct Lifter<'a> {
     trace: bool,
 }
 
+// where a loop's far exits land, the pcs jumping there, and the flag (see `far_exits`)
+type Far = Option<(Vec<usize>, usize, u32)>;
+
 // the loop being lifted: where a `break` and a `continue` jump to
 struct LoopCtx {
     breaks: Vec<usize>,
     cont: usize,
     continued: bool,
+    // jumps past the loop and the code right after it (an inlined function's `return`
+    // inside a loop): their targets, and the flag that says the loop left that way
+    far: Vec<usize>,
+    flag: Option<u32>,
 }
 
 // jump targets standing for `break` and `continue` once normalized
 const BREAK: usize = usize::MAX - 1;
 const CONTINUE: usize = usize::MAX - 2;
+const FAR: usize = usize::MAX - 3;
 
 // everything a speculative path can change, to put back if it doesn't work out
 struct Snapshot {
@@ -157,6 +165,8 @@ enum Succ {
 }
 
 struct CondNode {
+    // statements that run before `pred` is looked at (an inlined body's, say)
+    pre: Vec<Stmt>,
     pred: Expr,
     // where control goes when `pred` is truthy / falsy
     t: Succ,
@@ -235,7 +245,7 @@ pub fn lift(chunk: &Chunk, proto_id: usize) -> Result<Function, Error> {
     lifter.block(0, lifter.insns.len(), &[proto.code.len()])?;
     lifter.flush()?;
     let body = pin_constants(lifter.body, &lifter.ever_by_ref);
-    let body = limit_locals(body);
+    let body = limit_locals(body, proto.num_params as usize);
     Ok(Function { params, is_vararg: proto.is_vararg, body, names: lifter.names })
 }
 
@@ -297,16 +307,28 @@ fn pin(body: Vec<Stmt>, assigned: &[bool], by_ref: &[bool]) -> Vec<Stmt> {
 // mention what they capture), and each run goes in `do ... end`.
 const LOCALS_BEFORE_SCOPING: usize = 150;
 
-fn limit_locals(mut body: Vec<Stmt>) -> Vec<Stmt> {
-    for stmt in &mut body {
-        for nested in stmt.bodies_mut() {
-            *nested = limit_locals(std::mem::take(nested));
-        }
-    }
+// `outer`: locals already in scope from the enclosing blocks (registers are per function)
+fn limit_locals(body: Vec<Stmt>, outer: usize) -> Vec<Stmt> {
     let declared = body.iter().map(|s| declares(s).len()).sum::<usize>();
-    if declared <= LOCALS_BEFORE_SCOPING {
-        return body;
+    let mut body = if outer + declared <= LOCALS_BEFORE_SCOPING { body } else { scope_runs(body) };
+    let mut running = outer;
+    for stmt in &mut body {
+        // a for loop's own registers: three hidden ones and its variables
+        let held = match stmt {
+            Stmt::NumericFor { .. } => 4,
+            Stmt::GenericFor { vars, .. } => 3 + vars.len(),
+            _ => 0,
+        };
+        for nested in stmt.bodies_mut() {
+            *nested = limit_locals(std::mem::take(nested), running + held);
+        }
+        running += declares(stmt).len();
     }
+    body
+}
+
+// wraps runs of statements whose locals are done with by the run's end in `do ... end`
+fn scope_runs(body: Vec<Stmt>) -> Vec<Stmt> {
     // the last statement mentioning each local
     let mut last = std::collections::HashMap::new();
     for (i, stmt) in body.iter().enumerate() {
@@ -329,16 +351,31 @@ fn limit_locals(mut body: Vec<Stmt>) -> Vec<Stmt> {
     while i < n {
         // the shortest run from here that everything declared in it is done with by its end;
         // locals living to the end of the block stay outside
+        // a later `local` in the run that outlives it doesn't stretch it: its declaration moves
+        // in front of the `do` and the statement becomes an assignment
         let mut end = reach[i];
-        let mut k = i;
+        let mut k = i + 1;
         while k <= end {
-            end = end.max(reach[k]);
+            if !matches!(items[k], Some(Stmt::Local { .. })) {
+                end = end.max(reach[k]);
+            }
             k += 1;
         }
         let declaring = !declares(items[i].as_ref().unwrap()).is_empty();
         if declaring && end + 1 < n {
-            let run = items[i..=end].iter_mut().map(|s| s.take().unwrap()).collect::<Vec<_>>();
-            out.push(Stmt::Do(limit_locals(run)));
+            let mut run = Vec::new();
+            for k in i..=end {
+                match items[k].take().unwrap() {
+                    Stmt::Local { locals, values } if k > i && reach[k] > end => {
+                        out.push(Stmt::Local { locals: locals.clone(), values: Vec::new() });
+                        if !values.is_empty() {
+                            run.push(Stmt::Assign { targets: locals.into_iter().map(Expr::Local).collect(), values });
+                        }
+                    }
+                    stmt => run.push(stmt),
+                }
+            }
+            out.push(Stmt::Do(run));
             i = end + 1;
         } else {
             out.push(items[i].take().unwrap());
@@ -1328,6 +1365,9 @@ impl Lifter<'_> {
             if target == lp.cont {
                 return CONTINUE;
             }
+            if lp.far.contains(&target) {
+                return FAR;
+            }
         }
         if target > exits[0]
             && let Some(&i) = self.index_of.get(target)
@@ -1363,6 +1403,15 @@ impl Lifter<'_> {
             pc = t;
         }
         out
+    }
+
+    // lifts into a fresh statement list, which it returns; the current one is put back
+    // whatever happens, so a failed attempt can be retried another way
+    fn sub_body(&mut self, f: impl FnOnce(&mut Self) -> Result<(), Error>) -> Result<Vec<Stmt>, Error> {
+        let outer = std::mem::take(&mut self.body);
+        let result = f(self);
+        let inner = std::mem::replace(&mut self.body, outer);
+        result.map(|_| inner)
     }
 
     fn enter(&mut self, i: usize) -> Result<(), Error> {
@@ -1423,17 +1472,17 @@ impl Lifter<'_> {
             let insn = self.insns[i];
             match insn.op {
                 Op::FORNPREP => {
-                    i = self.numeric_for(i)?;
+                    i = self.numeric_for(i, end, exits)?;
                     continue;
                 }
                 Op::FORGPREP | Op::FORGPREP_INEXT | Op::FORGPREP_NEXT => {
-                    i = self.generic_for(i)?;
+                    i = self.generic_for(i, end, exits)?;
                     continue;
                 }
                 _ => {}
             }
             if let Some(back) = self.back_edge(i, end) {
-                i = self.jumpback_loop(i, back)?;
+                i = self.jumpback_loop(i, back, end, exits)?;
                 continue;
             }
             if is_test(insn.op) {
@@ -1443,7 +1492,8 @@ impl Lifter<'_> {
                 }
                 // a test going to the same place either way (folding leaves these) still has
                 // to compare: an empty `if` does exactly that
-                if insn.target() == Some(self.pc_at(i + 1)) {
+                let target = insn.target().unwrap();
+                if target == self.pc_at(i + 1) || (i + 1 == end && exits.contains(&target)) {
                     let test = self.test(i, None)?;
                     self.emit(Stmt::If { cond: test.pred, then_body: Vec::new(), else_body: Vec::new() })?;
                     i += 1;
@@ -1456,7 +1506,13 @@ impl Lifter<'_> {
                 Op::JUMP | Op::JUMPX => {
                     let target = insn.target().unwrap();
                     let loop_target = self.loops.last().map(|l| (l.breaks.contains(&target), l.cont == target));
+                    let far = self.loops.last().is_some_and(|l| l.far.contains(&target));
                     if target == insn.pc + 1 || (i + 1 == end && exits.contains(&target)) {
+                        i += 1;
+                    } else if far {
+                        for stmt in self.far_exit_stmts() {
+                            self.emit(stmt)?;
+                        }
                         i += 1;
                     } else if let Some((true, _)) = loop_target {
                         self.emit(Stmt::Break)?;
@@ -1557,9 +1613,11 @@ impl Lifter<'_> {
         while j < end {
             let insn = self.insns[j];
             let forward_jump = matches!(insn.op, Op::JUMP | Op::JUMPX) && insn.target().is_some_and(|t| t > insn.pc);
+            // (statements too: an inlined body's can sit between a condition's tests)
+            let statement = matches!(insn.op, Op::CALL | Op::CALLFB | Op::SETGLOBAL | Op::SETUPVAL | Op::CLOSEUPVALS);
             if is_test(insn.op) || forward_jump {
                 tests.push(j);
-            } else if !is_expression(&insn) && insn.op != Op::LOADB {
+            } else if !is_expression(&insn) && insn.op != Op::LOADB && !statement {
                 break;
             }
             j += 1;
@@ -1572,8 +1630,11 @@ impl Lifter<'_> {
             .map(|t| (t, self.normalize(t, first, end, exits)))
             .collect::<Vec<_>>();
         let normalize = move |t: usize| normalized.iter().find(|(from, _)| *from == t).map_or(t, |(_, to)| *to);
-        // the longest condition that works: a nested `if` with the same exits is the same code
-        for n in (1..=tests.len()).rev() {
+        // the longest condition that works: a nested `if` with the same exits is the same code.
+        // One whose parts need no statements reads as the source did; parts with statements
+        // (through a flag) are the fallback.
+        let mut last = None;
+        for (statements, n) in [false, true].into_iter().flat_map(|s| (1..=tests.len()).rev().map(move |n| (s, n))) {
             let then_index = tests[n - 1] + 1;
             let then_pc = self.pc_at(then_index);
             let Some(nodes) = self.condition_nodes(&tests[..n], then_pc, &normalize) else { continue };
@@ -1584,7 +1645,7 @@ impl Lifter<'_> {
                 if target <= then_pc {
                     continue;
                 }
-                if (target <= end_pc || target >= CONTINUE) && else_pc.is_none_or(|e| e == target) {
+                if (target <= end_pc || target >= FAR) && else_pc.is_none_or(|e| e == target) {
                     else_pc = Some(target);
                 } else {
                     valid = false;
@@ -1592,21 +1653,25 @@ impl Lifter<'_> {
             }
             let Some(else_pc) = else_pc.filter(|_| valid) else {
                 if self.trace {
-                    eprintln!("       condition {nodes:?} then {then_pc}: no single else (region ends {end_pc}, exits {exits:?})");
+                    eprintln!("       condition {:?} then {then_pc}: no single else (region ends {end_pc}, exits {exits:?})", nodes.iter().map(|&n| self.insns[n].pc).collect::<Vec<_>>());
                 }
                 continue;
             };
-            match self.condition(&nodes, then_pc, else_pc, &normalize) {
-                Ok(cond) => return self.finish_if(cond, then_index, else_pc, end, exits),
+            // a condition that reads as one can still give branches that don't fit together
+            // (a test in the then branch jumping into the else): then a shorter one is tried
+            let attempt = self.condition(&nodes, then_pc, else_pc, &normalize, statements).and_then(|cond| self.finish_if(cond, then_index, else_pc, end, exits));
+            match attempt {
+                Ok(next) => return Ok(next),
                 Err(e) => {
                     if self.trace {
-                        eprintln!("       condition {nodes:?} then {then_pc} else {else_pc} failed: {e}");
+                        eprintln!("       condition {:?} then {then_pc} else {else_pc} failed: {e}", nodes.iter().map(|&n| self.insns[n].pc).collect::<Vec<_>>());
                     }
+                    last = Some(e);
                     self.restore(&start)
                 }
             }
         }
-        Err(self.unsupported("a condition that isn't an expression"))
+        Err(last.unwrap_or_else(|| self.unsupported("a condition that isn't an expression")))
     }
 
     // Which tests are the condition's own and which belong to a value inside one of its parts
@@ -1634,37 +1699,83 @@ impl Lifter<'_> {
         }
     }
 
-    fn condition(&mut self, tests: &[usize], then_pc: usize, else_pc: usize, normalize: &dyn Fn(usize) -> usize) -> Result<Expr, Error> {
+    fn condition(
+        &mut self,
+        tests: &[usize],
+        then_pc: usize,
+        else_pc: usize,
+        normalize: &dyn Fn(usize) -> usize,
+        statements: bool,
+    ) -> Result<(Vec<Stmt>, Expr), Error> {
         let starts = tests.iter().enumerate().map(|(n, &t)| if n == 0 { self.insns[t].pc } else { self.pc_at(tests[n - 1] + 1) }).collect::<Vec<_>>();
         let mut nodes = Vec::new();
         for (n, &k) in tests.iter().enumerate() {
-            let (body, names) = (self.body.len(), self.names.len());
-            if n > 0 {
-                // a later test's own code only runs when the condition gets that far, so it
-                // must stay inside the condition: no statements, nothing left over
-                let mut j = tests[n - 1] + 1;
-                while j < k {
-                    self.enter(j)?;
-                    if is_test(self.insns[j].op) {
-                        j = self.value_region(j, k)?.ok_or_else(|| self.unsupported("a test inside a condition part"))?;
-                    } else {
-                        j += self.step(j)?;
-                    }
-                }
-                self.enter(k)?;
-            }
-            let test = if is_test(self.insns[k].op) {
-                self.test(k, None)?
-            } else {
-                // a constant part: which way it always goes is decided below
-                Test { pred: Expr::Bool(true), jump_when: true, subject: None }
-            };
-            if n == 0 {
+            let constant = Test { pred: Expr::Bool(true), jump_when: true, subject: None };
+            let (pre, test) = if n == 0 {
+                let test = if is_test(self.insns[k].op) { self.test(k, None)? } else { constant };
                 // what was still pending runs before the `if`
                 self.flush()?;
-            } else if self.body.len() != body || self.names.len() != names || !self.pending.is_empty() {
-                return Err(self.unsupported("condition code with statements"));
-            }
+                (Vec::new(), test)
+            } else {
+                // a later test's own code only runs when the condition gets that far; any
+                // statements it needs (an inlined body's) stay with it
+                let mut test = None;
+                // a value the part computes that is read after the condition (an inlined
+                // `a and b or c`'s result) is a variable declared before it; assigning it
+                // from inside the flag's `if` is fine
+                let mut written = Regs::default();
+                for i in tests[n - 1] + 1..k {
+                    written = written.union(liveness::writes(&self.insns[i]));
+                }
+                let after = [then_pc, else_pc]
+                    .into_iter()
+                    .filter_map(|pc| self.index_of.get(pc).filter(|&&i| i != usize::MAX))
+                    .fold(Regs::default(), |acc, &i| acc.union(self.live_in.get(i).copied().unwrap_or_default()));
+                let out = written.intersect(after).iter().collect::<Vec<_>>();
+                if !out.is_empty() && !statements {
+                    return Err(self.unsupported("condition code with statements"));
+                }
+                for &r in &out {
+                    if !matches!(self.slots[r as usize], Slot::Local(l) if !self.by_value[l as usize]) {
+                        let local = self.new_local(r, self.pc);
+                        self.body.push(Stmt::Local { locals: vec![local], values: Vec::new() });
+                        self.slots[r as usize] = Slot::Local(local);
+                    }
+                }
+                self.joins.push(out);
+                let pre = self.sub_body(|l| {
+                    let exits = [l.insns[k].pc];
+                    l.block(tests[n - 1] + 1, k, &exits)?;
+                    l.enter(k)?;
+                    test = Some(if is_test(l.insns[k].op) { l.test(k, None)? } else { constant });
+                    // what it computed and left over still runs in it
+                    l.flush()
+                });
+                self.joins.pop();
+                let pre = pre?;
+                if !pre.is_empty() {
+                    if !statements {
+                        return Err(self.unsupported("condition code with statements"));
+                    }
+                    if pre.iter().any(Stmt::terminates) {
+                        return Err(self.unsupported("a condition part that leaves"));
+                    }
+                    // its statements end up inside the flag's `if`: its own locals are out of
+                    // scope from here
+                    let mut declared = Vec::new();
+                    for stmt in &pre {
+                        declared_deep(stmt, &mut declared);
+                    }
+                    for slot in &mut self.slots {
+                        if let Slot::Local(l) = slot
+                            && declared.contains(l)
+                        {
+                            *slot = Slot::Free;
+                        }
+                    }
+                }
+                (pre, test.unwrap())
+            };
             let succ = |pc: usize| -> Result<Succ, Error> {
                 let pc = normalize(pc);
                 if pc == then_pc {
@@ -1684,29 +1795,32 @@ impl Lifter<'_> {
                 // `x and false` folds to JUMPIFNOT x / JUMP else, and prints back the same way
                 // the side it never takes still points on, so the chain stays connected
                 let node = match jump {
-                    Succ::Then => CondNode { pred: Expr::Bool(true), t: Succ::Then, f: fall },
-                    Succ::Else => CondNode { pred: Expr::Bool(false), t: fall, f: Succ::Else },
+                    Succ::Then => CondNode { pre, pred: Expr::Bool(true), t: Succ::Then, f: fall },
+                    Succ::Else => CondNode { pre, pred: Expr::Bool(false), t: fall, f: Succ::Else },
                     Succ::Node(_) => return Err(self.unsupported("a constant jump inside a condition")),
                 };
                 nodes.push(Some(node));
                 continue;
             }
             let (t, f) = if test.jump_when { (jump, fall) } else { (fall, jump) };
-            nodes.push(Some(CondNode { pred: test.pred, t, f }));
+            nodes.push(Some(CondNode { pre, pred: test.pred, t, f }));
         }
-        reduce_condition(nodes).ok_or_else(|| self.unsupported("a condition with no and/or shape"))
+        self.reduce_condition(nodes).ok_or_else(|| self.unsupported("a condition with no and/or shape"))
     }
 
-    fn finish_if(&mut self, cond: Expr, then_index: usize, else_pc: usize, end: usize, exits: &[usize]) -> Result<usize, Error> {
+    fn finish_if(&mut self, (pre, cond): (Vec<Stmt>, Expr), then_index: usize, else_pc: usize, end: usize, exits: &[usize]) -> Result<usize, Error> {
+        self.body.extend(pre);
         // `if c then break end` compiles to one jump to the loop's end when c holds
-        if else_pc == BREAK || else_pc == CONTINUE {
-            let stmt = if else_pc == BREAK {
-                Stmt::Break
-            } else {
-                self.loops.last_mut().unwrap().continued = true;
-                Stmt::Continue
+        if else_pc >= FAR {
+            let stmts = match else_pc {
+                BREAK => vec![Stmt::Break],
+                CONTINUE => {
+                    self.loops.last_mut().unwrap().continued = true;
+                    vec![Stmt::Continue]
+                }
+                _ => self.far_exit_stmts(),
             };
-            self.body.push(Stmt::If { cond: tidy_condition(negate(cond)), then_body: vec![stmt], else_body: Vec::new() });
+            self.body.push(Stmt::If { cond: tidy_condition(negate(cond)), then_body: stmts, else_body: Vec::new() });
             return Ok(then_index);
         }
         let end_pc = exits[0];
@@ -1720,7 +1834,7 @@ impl Lifter<'_> {
             let last = self.insns[else_index - 1];
             match (last.op, last.target()) {
                 // (a `break` or `continue` ending the then branch is no jump over an else)
-                (Op::JUMP | Op::JUMPX, Some(t)) if else_index - 1 >= then_index && t > else_pc && normalize(t) < CONTINUE => {
+                (Op::JUMP | Op::JUMPX, Some(t)) if else_index - 1 >= then_index && t > else_pc && normalize(t) < FAR => {
                     let joined = normalize(t);
                     if joined > end_pc {
                         return Err(self.unsupported("an else branch past its region"));
@@ -1757,22 +1871,35 @@ impl Lifter<'_> {
         self.joins.push(joined);
 
         let before = self.slots.clone();
-        let outer = std::mem::take(&mut self.body);
         let then_exits = if then_end == end { exits.to_vec() } else { self.exits_from(then_end) };
-        self.block(then_index, then_end, &then_exits)?;
-        self.flush_branch()?;
-        let then_body = std::mem::take(&mut self.body);
+        let then_body = self.sub_body(|l| {
+            l.block(then_index, then_end, &then_exits)?;
+            l.flush_branch()
+        });
+        let then_body = match then_body {
+            Ok(b) => b,
+            Err(e) => {
+                self.joins.pop();
+                return Err(e);
+            }
+        };
         let then_slots = std::mem::replace(&mut self.slots, before.clone());
         let mut else_body = Vec::new();
         let mut else_slots = before;
         if let Some((s, e)) = else_range {
             let else_exits = if e == end { exits.to_vec() } else { self.exits_from(e) };
-            self.block(s, e, &else_exits)?;
-            self.flush_branch()?;
-            else_body = std::mem::take(&mut self.body);
+            match self.sub_body(|l| {
+                l.block(s, e, &else_exits)?;
+                l.flush_branch()
+            }) {
+                Ok(b) => else_body = b,
+                Err(e) => {
+                    self.joins.pop();
+                    return Err(e);
+                }
+            }
             else_slots = self.slots.clone();
         }
-        self.body = outer;
         let (then_returns, else_returns) = (then_body.last().is_some_and(Stmt::terminates), else_body.last().is_some_and(Stmt::terminates));
         for r in 0..self.slots.len() {
             self.slots[r] = if then_returns {
@@ -2072,13 +2199,17 @@ impl Lifter<'_> {
         breaks: Vec<usize>,
         internal: Regs,
         vars: &[(u8, u32)],
+        far: &Far,
     ) -> Result<(Vec<Stmt>, bool), Error> {
         self.flush()?;
         let mut written = Regs::default();
         for i in start..back {
             written = written.union(liveness::writes(&self.insns[i]));
         }
-        let live = self.live_in[start].union(self.live_in.get(exit).copied().unwrap_or_default());
+        let mut live = self.live_in[start].union(self.live_in.get(exit).copied().unwrap_or_default());
+        if let Some((_, landing, _)) = far {
+            live = live.union(self.live_in.get(*landing).copied().unwrap_or_default());
+        }
         let joined = written.intersect(live).without(internal).iter().collect::<Vec<_>>();
         for &r in &joined {
             let assignable = matches!(self.slots[r as usize], Slot::Local(l) if !self.by_value[l as usize]);
@@ -2089,20 +2220,93 @@ impl Lifter<'_> {
             }
         }
         self.joins.push(joined);
-        self.loops.push(LoopCtx { breaks, cont: self.insns[back].pc, continued: false });
+        let (far_pcs, flag) = match far {
+            Some((pcs, _, flag)) => (pcs.clone(), Some(*flag)),
+            None => (Vec::new(), None),
+        };
+        self.loops.push(LoopCtx { breaks, cont: self.insns[back].pc, continued: false, far: far_pcs, flag });
         let before = self.slots.clone();
-        let outer = std::mem::take(&mut self.body);
         for &(reg, local) in vars {
             self.slots[reg as usize] = Slot::Local(local);
         }
         let exits = self.exits_from(back);
-        self.block(start, back, &exits)?;
-        self.flush_branch()?;
-        let body = std::mem::replace(&mut self.body, outer);
+        let body = self.sub_body(|l| {
+            l.block(start, back, &exits)?;
+            l.flush_branch()
+        });
         let ctx = self.loops.pop().unwrap();
         self.joins.pop();
+        let body = body?;
         self.slots = before;
         Ok((body, ctx.continued))
+    }
+
+    // Jumps from inside the loop past its end and past the code that follows it: an inlined
+    // function `return`ing from inside a loop. One landing place is handled, through a flag
+    // declared before the loop: `f = true; break` there, and the skipped code after the loop
+    // in `if not f then ... end`.
+    fn far_exits(&mut self, start: usize, back: usize, exit: usize, breaks: &[usize], end: usize, exits: &[usize]) -> Result<Far, Error> {
+        let exit_pc = self.pc_at(exit);
+        let mut pcs = Vec::new();
+        let mut landing = None;
+        for k in start..back {
+            let Some(t) = self.insns[k].target() else { continue };
+            if t <= exit_pc || breaks.contains(&t) {
+                continue;
+            }
+            let index = if exits.contains(&t) { end } else { self.idx(t)? };
+            if index > end || landing.is_some_and(|l| l != index) {
+                return Err(self.unsupported("a loop jumping out past more than its own end"));
+            }
+            landing = Some(index);
+            if !pcs.contains(&t) {
+                pcs.push(t);
+            }
+        }
+        let Some(landing) = landing else { return Ok(None) };
+        self.flush()?;
+        let flag = self.new_local(u8::MAX, self.pc);
+        self.body.push(Stmt::Local { locals: vec![flag], values: vec![Expr::Bool(false)] });
+        Ok(Some((pcs, landing, flag)))
+    }
+
+    fn far_exit_stmts(&self) -> Vec<Stmt> {
+        let flag = self.loops.last().and_then(|l| l.flag).expect("far exits only exist with a flag");
+        vec![Stmt::Assign { targets: vec![Expr::Local(flag)], values: vec![Expr::Bool(true)] }, Stmt::Break]
+    }
+
+    // after a loop with a far exit: the code it skips runs only when the loop ended normally
+    fn after_far(&mut self, exit: usize, far: &Far, end: usize, exits: &[usize]) -> Result<usize, Error> {
+        let Some((_, landing, flag)) = far else { return Ok(exit) };
+        let (landing, flag) = (*landing, *flag);
+        if landing > exit {
+            let region_exits = if landing == end { exits.to_vec() } else { self.exits_from(landing) };
+            let mut written = Regs::default();
+            for i in exit..landing {
+                written = written.union(liveness::writes(&self.insns[i]));
+            }
+            let live = self.live_in.get(landing).copied().unwrap_or_default();
+            let joined = written.intersect(live).iter().collect::<Vec<_>>();
+            for &r in &joined {
+                if !matches!(self.slots[r as usize], Slot::Local(l) if !self.by_value[l as usize]) {
+                    let local = self.new_local(r, self.pc);
+                    self.body.push(Stmt::Local { locals: vec![local], values: Vec::new() });
+                    self.slots[r as usize] = Slot::Local(local);
+                }
+            }
+            self.joins.push(joined);
+            let before = self.slots.clone();
+            let body = self.sub_body(|l| {
+                l.block(exit, landing, &region_exits)?;
+                l.flush_branch()
+            });
+            self.joins.pop();
+            let body = body?;
+            self.slots = before;
+            let cond = Expr::Unary(UnOp::Not, Box::new(Expr::Local(flag)));
+            self.emit(Stmt::If { cond, then_body: body, else_body: Vec::new() })?;
+        }
+        Ok(landing)
     }
 
     fn breaks_from(&self, exit: usize) -> Vec<usize> {
@@ -2116,7 +2320,7 @@ impl Lifter<'_> {
         breaks
     }
 
-    fn numeric_for(&mut self, prep: usize) -> Result<usize, Error> {
+    fn numeric_for(&mut self, prep: usize, end: usize, exits: &[usize]) -> Result<usize, Error> {
         let insn = self.insns[prep];
         let a = insn.a;
         // the FORNPREP's skip is threaded past JUMPs after the loop, so find the back-edge by
@@ -2140,12 +2344,14 @@ impl Lifter<'_> {
         let var = self.new_local(a + 2, self.insns[prep + 1].pc);
         let mut internal = Regs::default();
         internal.add_range(a as usize, a as usize + 3);
-        let (body, _) = self.loop_body(prep + 1, back, exit, self.breaks_from(exit), internal, &[(a + 2, var)])?;
+        let breaks = self.breaks_from(exit);
+        let far = self.far_exits(prep + 1, back, exit, &breaks, end, exits)?;
+        let (body, _) = self.loop_body(prep + 1, back, exit, breaks, internal, &[(a + 2, var)], &far)?;
         self.emit(Stmt::NumericFor { var, from, to, step, body })?;
-        Ok(exit)
+        self.after_far(exit, &far, end, exits)
     }
 
-    fn generic_for(&mut self, prep: usize) -> Result<usize, Error> {
+    fn generic_for(&mut self, prep: usize, end: usize, exits: &[usize]) -> Result<usize, Error> {
         let insn = self.insns[prep];
         let a = insn.a;
         let back = self.idx(insn.target().unwrap())?;
@@ -2182,17 +2388,21 @@ impl Lifter<'_> {
         let vars = (0..count).map(|k| (a + 3 + k, self.new_local(a + 3 + k, self.insns[prep + 1].pc))).collect::<Vec<_>>();
         let mut internal = Regs::default();
         internal.add_range(a as usize, a as usize + 3 + (count as usize).max(2));
-        let (body, _) = self.loop_body(prep + 1, back, exit, self.breaks_from(exit), internal, &vars)?;
+        let breaks = self.breaks_from(exit);
+        let far = self.far_exits(prep + 1, back, exit, &breaks, end, exits)?;
+        let (body, _) = self.loop_body(prep + 1, back, exit, breaks, internal, &vars, &far)?;
         self.emit(Stmt::GenericFor { vars: vars.iter().map(|v| v.1).collect(), values, body })?;
-        Ok(exit)
+        self.after_far(exit, &far, end, exits)
     }
 
     // `while` and `repeat` are both one range closed by a JUMPBACK. Lifted as `while true`,
     // a leading `if c then break end` makes it `while not c`, and a trailing one (with no
     // `continue`, which would skip it) `repeat ... until c`.
-    fn jumpback_loop(&mut self, head: usize, back: usize) -> Result<usize, Error> {
+    fn jumpback_loop(&mut self, head: usize, back: usize, end: usize, exits: &[usize]) -> Result<usize, Error> {
         let exit = back + 1;
-        let (mut body, continued) = self.loop_body(head, back, exit, self.breaks_from(exit), Regs::default(), &[])?;
+        let breaks = self.breaks_from(exit);
+        let far = self.far_exits(head, back, exit, &breaks, end, exits)?;
+        let (mut body, continued) = self.loop_body(head, back, exit, breaks, Regs::default(), &[], &far)?;
         let breaks_if = |s: Option<&Stmt>| matches!(s, Some(Stmt::If { then_body, else_body, .. }) if matches!(then_body[..], [Stmt::Break]) && else_body.is_empty());
         let stmt = if breaks_if(body.first()) {
             let Stmt::If { cond, .. } = body.remove(0) else { unreachable!() };
@@ -2204,7 +2414,7 @@ impl Lifter<'_> {
             Stmt::While { cond: Expr::Bool(true), body }
         };
         self.emit(stmt)?;
-        Ok(exit)
+        self.after_far(exit, &far, end, exits)
     }
 }
 
@@ -2244,70 +2454,108 @@ fn tidy_condition(e: Expr) -> Expr {
 
 // Each test sends control to two places: another test, the then branch, or the else branch.
 // Luau's conditions are and/or trees, so a test whose successor has no other predecessor
-// folds into it, until one test with then/else is left. No code is duplicated.
-fn reduce_condition(mut nodes: Vec<Option<CondNode>>) -> Option<Expr> {
-    let not = |e: Expr| Expr::Unary(UnOp::Not, Box::new(e));
-    loop {
-        let mut changed = false;
-        for a in 0..nodes.len() {
-            let Some(node) = &nodes[a] else { continue };
-            let preds = |b: usize, nodes: &[Option<CondNode>]| {
-                nodes.iter().flatten().filter(|n| n.t == Succ::Node(b) || n.f == Succ::Node(b)).count()
-            };
-            let (t, f) = (node.t, node.f);
-            let merge = match (t, f) {
-                (Succ::Node(b), _) if preds(b, &nodes) == 1 => {
-                    let nb = nodes[b].as_ref().unwrap();
-                    if f == nb.f {
-                        Some((b, true, false))
-                    } else if f == nb.t {
-                        Some((b, true, true))
-                    } else {
-                        None
+// folds into it, until one test with then/else is left. No code is duplicated. When the
+// folded-in test needs statements first (an inlined body), the pair goes through a flag:
+// `a and b` is `local f = a; if f then <b's statements> f = b end`, in the same order.
+impl Lifter<'_> {
+    fn reduce_condition(&mut self, mut nodes: Vec<Option<CondNode>>) -> Option<(Vec<Stmt>, Expr)> {
+        let not = |e: Expr| Expr::Unary(UnOp::Not, Box::new(e));
+        let mut scoped = Vec::new();
+        loop {
+            let mut changed = false;
+            for a in 0..nodes.len() {
+                let Some(node) = &nodes[a] else { continue };
+                let preds = |b: usize, nodes: &[Option<CondNode>]| {
+                    nodes.iter().flatten().filter(|n| n.t == Succ::Node(b) || n.f == Succ::Node(b)).count()
+                };
+                let (t, f) = (node.t, node.f);
+                let merge = match (t, f) {
+                    (Succ::Node(b), _) if preds(b, &nodes) == 1 => {
+                        let nb = nodes[b].as_ref().unwrap();
+                        if f == nb.f {
+                            Some((b, true, false))
+                        } else if f == nb.t {
+                            Some((b, true, true))
+                        } else {
+                            None
+                        }
                     }
-                }
-                (_, Succ::Node(b)) if preds(b, &nodes) == 1 => {
-                    let nb = nodes[b].as_ref().unwrap();
-                    if t == nb.t {
-                        Some((b, false, false))
-                    } else if t == nb.f {
-                        Some((b, false, true))
-                    } else {
-                        None
+                    (_, Succ::Node(b)) if preds(b, &nodes) == 1 => {
+                        let nb = nodes[b].as_ref().unwrap();
+                        if t == nb.t {
+                            Some((b, false, false))
+                        } else if t == nb.f {
+                            Some((b, false, true))
+                        } else {
+                            None
+                        }
                     }
-                }
-                _ => None,
-            };
-            if let Some((b, through_true, negated)) = merge {
+                    _ => None,
+                };
+                let Some((b, through_true, negated)) = merge else { continue };
                 let na = nodes[a].take().unwrap();
                 let nb = nodes[b].take().unwrap();
-                let pred = match (through_true, negated) {
+                // (first, and_like): the combined truthiness is `first and b` or `first or b`
+                let (first, and_like) = match (through_true, negated) {
                     // a truthy goes on to b, falsy agrees with b falsy: a and b
-                    (true, false) => Expr::Binary(BinOp::And, Box::new(na.pred), Box::new(nb.pred)),
+                    (true, false) => (na.pred, true),
                     // a falsy lands where b truthy does: (not a) or b
-                    (true, true) => Expr::Binary(BinOp::Or, Box::new(not(na.pred)), Box::new(nb.pred)),
+                    (true, true) => (not(na.pred), false),
                     // a truthy agrees with b truthy, falsy goes on to b: a or b
-                    (false, false) => Expr::Binary(BinOp::Or, Box::new(na.pred), Box::new(nb.pred)),
+                    (false, false) => (na.pred, false),
                     // a truthy lands where b falsy does: (not a) and b
-                    (false, true) => Expr::Binary(BinOp::And, Box::new(not(na.pred)), Box::new(nb.pred)),
+                    (false, true) => (not(na.pred), true),
                 };
-                nodes[a] = Some(CondNode { pred, t: nb.t, f: nb.f });
+                let op = if and_like { BinOp::And } else { BinOp::Or };
+                let (pre, pred) = if nb.pre.is_empty() {
+                    (na.pre, Expr::Binary(op, Box::new(first), Box::new(nb.pred)))
+                } else {
+                    let flag = self.new_local(u8::MAX, self.pc);
+                    for stmt in &nb.pre {
+                        declared_deep(stmt, &mut scoped);
+                    }
+                    let mut pre = na.pre;
+                    pre.push(Stmt::Local { locals: vec![flag], values: vec![first] });
+                    let mut inner = nb.pre;
+                    inner.push(Stmt::Assign { targets: vec![Expr::Local(flag)], values: vec![nb.pred] });
+                    let guard = if and_like { Expr::Local(flag) } else { not(Expr::Local(flag)) };
+                    pre.push(Stmt::If { cond: guard, then_body: inner, else_body: Vec::new() });
+                    (pre, Expr::Local(flag))
+                };
+                nodes[a] = Some(CondNode { pre, pred, t: nb.t, f: nb.f });
                 changed = true;
             }
+            if !changed {
+                break;
+            }
         }
-        if !changed {
-            break;
+        // locals declared inside a flag's `if` are out of scope after it
+        for slot in &mut self.slots {
+            if let Slot::Local(l) = slot
+                && scoped.contains(l)
+            {
+                *slot = Slot::Free;
+            }
+        }
+        let mut alive = nodes.into_iter().flatten();
+        let node = alive.next()?;
+        if alive.next().is_some() {
+            return None;
+        }
+        match (node.t, node.f) {
+            (Succ::Then, Succ::Else) => Some((node.pre, node.pred)),
+            (Succ::Else, Succ::Then) => Some((node.pre, not(node.pred))),
+            _ => None,
         }
     }
-    let mut alive = nodes.into_iter().flatten();
-    let node = alive.next()?;
-    if alive.next().is_some() {
-        return None;
-    }
-    match (node.t, node.f) {
-        (Succ::Then, Succ::Else) => Some(node.pred),
-        (Succ::Else, Succ::Then) => Some(not(node.pred)),
-        _ => None,
+}
+
+fn declared_deep(stmt: &Stmt, out: &mut Vec<u32>) {
+    out.extend(declares(stmt));
+    for nested in stmt.bodies() {
+        for s in nested {
+            declared_deep(s, out);
+        }
     }
 }
 
@@ -2364,10 +2612,29 @@ fn literal(e: &Expr) -> bool {
 
 // exponents POWK computes differently from pow() (or that might fold to one)
 fn power_special(e: &Expr) -> bool {
-    match e {
-        Expr::Number(n) => *n == 2.0 || *n == 0.5 || *n == 3.0,
-        e => foldable(e),
+    match literal_value(e) {
+        Some(n) => n == 2.0 || n == 0.5 || n == 3.0,
+        None => foldable(e),
     }
+}
+
+// the value of plain arithmetic on number literals, as Luau would fold it
+fn literal_value(e: &Expr) -> Option<f64> {
+    Some(match e {
+        Expr::Number(n) => *n,
+        Expr::Unary(UnOp::Neg, a) => -literal_value(a)?,
+        Expr::Binary(op, a, b) => {
+            let (a, b) = (literal_value(a)?, literal_value(b)?);
+            match op {
+                BinOp::Add => a + b,
+                BinOp::Sub => a - b,
+                BinOp::Mul => a * b,
+                BinOp::Div => a / b,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    })
 }
 
 fn pure_constant(e: &Expr) -> bool {
