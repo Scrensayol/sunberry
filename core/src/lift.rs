@@ -1071,8 +1071,28 @@ impl Lifter<'_> {
     // a store to a table under construction becomes one of its fields
     fn store(&mut self, table_reg: u8, key: Option<u8>, key_const: Option<Expr>, value_reg: u8) -> Result<(), Error> {
         if let Slot::Pending(table_id) = self.slots[table_reg as usize] {
-            let table_index = self.index_of(table_id);
             let operands = key.into_iter().chain([value_reg]).collect::<Vec<_>>();
+            // a field value computed before the table was made (`local goal = ...` folded into
+            // its one reader) was a local in the source: it becomes one again, with everything
+            // older, and the constructor carries on
+            if matches!(self.pending[self.index_of(table_id)].value, Value::Table(..)) {
+                let table_index = self.index_of(table_id);
+                let older = operands
+                    .iter()
+                    .filter_map(|&r| match self.slots[r as usize] {
+                        Slot::Pending(id) => Some(self.index_of(id)),
+                        _ => None,
+                    })
+                    .filter(|&i| i < table_index)
+                    .max();
+                if let Some(index) = older {
+                    self.flush_keeping(index + 1, &operands)?;
+                }
+            }
+            let Slot::Pending(table_id) = self.slots[table_reg as usize] else {
+                return self.store_plain(table_reg, key, key_const, value_reg);
+            };
+            let table_index = self.index_of(table_id);
             if matches!(self.pending[table_index].value, Value::Table(..))
                 && let Some(used) = self.foldable(&operands)
                 && table_index < self.pending.len() - used.len()
@@ -1103,6 +1123,10 @@ impl Lifter<'_> {
                 return self.emit(Stmt::Assign { targets: vec![Expr::Index(Box::new(table), Box::new(key))], values: vec![value] });
             }
         }
+        self.store_plain(table_reg, key, key_const, value_reg)
+    }
+
+    fn store_plain(&mut self, table_reg: u8, key: Option<u8>, key_const: Option<Expr>, value_reg: u8) -> Result<(), Error> {
         let regs = [Some(table_reg), key, Some(value_reg)].into_iter().flatten().collect::<Vec<_>>();
         let mut values = self.take_exprs(&regs)?.into_iter();
         let table = values.next().unwrap();
