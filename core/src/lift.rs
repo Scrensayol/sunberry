@@ -1143,7 +1143,13 @@ impl Lifter<'_> {
         let self_capture = captures.iter().any(|c| c.a != 2 && c.b == target) && self.slots[target as usize] == Slot::Free;
         // captured registers have to hold locals: their values (and everything older) become
         // locals, the rest can stay pending
-        let captured = captures.iter().filter(|c| c.a != 2 && c.b != target).map(|c| c.b).collect::<Vec<_>>();
+        // (the target too when it holds something: `local f; f = function() f() end` declares
+        // f first, and the function is assigned to it)
+        let captured = captures
+            .iter()
+            .filter(|c| c.a != 2 && (c.b != target || matches!(self.slots[target as usize], Slot::Pending(_))))
+            .map(|c| c.b)
+            .collect::<Vec<_>>();
         let newest = captured
             .iter()
             .filter_map(|&r| match self.slots[r as usize] {
