@@ -63,17 +63,50 @@ local function scan(p12, p13)
 end
 scan({1, 2, 3}, 2)
 scan({}, true)
-local v15 = v1 > 3
+local function curve(p15)
+	local v16 = {}
+	local function IsA(_, p17)
+		return p17 == "FloatCurve"
+	end
+	v16.IsA = IsA
+	local function GetKeys()
+		return p15
+	end
+	v16.GetKeys = GetKeys
+	return v16
+end
+local function hasKeys(p18)
+	local X = p18.X
+	local Y = p18.Y
+	local Z = p18.Z
+	local v19 = if X then X:IsA("FloatCurve") and #X:GetKeys() > 0 else false
+	if not v19 then
+		v19 = if Y then Y:IsA("FloatCurve") and #Y:GetKeys() > 0 else false
+		if not v19 then
+			if Z then
+				v19 = Z:IsA("FloatCurve")
+				if v19 then
+					v19 = #Z:GetKeys() > 0
+				end
+				return v19
+			end
+			v19 = false
+		end
+	end
+	return v19
+end
+print(hasKeys({X = curve({}), Z = curve({1})}), hasKeys({}), hasKeys({Y = curve({1, 2})}))
+local v20 = v1 > 3
 print(v1, check(v6, "quote"), check(v6, "table"), check(nil, "doc"))
 print(pick({price = 7, payload = {kind = 2}}), pick({payload = 1, price = 8, request = {kind = 5}}), pick({price = 9, payload = {}}))
-local v16 = print
-if v15 then
+local v21 = print
+if v20 then
 end
-local v17 = {Asset = 1, Bundle = 2, Look = 3}
-local v18 = {GamePass = 4, Product = 5}
-local v19 = v15
+local v22 = {Asset = 1, Bundle = 2, Look = 3}
+local v23 = {GamePass = 4, Product = 5}
+local v24 = v20
 if v1 > 1000 then
-	if v15 then
+	if v20 then
 	end
 end
-v16(v19, "no")
+v21(v24, "no")

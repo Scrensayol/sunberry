@@ -95,6 +95,9 @@ struct Lifter<'a> {
     fastcall: Option<Fastcall>,
     // set while a CALL that copies its arguments in order takes them (see take_ignoring)
     args_in_order: bool,
+    // a local whose register a NAMECALL borrowed for the method: the CALL's result is
+    // assigned to it again
+    namecall_local: Option<(u8, u32)>,
     // the NAMECALL waiting for its CALL: base register and method name
     namecall: Option<(u8, Vec<u8>)>,
     pc: usize,
@@ -243,6 +246,7 @@ pub fn lift(chunk: &Chunk, proto_id: usize, inline: Option<&Ctx>) -> Result<Lift
         ever_by_ref: Vec::new(),
         fastcall: None,
         args_in_order: false,
+        namecall_local: None,
         namecall: None,
         pc: 0,
         at: 0,
@@ -1296,6 +1300,7 @@ impl Lifter<'_> {
             NAMECALL | NAMECALLUDATA => {
                 let method = self.name(if i.op == NAMECALLUDATA { i.aux & 0xffff } else { i.aux })?;
                 self.namecall = Some((a, method.clone()));
+                self.namecall_local = None;
                 self.clear(a + 1)?;
                 if b != a {
                     self.clear(a)?;
@@ -1309,6 +1314,15 @@ impl Lifter<'_> {
                 {
                     let index = self.index_of(id);
                     self.flush_keeping(index + 1, &[b])?;
+                }
+                // the base still holds a local the call's result will be assigned to (a value
+                // an `or` chain builds up): the method borrows the register until the CALL
+                if b != a
+                    && let Slot::Local(m) = self.slots[a as usize]
+                    && matches!(self.slots[b as usize], Slot::Local(l) if l != m)
+                {
+                    self.namecall_local = Some((a, m));
+                    self.slots[a as usize] = Slot::Free;
                 }
                 match self.slots[b as usize] {
                     Slot::Pending(id) if b == a => {
@@ -1355,6 +1369,11 @@ impl Lifter<'_> {
                 let operands = self.take(&regs);
                 self.args_in_order = false;
                 let mut operands = operands?.into_iter();
+                if let Some((reg, local)) = self.namecall_local.take()
+                    && reg == a
+                {
+                    self.slots[a as usize] = Slot::Local(local);
+                }
                 let func = operands.next().unwrap();
                 let args = operands.map(Operand::expr).collect::<Vec<_>>();
                 let multret = c == 0 || c > 2;

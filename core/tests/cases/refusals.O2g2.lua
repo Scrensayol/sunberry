@@ -132,172 +132,205 @@ if #list3 > 0 then
 else
 	count += 1
 end
+local function curve(keys)
+	local v9 = {}
+	local function IsA(_, class)
+		return class == "FloatCurve"
+	end
+	v9.IsA = IsA
+	local function GetKeys()
+		return keys
+	end
+	v9.GetKeys = GetKeys
+	return v9
+end
+local function hasKeys(folder)
+	local X = folder.X
+	local Y = folder.Y
+	local Z = folder.Z
+	local v10 = if X then X:IsA("FloatCurve") and #X:GetKeys() > 0 else false
+	if not v10 then
+		v10 = if Y then Y:IsA("FloatCurve") and #Y:GetKeys() > 0 else false
+		if not v10 then
+			if Z then
+				v10 = Z:IsA("FloatCurve")
+				if v10 then
+					v10 = #Z:GetKeys() > 0
+				end
+				return v10
+			end
+			v10 = false
+		end
+	end
+	return v10
+end
+print(hasKeys({X = curve({}), Z = curve({1})}), hasKeys({}), (hasKeys({Y = curve({1, 2})})))
 local flag = count > 3
-local v9 = print
-local v10 = count
-local v11
-local v12 = tree ~= nil
-if v12 then
+local v11 = print
+local v12 = count
+local v13
+local v14 = tree ~= nil
+if v14 then
 	local node3 = tree
-	local v13 = false
-	local v14
+	local v15 = false
+	local v16
 	while node3 ~= nil do
 		if node3.kind == "quote" then
-			v14 = true
-			v13 = true
+			v16 = true
+			v15 = true
 			break
 		end
 		node3 = node3.parent
 	end
-	if not v13 then
-		v14 = false
+	if not v15 then
+		v16 = false
 	end
-	v12 = v14
+	v14 = v16
 end
-local v15 = not v12
-if not v15 then
-	v11 = "inside quote"
-	v15 = false
+local v17 = not v14
+if not v17 then
+	v13 = "inside quote"
+	v17 = false
 end
-if v15 then
-	v11 = "outside quote"
-end
-local v16
-local v17 = tree ~= nil
 if v17 then
+	v13 = "outside quote"
+end
+local v18
+local v19 = tree ~= nil
+if v19 then
 	local node4 = tree
-	local v18 = false
-	local v19
+	local v20 = false
+	local v21
 	while node4 ~= nil do
 		if node4.kind == "table" then
-			v19 = true
-			v18 = true
+			v21 = true
+			v20 = true
 			break
 		end
 		node4 = node4.parent
 	end
-	if not v18 then
-		v19 = false
+	if not v20 then
+		v21 = false
 	end
-	v17 = v19
+	v19 = v21
 end
-local v20 = not v17
-if not v20 then
-	v16 = "inside table"
-	v20 = false
+local v22 = not v19
+if not v22 then
+	v18 = "inside table"
+	v22 = false
 end
-if v20 then
-	v16 = "outside table"
+if v22 then
+	v18 = "outside table"
 end
-local v21 = false
-v9(v10, v11, v16, "outside doc")
-local v22 = print
+local v23 = false
+v11(v12, v13, v18, "outside doc")
+local v24 = print
 local state2 = {price = 7, payload = {kind = 2}}
-local v23
+local v25
 if state2 == nil then
-	v23 = nil
+	v25 = nil
 else
 	local payload3 = state2.payload
 	local requestType3 = state2.request and state2.request.kind
 	local kind5
-	local v24
-	local v25 = type(payload3) == "table"
-	if v25 then
+	local v26
+	local v27 = type(payload3) == "table"
+	if v27 then
 		kind5 = payload3.kind
-		v25 = kind5 == A.Asset or kind5 == A.Bundle or kind5 == A.Look
+		v27 = kind5 == A.Asset or kind5 == A.Bundle or kind5 == A.Look
 	end
-	local v26 = not v25
-	if not v26 then
-		v24 = true
+	local v28 = not v27
+	if not v28 then
+		v26 = true
+		v28 = false
+	end
+	local v29 = v28
+	if v29 then
+		local v30 = not (requestType3 == B.GamePass or requestType3 == B.Product)
+		if not v30 then
+			v26 = true
+			v30 = false
+		end
+		v29 = v30
+	end
+	if v29 then
 		v26 = false
 	end
-	local v27 = v26
-	if v27 then
-		local v28 = not (requestType3 == B.GamePass or requestType3 == B.Product)
-		if not v28 then
-			v24 = true
-			v28 = false
-		end
-		v27 = v28
-	end
-	if v27 then
-		v24 = false
-	end
-	v23 = if v24 then state2.price else nil
+	v25 = if v26 then state2.price else nil
 end
 local state3 = {payload = 1, price = 8, request = {kind = 5}}
-local v29
+local v31
 if state3 == nil then
-	v29 = nil
+	v31 = nil
 else
 	local payload4 = state3.payload
 	local requestType4 = state3.request and state3.request.kind
 	local kind6
-	local v30
-	local v31 = type(payload4) == "table"
-	if v31 then
+	local v32
+	local v33 = type(payload4) == "table"
+	if v33 then
 		kind6 = payload4.kind
-		v31 = kind6 == A.Asset or kind6 == A.Bundle or kind6 == A.Look
+		v33 = kind6 == A.Asset or kind6 == A.Bundle or kind6 == A.Look
 	end
-	local v32 = not v31
-	if not v32 then
-		v30 = true
+	local v34 = not v33
+	if not v34 then
+		v32 = true
+		v34 = false
+	end
+	local v35 = v34
+	if v35 then
+		local v36 = not (requestType4 == B.GamePass or requestType4 == B.Product)
+		if not v36 then
+			v32 = true
+			v36 = false
+		end
+		v35 = v36
+	end
+	if v35 then
 		v32 = false
 	end
-	local v33 = v32
-	if v33 then
-		local v34 = not (requestType4 == B.GamePass or requestType4 == B.Product)
-		if not v34 then
-			v30 = true
-			v34 = false
-		end
-		v33 = v34
-	end
-	if v33 then
-		v30 = false
-	end
-	v29 = if v30 then state3.price else nil
+	v31 = if v32 then state3.price else nil
 end
 local state4 = {price = 9, payload = {}}
-local v35
+local v37
 if state4 == nil then
-	v35 = nil
+	v37 = nil
 else
 	local payload5 = state4.payload
 	local requestType5 = state4.request and state4.request.kind
 	local kind7
-	local v36
-	local v37 = type(payload5) == "table"
-	if v37 then
+	local v38
+	local v39 = type(payload5) == "table"
+	if v39 then
 		kind7 = payload5.kind
-		v37 = kind7 == A.Asset or kind7 == A.Bundle or kind7 == A.Look
+		v39 = kind7 == A.Asset or kind7 == A.Bundle or kind7 == A.Look
 	end
-	local v38 = not v37
-	if not v38 then
-		v36 = true
+	local v40 = not v39
+	if not v40 then
+		v38 = true
+		v40 = false
+	end
+	local v41 = v40
+	if v41 then
+		local v42 = not (requestType5 == B.GamePass or requestType5 == B.Product)
+		if not v42 then
+			v38 = true
+			v42 = false
+		end
+		v41 = v42
+	end
+	if v41 then
 		v38 = false
 	end
-	local v39 = v38
-	if v39 then
-		local v40 = not (requestType5 == B.GamePass or requestType5 == B.Product)
-		if not v40 then
-			v36 = true
-			v40 = false
-		end
-		v39 = v40
-	end
-	if v39 then
-		v36 = false
-	end
-	v35 = if v36 then state4.price else nil
+	v37 = if v38 then state4.price else nil
 end
-v22(v23, v29, v35)
-local v41 = print
+v24(v25, v31, v37)
+local v43 = print
 if flag then
 end
-local v42 = flag
+local v44 = flag
 if count > 1000 then
 	if flag then
 	end
 end
-v41(v42, "no")
+v43(v44, "no")

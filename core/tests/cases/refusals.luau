@@ -73,6 +73,20 @@ end
 scan({ 1, 2, 3 }, 2)
 scan({}, true)
 
+-- an `or` chain of method calls on locals, each part a boolean
+local function curve(keys)
+	return { IsA = function(_, class) return class == "FloatCurve" end, GetKeys = function() return keys end }
+end
+local function hasKeys(folder)
+	local X = folder.X
+	local Y = folder.Y
+	local Z = folder.Z
+	return (if X then X:IsA("FloatCurve") and #X:GetKeys() > 0 else false)
+		or (if Y then Y:IsA("FloatCurve") and #Y:GetKeys() > 0 else false)
+		or (if Z then Z:IsA("FloatCurve") and #Z:GetKeys() > 0 else false)
+end
+print(hasKeys({ X = curve({}), Z = curve({ 1 }) }), hasKeys({}), hasKeys({ Y = curve({ 1, 2 }) }))
+
 local flag = count > 3
 print(count, check(tree, "quote"), check(tree, "table"), check(nil, "doc"))
 print(pick({ payload = { kind = 2 }, price = 7 }), pick({ payload = 1, request = { kind = 5 }, price = 8 }), pick({ payload = {}, price = 9 }))
