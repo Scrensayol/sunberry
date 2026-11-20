@@ -55,7 +55,7 @@ pub fn decompile_named(data: &[u8], key: u8, script: Option<&str>) -> Result<Str
     let mut functions = deinline(&chunk, lifted);
     let protos = chunk.protos.iter().map(|p| p.debug_name.clone()).collect::<Vec<_>>();
     names::infer(&mut functions, &protos, chunk.main, script);
-    Ok(print::print_chunk(&functions, chunk.main))
+    Ok(print::print_chunk(&functions, chunk.main, key != 1))
 }
 
 // a second lift of every function with inlined copies in it, which turns those back into

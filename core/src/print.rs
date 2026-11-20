@@ -229,11 +229,20 @@ struct Printer<'a> {
     methods: HashSet<Vec<u8>>,
     // tables set up as classes (`X.__index = X`), by printed name
     class_tables: HashSet<String>,
+    // globals Luau won't import here: assigned somewhere in the chunk, or all of them when it
+    // uses getfenv/setfenv (None)
+    no_imports: Option<HashSet<Vec<u8>>>,
     // per function, the locals something reads, writes or captures
     used: Vec<HashSet<u32>>,
 }
 
-pub fn print_chunk(functions: &[Function], main: usize) -> String {
+// Globals whose fields Roblox's compiler never imports (its mutable globals), and Enum, whose
+// values never change, so a cached lookup and one at run time read the same thing
+const ROBLOX_NOT_IMPORTED: &[&[u8]] = &[b"game", b"Game", b"workspace", b"Workspace", b"script", b"plugin", b"shared", b"_G", b"Enum"];
+
+// `roblox`: the bytecode came from Roblox's compiler, which imports differently (see
+// Expr::RuntimeKey)
+pub fn print_chunk(functions: &[Function], main: usize, roblox: bool) -> String {
     let mut reserved = HashSet::new();
     let mut methods = HashSet::new();
     for function in functions {
@@ -242,6 +251,15 @@ pub fn print_chunk(functions: &[Function], main: usize) -> String {
     }
     // printed for vector constants
     reserved.insert(b"Vector3".to_vec());
+    let mut written = HashSet::new();
+    for function in functions {
+        collect_written_globals(&function.body, &mut written);
+    }
+    let fenv = reserved.contains(&b"getfenv"[..]) || reserved.contains(&b"setfenv"[..]);
+    if roblox {
+        written.extend(ROBLOX_NOT_IMPORTED.iter().map(|g| g.to_vec()));
+    }
+    let no_imports = (!fenv).then_some(written);
     let used = functions
         .iter()
         .map(|f| {
@@ -250,7 +268,7 @@ pub fn print_chunk(functions: &[Function], main: usize) -> String {
             used
         })
         .collect();
-    let mut printer = Printer { functions, reserved, taken: HashSet::new(), counter: 0, scopes: Vec::new(), methods, used, class_tables: HashSet::new() };
+    let mut printer = Printer { functions, reserved, taken: HashSet::new(), counter: 0, scopes: Vec::new(), methods, used, class_tables: HashSet::new(), no_imports };
     printer.scopes.push(Scope { proto: main, locals: vec![None; functions[main].names.len()], upvalues: Vec::new() });
     let mut out = String::new();
     printer.body(&functions[main].body, 0, &mut out);
@@ -289,7 +307,7 @@ fn used_in(body: &[Stmt], out: &mut HashSet<u32>) {
                 }
             }),
             Expr::Closure(c) => closure(c, out),
-            Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_) | Expr::Vector(_) | Expr::VarArg { .. } => {}
+            Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_) | Expr::RuntimeKey(_) | Expr::Vector(_) | Expr::VarArg { .. } => {}
             Expr::Upvalue(_) | Expr::Global(_) | Expr::Tested(_) => {}
         }
     }
@@ -320,6 +338,21 @@ fn used_in(body: &[Stmt], out: &mut HashSet<u32>) {
         }
         for body in stmt.bodies() {
             used_in(body, out);
+        }
+    }
+}
+
+fn collect_written_globals(body: &[Stmt], out: &mut HashSet<Vec<u8>>) {
+    for stmt in body {
+        if let Stmt::Assign { targets, .. } = stmt {
+            for target in targets {
+                if let Expr::Global(g) = target {
+                    out.insert(g.clone());
+                }
+            }
+        }
+        for body in stmt.bodies() {
+            collect_written_globals(body, out);
         }
     }
 }
@@ -722,16 +755,33 @@ impl Printer<'_> {
             Expr::Nil => "nil".into(),
             Expr::Bool(b) => b.to_string(),
             Expr::Number(n) => number(*n),
-            Expr::String(s) => string(s),
+            Expr::String(s) | Expr::RuntimeKey(s) => string(s),
             Expr::Vector(v) => format!("Vector3.new({}, {}, {})", number(v[0]), number(v[1]), number(v[2])),
             Expr::VarArg { .. } => "...".into(),
             Expr::Local(l) => self.local(*l),
             Expr::Upvalue(u) => self.scopes.last().unwrap().upvalues[*u as usize].clone(),
             Expr::Global(name) => String::from_utf8_lossy(name).into_owned(),
             Expr::Index(table, key) => {
+                // a key read at run time stays in brackets unless Luau wouldn't import the path
+                // anyway (see Expr::RuntimeKey)
+                let dotted = match key.as_ref() {
+                    Expr::String(name) => is_identifier(name),
+                    Expr::RuntimeKey(name) => {
+                        let root = match table.as_ref() {
+                            Expr::Global(g) => Some(g),
+                            Expr::Index(t, _) => match t.as_ref() {
+                                Expr::Global(g) => Some(g),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        is_identifier(name) && self.no_imports.as_ref().is_none_or(|w| root.is_some_and(|g| w.contains(g)))
+                    }
+                    _ => false,
+                };
                 let table = self.prefix(table, indent);
                 match key.as_ref() {
-                    Expr::String(name) if is_identifier(name) => format!("{table}.{}", String::from_utf8_lossy(name)),
+                    Expr::String(name) | Expr::RuntimeKey(name) if dotted => format!("{table}.{}", String::from_utf8_lossy(name)),
                     key => format!("{table}[{}]", self.expr(key, indent)),
                 }
             }

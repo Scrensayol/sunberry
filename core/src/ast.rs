@@ -16,6 +16,10 @@ pub enum Expr {
     Upvalue(u8),
     Global(Vec<u8>),
     Index(Box<Expr>, Box<Expr>),
+    // a string key read at run time off a global path short enough that `a.b.c` would compile
+    // to an import, which is looked up once when the script loads: printed `a.b["c"]` so it
+    // stays a read at run time. Only ever an Index's key
+    RuntimeKey(Vec<u8>),
     Call { func: Box<Expr>, args: Vec<Expr>, multret: bool },
     MethodCall { object: Box<Expr>, method: Vec<u8>, args: Vec<Expr>, multret: bool },
     Binary(BinOp, Box<Expr>, Box<Expr>),

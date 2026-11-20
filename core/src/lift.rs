@@ -1267,12 +1267,17 @@ impl Lifter<'_> {
             GETTABLE => {
                 let mut v = self.take_exprs(&[b, c])?.into_iter();
                 let (t, k) = (v.next().unwrap(), v.next().unwrap());
+                let k = match k {
+                    Expr::String(key) => runtime_key(&t, key),
+                    k => k,
+                };
                 self.write(a, Expr::Index(Box::new(t), Box::new(k)))?
             }
             GETTABLEKS | GETUDATAKS => {
                 let key = self.proto.string(if i.op == GETUDATAKS { i.aux & 0xffff } else { i.aux }).ok_or_else(|| self.unsupported("key is not a string"))?.to_vec();
                 let t = self.take1(b)?;
-                self.write(a, Expr::Index(Box::new(t), Box::new(Expr::String(key))))?
+                let key = runtime_key(&t, key);
+                self.write(a, Expr::Index(Box::new(t), Box::new(key)))?
             }
             GETTABLEN => {
                 let t = self.take1(b)?;
@@ -2968,6 +2973,17 @@ pub(crate) fn simplify_choice(p: Expr, t: Expr, f: Expr) -> Expr {
         }
         (t, f) => Expr::IfElse(Box::new(p), Box::new(t), Box::new(f)),
     }
+}
+
+// `t.key` read at run time: when t is a global or a global's field, `t.key` written out would
+// make Luau import it (look it up once, when the script loads), so the key keeps its brackets
+fn runtime_key(table: &Expr, key: Vec<u8>) -> Expr {
+    let short_path = match table {
+        Expr::Global(_) => true,
+        Expr::Index(root, k) => matches!(root.as_ref(), Expr::Global(_)) && matches!(k.as_ref(), Expr::String(_)),
+        _ => false,
+    };
+    if short_path { Expr::RuntimeKey(key) } else { Expr::String(key) }
 }
 
 // reading it can't call anything (no metamethod, no environment lookup)

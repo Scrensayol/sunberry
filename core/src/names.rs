@@ -161,7 +161,7 @@ fn hint(e: &Expr) -> Name {
         },
         // script.Parent, props.onActivated (not Enum.KeyCode.E)
         Expr::Index(t, k) => match k.as_ref() {
-            Expr::String(s) if !enum_path(t) => Some(s.clone()),
+            Expr::String(s) | Expr::RuntimeKey(s) if !enum_path(t) => Some(s.clone()),
             _ => None,
         },
         // plr.Character or plr.CharacterAdded:Wait()
@@ -235,7 +235,7 @@ fn event_handlers(body: &[Stmt], functions: &mut HashMap<u32, usize>, params: &m
             Expr::MethodCall { object, method, args, .. } => {
                 if matches!(&method[..], b"Connect" | b"Once" | b"ConnectParallel")
                     && let Expr::Index(_, event) = object.as_ref()
-                    && let Expr::String(event) = event.as_ref()
+                    && let Expr::String(event) | Expr::RuntimeKey(event) = event.as_ref()
                     && let [handler] = &args[..]
                 {
                     let proto = match handler {
