@@ -27,6 +27,7 @@ pub fn infer(functions: &mut [Function], protos: &[Name], main: usize, script: O
         for (&param, name) in function.params.iter().zip(params.get(&id).into_iter().flatten()) {
             set(&mut hints, param, Some(name.as_bytes().to_vec()));
         }
+        param_roles(function, &mut hints);
         if id == main
             && let Some(Stmt::Return(values)) = function.body.last()
             && let [Expr::Local(module)] = values[..]
@@ -103,7 +104,8 @@ fn walk(body: &[Stmt], hints: &mut [Name], protos: &[Name]) {
                     [v] => set(hints, *v, Some(if indexed { b"i".to_vec() } else { b"v".to_vec() })),
                     [k, v, ..] => {
                         set(hints, *k, Some(key.to_vec()));
-                        set(hints, *v, Some(collection_item(values).unwrap_or(b"v").to_vec()));
+                        let item = collection_item(values).map(<[u8]>::to_vec).or_else(|| iterated_field(values).and_then(singular));
+                        set(hints, *v, Some(item.unwrap_or_else(|| b"v".to_vec())));
                     }
                     [] => {}
                 }
@@ -183,6 +185,134 @@ fn enum_path(e: &Expr) -> bool {
         Expr::Global(g) => g == b"Enum",
         Expr::Index(t, _) => enum_path(t),
         _ => false,
+    }
+}
+
+// `for _, rsvp in event.rsvps`: the field a loop goes over, for naming its items
+fn iterated_field(values: &[Expr]) -> Option<&[u8]> {
+    let iterated = match values {
+        [Expr::Call { func, args, .. }] if matches!(func.as_ref(), Expr::Global(g) if g == b"ipairs" || g == b"pairs") => args.first()?,
+        [single] => single,
+        _ => return None,
+    };
+    match iterated {
+        Expr::Index(_, k) => match k.as_ref() {
+            Expr::String(s) | Expr::RuntimeKey(s) => Some(s),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// a plural field name's singular, lowercased like a local: Items -> item, entries -> entry
+fn singular(plural: &[u8]) -> Option<Vec<u8>> {
+    let word = std::str::from_utf8(plural).ok()?;
+    let lower = word.to_ascii_lowercase();
+    let one = if word.len() > 4 && lower.ends_with("ies") {
+        format!("{}y", &word[..word.len() - 3])
+    } else if lower.ends_with("children") {
+        format!("{}child", &word[..word.len() - 8])
+    } else if ["sses", "xes", "ches", "shes"].iter().any(|e| lower.ends_with(e)) {
+        word[..word.len() - 2].to_string()
+    } else if word.len() > 3 && lower.ends_with('s') && !lower.ends_with("ss") && !lower.ends_with("us") {
+        word[..word.len() - 1].to_string()
+    } else {
+        return None;
+    };
+    let mut one = one.into_bytes();
+    if let Some(c) = one.first_mut() {
+        c.make_ascii_lowercase();
+    }
+    is_identifier(&one).then_some(one)
+}
+
+// parameters named after how the function uses them: only ever called is `callback`; the
+// first parameter of a React component (it returns createElement and reads fields off the
+// parameter) is `props`
+fn param_roles(function: &Function, hints: &mut [Name]) {
+    for (i, &param) in function.params.iter().enumerate() {
+        let mut called = false;
+        let mut other = false;
+        let mut indexed = false;
+        visit(&function.body, &mut |e| match e {
+            Expr::Call { func, args, .. } => {
+                if **func == Expr::Local(param) {
+                    called = true;
+                }
+                other |= args.contains(&Expr::Local(param));
+            }
+            Expr::Index(t, _) if **t == Expr::Local(param) => indexed = true,
+            Expr::MethodCall { object, args, .. } => {
+                other |= **object == Expr::Local(param) || args.contains(&Expr::Local(param));
+            }
+            Expr::Binary(_, a, b) => other |= **a == Expr::Local(param) || **b == Expr::Local(param),
+            _ => {}
+        });
+        if called && !other && !indexed {
+            set(hints, param, Some(b"callback".to_vec()));
+        } else if i == 0 && indexed && returns_element(&function.body) {
+            set(hints, param, Some(b"props".to_vec()));
+        }
+    }
+}
+
+fn returns_element(body: &[Stmt]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::Return(values) => matches!(values.first(), Some(Expr::Call { func, .. }) if matches!(func.as_ref(), Expr::Index(_, k) if matches!(k.as_ref(), Expr::String(n) | Expr::RuntimeKey(n) if n == b"createElement"))),
+        _ => stmt.bodies().into_iter().any(|b| returns_element(b)),
+    })
+}
+
+// every expression in `body`, nested ones included, but not inside functions it creates
+fn visit(body: &[Stmt], f: &mut impl FnMut(&Expr)) {
+    fn expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
+        f(e);
+        match e {
+            Expr::Index(a, b) | Expr::Binary(_, a, b) => {
+                expr(a, f);
+                expr(b, f);
+            }
+            Expr::Unary(_, a) => expr(a, f),
+            Expr::IfElse(a, b, c) => {
+                expr(a, f);
+                expr(b, f);
+                expr(c, f);
+            }
+            Expr::Call { func, args, .. } => {
+                expr(func, f);
+                args.iter().for_each(|a| expr(a, f));
+            }
+            Expr::MethodCall { object, args, .. } => {
+                expr(object, f);
+                args.iter().for_each(|a| expr(a, f));
+            }
+            Expr::Table(fields) => fields.iter().for_each(|field| match field {
+                crate::ast::Field::Positional(v) => expr(v, f),
+                crate::ast::Field::Keyed(k, v) => {
+                    expr(k, f);
+                    expr(v, f);
+                }
+            }),
+            _ => {}
+        }
+    }
+    for stmt in body {
+        match stmt {
+            Stmt::Local { values, .. } | Stmt::Return(values) => values.iter().for_each(|v| expr(v, f)),
+            Stmt::Assign { targets, values } => targets.iter().chain(values).for_each(|v| expr(v, f)),
+            Stmt::Call(e) => expr(e, f),
+            Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::Repeat { cond, .. } => expr(cond, f),
+            Stmt::NumericFor { from, to, step, .. } => {
+                expr(from, f);
+                expr(to, f);
+                step.iter().for_each(|s| expr(s, f));
+            }
+            Stmt::GenericFor { values, .. } => values.iter().for_each(|v| expr(v, f)),
+            Stmt::LocalFunction { .. } | Stmt::Break | Stmt::Continue | Stmt::Do(_) => {}
+        }
+        for nested in stmt.bodies() {
+            visit(nested, f);
+        }
     }
 }
 

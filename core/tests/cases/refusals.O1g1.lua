@@ -98,7 +98,11 @@ end
 print(hasKeys({X = curve({}), Z = curve({1})}), hasKeys({}), hasKeys({Y = curve({1, 2})}))
 local v20 = v1 > 3
 print(v1, check(v6, "quote"), check(v6, "table"), check(nil, "doc"))
-print(pick({price = 7, payload = {kind = 2}}), pick({payload = 1, price = 8, request = {kind = 5}}), pick({price = 9, payload = {}}))
+print(
+	pick({price = 7, payload = {kind = 2}}),
+	pick({payload = 1, price = 8, request = {kind = 5}}),
+	pick({price = 9, payload = {}})
+)
 local v21 = print
 if v20 then
 end

@@ -130,9 +130,61 @@ pub struct Proto {
     pub lines: Option<Vec<u32>>,
     pub locals: Vec<LocalVar>,
     pub upvalue_names: Vec<Vec<u8>>,
+    // the compiler's type info for the function, as stored (see `param_types`)
+    pub type_info: Vec<u8>,
 }
 
 impl Proto {
+    // Parameter types from the compiler's type info, as annotation text: only those an
+    // annotation can say exactly (`number`, `string?`, a userdata type the host named), not
+    // `any` or the ones that need a shape (tables, functions)
+    pub fn param_types(&self, types_version: u8, userdata: &[(u8, Vec<u8>)]) -> Vec<Option<String>> {
+        let info = &self.type_info;
+        let signature = if types_version == 1 {
+            Some(&info[..])
+        } else {
+            let varint = |at: &mut usize| {
+                let mut value = 0usize;
+                for shift in (0..35).step_by(7) {
+                    let byte = *info.get(*at)?;
+                    *at += 1;
+                    value |= ((byte & 0x7f) as usize) << shift;
+                    if byte & 0x80 == 0 {
+                        return Some(value);
+                    }
+                }
+                None
+            };
+            let mut at = 0;
+            (|| {
+                let size = varint(&mut at)?;
+                varint(&mut at)?;
+                varint(&mut at)?;
+                info.get(at..at + size)
+            })()
+        };
+        let Some(&[5, count, ref types @ ..]) = signature else { return vec![None; self.num_params as usize] };
+        (0..self.num_params as usize)
+            .map(|i| {
+                let t = *types.get(i).filter(|_| i < count as usize)?;
+                let base = match t & 0x7f {
+                    1 => "boolean".to_string(),
+                    2 => "number".to_string(),
+                    3 => "string".to_string(),
+                    6 => "thread".to_string(),
+                    9 => "buffer".to_string(),
+                    tag @ 64..=95 => {
+                        let name = &userdata.iter().find(|(index, _)| *index == tag - 63)?.1;
+                        let name = std::str::from_utf8(name).ok()?;
+                        name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_').then(|| name.to_string())?
+                    }
+                    _ => return None,
+                };
+                Some(if t & 0x80 != 0 { format!("{base}?") } else { base })
+            })
+            .collect()
+    }
+
     pub fn insn(&self, pc: usize) -> Insn {
         let word = self.code[pc];
         let op = Op::from_byte(word as u8).expect("opcodes are checked when reading");
@@ -166,6 +218,9 @@ pub struct Chunk {
     pub trailing: usize,
     pub protos: Vec<Proto>,
     pub main: usize,
+    pub types_version: u8,
+    // userdata type names the compiler was given, by index from 1 (types version 3)
+    pub userdata_types: Vec<(u8, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -260,9 +315,15 @@ pub fn read(data: &[u8], key: u8) -> Result<Chunk, ReadError> {
         })
         .collect::<Result<Vec<_>, ReadError>>()?;
 
+    // userdata types the host named (Vector3, CFrame...), by index from 1
+    let mut userdata_types = Vec::new();
     if types_version == 3 {
-        while r.u8()? != 0 {
-            r.string_ref(&strings)?;
+        loop {
+            let index = r.u8()?;
+            if index == 0 {
+                break;
+            }
+            userdata_types.push((index, r.string_ref(&strings)?.unwrap_or_default()));
         }
     }
 
@@ -276,11 +337,12 @@ pub fn read(data: &[u8], key: u8) -> Result<Chunk, ReadError> {
         let num_params = r.u8()?;
         let num_upvalues = r.u8()?;
         let is_vararg = r.u8()? != 0;
+        let mut type_info = Vec::new();
         if version >= 4 {
             let _flags = r.u8()?;
             if types_version > 0 {
                 let len = r.varint()? as usize;
-                r.bytes(len)?;
+                type_info = r.bytes(len)?.to_vec();
             }
         }
 
@@ -398,6 +460,7 @@ pub fn read(data: &[u8], key: u8) -> Result<Chunk, ReadError> {
             lines,
             locals,
             upvalue_names,
+            type_info,
         });
     }
 
@@ -410,7 +473,7 @@ pub fn read(data: &[u8], key: u8) -> Result<Chunk, ReadError> {
             return Err(ReadError("child proto out of range".into()));
         }
     }
-    Ok(Chunk { version, trailing: data.len() - r.at, protos, main })
+    Ok(Chunk { version, trailing: data.len() - r.at, protos, main, types_version, userdata_types })
 }
 
 fn decode_ops(mut code: Vec<u32>, key: u8) -> Result<Vec<u32>, ReadError> {

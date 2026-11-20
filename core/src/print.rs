@@ -609,8 +609,8 @@ impl Printer<'_> {
                 out
             }
             Stmt::While { cond, body } => {
-                let cond = self.operand(cond, precedence(cond) == IF_ELSE, indent);
-                let mut out = format!("while {cond} do\n");
+                let cond = self.condition(cond, indent);
+                let mut out = if cond.starts_with('\n') { format!("while{cond}do\n") } else { format!("while {cond} do\n") };
                 self.block(body, indent + 1, &mut out);
                 out.push_str(&"\t".repeat(indent));
                 out.push_str("end");
@@ -665,8 +665,8 @@ impl Printer<'_> {
             return self.if_chain(inner, else_body, then_body, indent, out);
         }
         let pad = "\t".repeat(indent);
-        let cond = self.operand(cond, precedence(cond) == IF_ELSE, indent);
-        out.push_str(&format!("if {cond} then\n"));
+        let cond = self.condition(cond, indent);
+        out.push_str(&if cond.starts_with('\n') { format!("if{cond}then\n") } else { format!("if {cond} then\n") });
         self.block(then_body, indent + 1, out);
         match else_body {
             [] => {}
@@ -787,7 +787,7 @@ impl Printer<'_> {
             }
             Expr::Call { func, args, .. } => {
                 let func = self.prefix(func, indent);
-                format!("{func}({})", self.list(args, indent))
+                self.arguments(func, args, indent)
             }
             Expr::MethodCall { object, method, args, multret } if let Some(parts) = interpolation(object, method, args, *multret) => {
                 let mut out = String::from("`");
@@ -872,9 +872,63 @@ impl Printer<'_> {
         }
     }
 
+    // an `if` or `while` condition; a long `a and b or c` chain gets a line per operand of its
+    // loosest operator, between the keyword and `then`/`do`
+    fn condition(&mut self, cond: &Expr, indent: usize) -> String {
+        let line = self.operand(cond, precedence(cond) == IF_ELSE, indent);
+        let Expr::Binary(op @ (BinOp::And | BinOp::Or), ..) = cond else { return line };
+        if line.len() <= 100 || line.contains('\n') {
+            return line;
+        }
+        // `(a or b) or c` reads as `a or b or c`; a same-operator right side keeps its parentheses
+        let mut parts = Vec::new();
+        let mut rest = cond;
+        while let Expr::Binary(o, left, right) = rest
+            && o == op
+        {
+            parts.push(right.as_ref());
+            rest = left;
+        }
+        parts.push(rest);
+        parts.reverse();
+        let (p, _, symbol) = binary_precedence(*op);
+        let inner = "\t".repeat(indent + 1);
+        let mut out = String::from("\n");
+        for (i, part) in parts.iter().enumerate() {
+            let wrap = if i == 0 { precedence(part) < p } else { precedence(part) <= p };
+            let text = self.operand(part, wrap, indent + 1);
+            out.push_str(&inner);
+            if i > 0 {
+                out.push_str(symbol);
+                out.push(' ');
+            }
+            out.push_str(&text);
+            out.push('\n');
+        }
+        out.push_str(&"\t".repeat(indent));
+        out
+    }
+
     fn method_call(&mut self, object: &Expr, method: &[u8], args: &[Expr], indent: usize) -> String {
         let object = self.prefix(object, indent);
-        format!("{object}:{}({})", String::from_utf8_lossy(method), self.list(args, indent))
+        self.arguments(format!("{object}:{}", String::from_utf8_lossy(method)), args, indent)
+    }
+
+    // `f(a, b)`; past 120 characters, with two or more arguments that fit on a line each, one
+    // argument per line
+    fn arguments(&mut self, func: String, args: &[Expr], indent: usize) -> String {
+        let list = self.list(args, indent);
+        if args.len() < 2 || func.len() + list.len() <= 120 || list.contains('\n') || func.contains('\n') {
+            return format!("{func}({list})");
+        }
+        let last = args.len() - 1;
+        let inner = "\t".repeat(indent + 1);
+        let lines = args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| format!("{inner}{}", if i == last { self.expr_last(a, indent + 1) } else { self.expr(a, indent + 1) }))
+            .collect::<Vec<_>>();
+        format!("{func}(\n{}\n{})", lines.join(",\n"), "\t".repeat(indent))
     }
 
     fn table(&mut self, fields: &[Field], indent: usize) -> String {
@@ -967,7 +1021,11 @@ impl Printer<'_> {
                 self.scopes.last_mut().unwrap().locals[p as usize] = Some("self".into());
                 continue;
             }
-            params.push(self.declare_maybe_unused(p, "p"));
+            let name = self.declare_maybe_unused(p, "p");
+            params.push(match function.param_types.get(i).cloned().flatten() {
+                Some(t) => format!("{name}: {t}"),
+                None => name,
+            });
         }
         if function.is_vararg {
             params.push("...".into());

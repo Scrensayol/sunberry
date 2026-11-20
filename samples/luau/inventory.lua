@@ -26,10 +26,10 @@ function v1:add(p7, p8)
 		return false, `too heavy: {math.floor((self.weight + v9.weight * p8) * 10 + 0.5) / 10} > {self.capacity}`
 	end
 	local v10 = p8
-	for _, v in self.slots do
-		if v.name == p7 and v.count < v9.stack then
-			local v11 = math.min(v9.stack - v.count, v10)
-			v.count += v11
+	for _, slot in self.slots do
+		if slot.name == p7 and slot.count < v9.stack then
+			local v11 = math.min(v9.stack - slot.count, v10)
+			slot.count += v11
 			v10 -= v11
 			if v10 == 0 then
 				break
@@ -64,19 +64,19 @@ function v1:remove(p13, p14)
 end
 function v1:report()
 	local v17 = {}
-	for _, v3 in self.slots do
-		v17[v3.name] = (v17[v3.name] or 0) + v3.count
+	for _, slot2 in self.slots do
+		v17[slot2.name] = (v17[slot2.name] or 0) + slot2.count
 	end
 	local v18 = {}
-	for v4 in v17 do
-		table.insert(v18, v4)
+	for v in v17 do
+		table.insert(v18, v)
 	end
 	table.sort(v18, function(p19, p20)
 		return v2[p19].value * v17[p19] > v2[p20].value * v17[p20]
 	end)
 	local v21 = {}
-	for k, v5 in v18 do
-		v21[k] = `{k}. {v5} x{v17[v5]} ({v2[v5].value * v17[v5]}g)`
+	for k, v3 in v18 do
+		v21[k] = `{k}. {v3} x{v17[v3]} ({v2[v3].value * v17[v3]}g)`
 	end
 	return table.concat(v21, "\n"), math.floor(self.weight * 100 + 0.5) / 100
 end

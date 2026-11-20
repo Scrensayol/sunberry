@@ -4,6 +4,10 @@ use crate::bytecode::{Chunk, Constant, Insn, Op, Proto};
 
 pub fn disassemble(chunk: &Chunk) -> String {
     let mut out = String::new();
+    if !chunk.userdata_types.is_empty() {
+        let names = chunk.userdata_types.iter().map(|(i, n)| format!("{i}={}", String::from_utf8_lossy(n))).collect::<Vec<_>>();
+        let _ = writeln!(out, "userdata types (version {}): {}\n", chunk.types_version, names.join(" "));
+    }
     for (id, proto) in chunk.protos.iter().enumerate() {
         let name = proto.debug_name.as_deref().map(String::from_utf8_lossy).unwrap_or_default();
         let main = if id == chunk.main { " (main)" } else { "" };
@@ -12,6 +16,10 @@ pub fn disassemble(chunk: &Chunk) -> String {
             "function {id}{main} {name} params={} upvalues={} vararg={} stack={} line={}",
             proto.num_params, proto.num_upvalues, proto.is_vararg, proto.max_stack, proto.line_defined
         );
+        if !proto.type_info.is_empty() {
+            let bytes = proto.type_info.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+            let _ = writeln!(out, "  types {bytes}");
+        }
         for (i, k) in proto.constants.iter().enumerate() {
             let _ = writeln!(out, "  K{i} = {}", constant(proto, k));
         }

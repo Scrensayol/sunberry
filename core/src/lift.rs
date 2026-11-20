@@ -290,7 +290,7 @@ pub fn lift(chunk: &Chunk, proto_id: usize, inline: Option<&Ctx>) -> Result<Lift
     let raw = lifter.body.clone();
     let body = pin_constants(lifter.body, &lifter.ever_by_ref);
     let body = limit_locals(body, proto.num_params as usize);
-    Ok(Lifted { function: Function { params, is_vararg: proto.is_vararg, body, names: lifter.names }, raw, extra: lifter.extra })
+    Ok(Lifted { function: Function { params, is_vararg: proto.is_vararg, body, names: lifter.names, param_types: proto.param_types(chunk.types_version, &chunk.userdata_types) }, raw, extra: lifter.extra })
 }
 
 // From O1 up, Luau folds a local that is never assigned and starts as a constant into every

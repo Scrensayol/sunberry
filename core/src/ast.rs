@@ -177,4 +177,6 @@ pub struct Function {
     pub body: Vec<Stmt>,
     // debug names (debug level 2), indexed by local
     pub names: Vec<Option<Vec<u8>>>,
+    // a type annotation for each parameter, where the compiler's type info gives one
+    pub param_types: Vec<Option<String>>,
 }
