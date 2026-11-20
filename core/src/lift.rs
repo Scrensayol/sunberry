@@ -2606,8 +2606,21 @@ impl Lifter<'_> {
         Ok(landing)
     }
 
-    fn breaks_from(&self, exit: usize) -> Vec<usize> {
+    // where the loop's exits land; `start` is where the loop begins. When what follows the loop
+    // is a RETURN, a jump from inside to an identical RETURN elsewhere (a jump the compiler
+    // threaded through to the function's end) leaves the loop the same way
+    fn breaks_from(&self, start: usize, exit: usize) -> Vec<usize> {
         let mut breaks = self.exits_from(exit);
+        if let Some(&last) = breaks.last()
+            && let Some(&i) = self.index_of.get(last)
+            && let Some(ret) = self.insns.get(i).filter(|r| r.op == Op::RETURN && r.b != 0)
+        {
+            for (k, other) in self.insns.iter().enumerate() {
+                if (k < start || k >= exit) && other.op == Op::RETURN && other.a == ret.a && other.b == ret.b && !breaks.contains(&other.pc) {
+                    breaks.push(other.pc);
+                }
+            }
+        }
         // a repeat's condition exits through the CLOSEUPVALS for its body's locals
         if let Some(i) = self.insns.get(exit)
             && i.op == Op::CLOSEUPVALS
@@ -2641,7 +2654,7 @@ impl Lifter<'_> {
         let var = self.new_local(a + 2, self.insns[prep + 1].pc);
         let mut internal = Regs::default();
         internal.add_range(a as usize, a as usize + 3);
-        let breaks = self.breaks_from(exit);
+        let breaks = self.breaks_from(prep, exit);
         let far = self.far_exits(prep + 1, back, exit, &breaks, end, exits)?;
         let (body, _) = self.loop_body(prep + 1, back, exit, breaks, internal, &[(a + 2, var)], &far)?;
         self.emit(Stmt::NumericFor { var, from, to, step, body })?;
@@ -2685,7 +2698,7 @@ impl Lifter<'_> {
         let vars = (0..count).map(|k| (a + 3 + k, self.new_local(a + 3 + k, self.insns[prep + 1].pc))).collect::<Vec<_>>();
         let mut internal = Regs::default();
         internal.add_range(a as usize, a as usize + 3 + (count as usize).max(2));
-        let breaks = self.breaks_from(exit);
+        let breaks = self.breaks_from(prep, exit);
         let far = self.far_exits(prep + 1, back, exit, &breaks, end, exits)?;
         let (body, _) = self.loop_body(prep + 1, back, exit, breaks, internal, &vars, &far)?;
         self.emit(Stmt::GenericFor { vars: vars.iter().map(|v| v.1).collect(), values, body })?;
@@ -2697,7 +2710,7 @@ impl Lifter<'_> {
     // `continue`, which would skip it) `repeat ... until c`.
     fn jumpback_loop(&mut self, head: usize, back: usize, end: usize, exits: &[usize]) -> Result<usize, Error> {
         let exit = back + 1;
-        let breaks = self.breaks_from(exit);
+        let breaks = self.breaks_from(head, exit);
         let far = self.far_exits(head, back, exit, &breaks, end, exits)?;
         let (mut body, continued) = self.loop_body(head, back, exit, breaks, Regs::default(), &[], &far)?;
         let breaks_if = |s: Option<&Stmt>| matches!(s, Some(Stmt::If { then_body, else_body, .. }) if matches!(then_body[..], [Stmt::Break]) && else_body.is_empty());
