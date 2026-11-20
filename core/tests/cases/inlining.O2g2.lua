@@ -36,7 +36,7 @@ local function scaled(n)
 	if x2 < 1 then
 		return 1
 	end
-	if 9 < x2 then
+	if x2 > 9 then
 		return 9
 	end
 	return x2
@@ -44,7 +44,7 @@ end
 if clamp(sum, 0, 5) == 5 and 6 > 4 then
 	print("both")
 end
-while 0 < counter do
+while counter > 0 do
 	counter -= clamp(counter, 1, 7)
 	if counter % 3 == 0 then
 		break

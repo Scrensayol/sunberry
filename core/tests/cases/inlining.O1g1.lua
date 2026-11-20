@@ -38,7 +38,7 @@ end
 if clamp(v10, 0, 5) == 5 and scaled(3) > 4 then
 	print("both")
 end
-while 0 < v8 do
+while v8 > 0 do
 	local v14 = clamp
 	local v15 = v8
 	v8 -= v14(v15, 1, 7)

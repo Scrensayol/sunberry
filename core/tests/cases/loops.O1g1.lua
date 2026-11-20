@@ -15,7 +15,7 @@ print(find({1, 5, 3, 5}, 5), find({1, 2}, 9), find({}, 1))
 local function first_even(p4)
 	local v5
 	for i = 1, p4 do
-		if i % 2 == 0 and 3 < i then
+		if i % 2 == 0 and i > 3 then
 			v5 = i
 			return v5
 		end
@@ -27,7 +27,7 @@ local function f(p6, p7)
 	local v8 = 0
 	if p6 then
 		for _, v2 in p7 do
-			if 2 < v2 then
+			if v2 > 2 then
 				v8 = v2
 				break
 			end
@@ -59,7 +59,7 @@ local function g(p10)
 	while v11 < p10 do
 		v11 += 1
 		if v11 % 3 ~= 0 then
-			if 20 < v12 then
+			if v12 > 20 then
 				break
 			end
 			v12 += v11
@@ -110,7 +110,7 @@ local function f2(p21, p22)
 	local v23 = 0
 	for _, v10 in p21 do
 		v23 += 1
-		if 10 < v10 then
+		if v10 > 10 then
 			if p22 then
 				print("big flag", v10)
 				return v23

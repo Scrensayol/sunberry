@@ -34,7 +34,7 @@ repeat
 		return x
 	end
 	table.insert(fs, v1)
-until 10 < x
+until x > 10
 local r = {}
 for _, f in fs do
 	table.insert(r, f())

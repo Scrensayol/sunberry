@@ -15,7 +15,7 @@ print(find({1, 5, 3, 5}, 5), find({1, 2}, 9), (find({}, 1)))
 local function first_even(n)
 	local r
 	for i2 = 1, n do
-		if i2 % 2 == 0 and 3 < i2 then
+		if i2 % 2 == 0 and i2 > 3 then
 			r = i2
 			return r
 		end
@@ -27,7 +27,7 @@ local function f(a, t2)
 	local hit = 0
 	if a then
 		for _, v2 in t2 do
-			if 2 < v2 then
+			if v2 > 2 then
 				hit = v2
 				break
 			end
@@ -41,7 +41,7 @@ local v1 = print
 local t3 = {1, 3, 4}
 local hit2 = 0
 for _, v3 in t3 do
-	if 2 < v3 then
+	if v3 > 2 then
 		hit2 = v3
 		break
 	end
@@ -50,7 +50,7 @@ local v4 = hit2 * 10
 local t4 = {1}
 local hit3 = 0
 for _, v5 in t4 do
-	if 2 < v5 then
+	if v5 > 2 then
 		hit3 = v5
 		break
 	end
@@ -79,7 +79,7 @@ local function g(n2)
 	while i4 < n2 do
 		i4 += 1
 		if i4 % 3 ~= 0 then
-			if 20 < s then
+			if s > 20 then
 				break
 			end
 			s += i4
@@ -130,7 +130,7 @@ local function f3(list, flag)
 	local n4 = 0
 	for _, v10 in list do
 		n4 += 1
-		if 10 < v10 then
+		if v10 > 10 then
 			if flag then
 				print("big flag", v10)
 				return n4
@@ -162,7 +162,7 @@ local v13 = false
 local v14
 for _, v15 in list3 do
 	n5 += 1
-	if 10 < v15 then
+	if v15 > 10 then
 		print("big flag", v15)
 		v14 = n5
 		v13 = true
@@ -178,7 +178,7 @@ local v16 = false
 local v17
 for _, v18 in list4 do
 	n6 += 1
-	if 10 < v18 then
+	if v18 > 10 then
 		print("big", v18)
 		v17 = -n6
 		v16 = true
@@ -194,7 +194,7 @@ local v19 = false
 local v20
 for _, v21 in list5 do
 	n7 += 1
-	if 10 < v21 then
+	if v21 > 10 then
 		print("big flag", v21)
 		v20 = n7
 		v19 = true

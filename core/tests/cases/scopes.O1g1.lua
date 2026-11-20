@@ -34,7 +34,7 @@ repeat
 		return v8
 	end
 	table.insert(v6, v9)
-until 10 < v8
+until v8 > 10
 local v10 = {}
 for _, v in v6 do
 	table.insert(v10, v())

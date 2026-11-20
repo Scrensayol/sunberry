@@ -23,7 +23,7 @@ local function firstPrimeAfter(p5)
 	local v6 = p5
 	repeat
 		v6 += 1
-		local v7 = 1 < v6
+		local v7 = v6 > 1
 		for i = 2, math.floor(math.sqrt(v6)) do
 			if v6 % i == 0 then
 				v7 = false

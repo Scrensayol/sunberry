@@ -756,6 +756,17 @@ impl Printer<'_> {
                 out
             }
             Expr::MethodCall { object, method, args, .. } => self.method_call(object, method, args, indent),
+            // `0 < x` reads better as `x > 0`, and `a > b` is defined as `b < a`
+            Expr::Binary(op @ (BinOp::Lt | BinOp::Le), left, right)
+                if matches!(left.as_ref(), Expr::Number(_) | Expr::String(_))
+                    && !matches!(right.as_ref(), Expr::Number(_) | Expr::String(_)) =>
+            {
+                let (p, ..) = binary_precedence(*op);
+                let symbol = if *op == BinOp::Lt { ">" } else { ">=" };
+                let right = self.operand(right, precedence(right) <= p, indent);
+                let left = self.operand(left, precedence(left) <= p, indent);
+                format!("{right} {symbol} {left}")
+            }
             Expr::Binary(op, left, right) => {
                 let (p, right_assoc, symbol) = binary_precedence(*op);
                 let (lp, rp) = (precedence(left), precedence(right));

@@ -23,7 +23,7 @@ local function firstPrimeAfter(n2)
 	local candidate = n2
 	repeat
 		candidate += 1
-		local prime = 1 < candidate
+		local prime = candidate > 1
 		for d = 2, math.floor((math.sqrt(candidate))) do
 			if candidate % d == 0 then
 				prime = false
