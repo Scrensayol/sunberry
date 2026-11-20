@@ -19,28 +19,29 @@ jobs:
         run: cargo build --release -p sunberry -p lua51-lifter
 
       - name: Test
-        run: cargo test --release -p ast -p cfg -p restructure -p luau-lifter
+        run: cargo test --release -p ast -p cfg -p restructure -p luau-lifter -p sunberry-core
 
       - name: Build round-trip harness
         run: cargo build --profile harness -p harness
 
       - name: Round-trip snapshot programs
-        run: target/harness/sunberry-harness check --work harness/out/check
+        run: target/harness/sunberry-harness check --decompiler next --decompiler sunberry --baseline harness/baseline-check.json --work harness/out/check
 
       # fails only on failures missing from harness/baseline.json. after a fix, run
       # `sunberry-harness fuzz --seeds 200 --baseline harness/baseline.json --update-baseline`
       - name: Round-trip generated programs
         run: target/harness/sunberry-harness fuzz --seeds 200 --baseline harness/baseline.json --work harness/out/fuzz
 
-      # the new core may refuse what it can't do yet, but never print something wrong
+      # the new core may refuse what it can't do, but never print something wrong, and never
+      # start refusing a program it used to do. after a fix, rerun the step with --update-baseline
       - name: Round-trip the new core on straight-line programs
-        run: target/harness/sunberry-harness fuzz --seeds 200 --grammar straight --decompiler next --work harness/out/next
+        run: target/harness/sunberry-harness fuzz --seeds 200 --grammar straight --decompiler next --baseline harness/baseline-next-straight.json --work harness/out/next
 
       - name: Round-trip the new core on branching programs
-        run: target/harness/sunberry-harness fuzz --seeds 200 --grammar branches --decompiler next --work harness/out/next-branches
+        run: target/harness/sunberry-harness fuzz --seeds 200 --grammar branches --decompiler next --baseline harness/baseline-next-branches.json --work harness/out/next-branches
 
       - name: Round-trip the new core on everything
-        run: target/harness/sunberry-harness fuzz --seeds 200 --decompiler next --work harness/out/next-full
+        run: target/harness/sunberry-harness fuzz --seeds 200 --decompiler next --baseline harness/baseline-next-full.json --work harness/out/next-full
 
       - name: Upload failing round trips
         if: failure()

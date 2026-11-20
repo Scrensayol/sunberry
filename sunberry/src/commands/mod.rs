@@ -6,7 +6,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 pub enum Core {
     /// the current decompiler
     Old,
-    /// the rewrite in progress: refuses what it can't do yet instead of guessing
+    /// the rewrite: refuses what it can't do exactly instead of guessing, and then falls
+    /// back to the old core's output, marked as such
     Next,
 }
 
@@ -67,6 +68,10 @@ pub enum Commands {
         /// Whether to allow decompiling Lua 5.1 bytecode
         #[arg(short, long, default_value_t = false)]
         lua51: bool,
+
+        /// Which decompiler core to use for Luau when a request doesn't say (`?core=`)
+        #[arg(long, value_enum, default_value_t = Core::Old)]
+        core: Core,
     },
 }
 

@@ -1,0 +1,12 @@
+{
+  "generator": "typed-v2",
+  "failing": {},
+  "refused": {
+    "next": [
+      "seed171 O1g1",
+      "seed171 O2g1",
+      "seed35 O0g1",
+      "seed35 O0g2"
+    ]
+  }
+}

@@ -93,6 +93,8 @@ struct Lifter<'a> {
     // captured by reference at any point: some closure may assign it
     ever_by_ref: Vec<bool>,
     fastcall: Option<Fastcall>,
+    // set while a CALL that copies its arguments in order takes them (see take_ignoring)
+    args_in_order: bool,
     // the NAMECALL waiting for its CALL: base register and method name
     namecall: Option<(u8, Vec<u8>)>,
     pc: usize,
@@ -240,6 +242,7 @@ pub fn lift(chunk: &Chunk, proto_id: usize, inline: Option<&Ctx>) -> Result<Lift
         by_ref: Vec::new(),
         ever_by_ref: Vec::new(),
         fastcall: None,
+        args_in_order: false,
         namecall: None,
         pc: 0,
         at: 0,
@@ -888,6 +891,27 @@ impl Lifter<'_> {
         in_order.then_some(used)
     }
 
+    // whether the function in `reg` could be one Luau compiles as a FASTCALL builtin
+    fn maybe_builtin(&self, reg: u8) -> bool {
+        const GLOBALS: &[&[u8]] = &[
+            b"assert", b"type", b"typeof", b"rawset", b"rawget", b"rawequal", b"rawlen", b"unpack", b"select",
+            b"getmetatable", b"setmetatable", b"tonumber", b"tostring",
+        ];
+        const LIBRARIES: &[&[u8]] = &[b"math", b"bit32", b"string", b"table", b"vector", b"buffer", b"Vector3"];
+        let value = match self.slots[reg as usize] {
+            Slot::Pending(id) => &self.pending[self.index_of(id)].value,
+            // `local max = math.max` is a builtin too, as long as nothing assigns it
+            _ => return true,
+        };
+        match value {
+            Value::Expr(Expr::Global(g)) => GLOBALS.contains(&&g[..]),
+            Value::Expr(Expr::Index(t, _)) => matches!(t.as_ref(), Expr::Global(g) if LIBRARIES.contains(&&g[..])),
+            Value::Expr(Expr::Local(_) | Expr::Upvalue(_)) => true,
+            Value::Expr(_) => false,
+            _ => true,
+        }
+    }
+
     // the values `regs` hold, in order; a NAMECALL pair counts as one operand
     fn take(&mut self, regs: &[u8]) -> Result<Vec<Operand>, Error> {
         self.take_ignoring(regs, &[])
@@ -913,7 +937,11 @@ impl Lifter<'_> {
         // Luau reads a local operand where the operation runs, not where it appears, so a copy
         // of a local some closure can assign (captured by reference) can't fold past
         // anything evaluated after it: that might call the closure. It stays a snapshot.
+        // A call's arguments are the exception: each is copied into its register in order.
         loop {
+            if self.args_in_order {
+                break;
+            }
             let mut used = regs
                 .iter()
                 .filter_map(|&r| match self.slots[r as usize] {
@@ -1290,7 +1318,13 @@ impl Lifter<'_> {
                 let all = if b == 0 { self.to_top(a)? } else { (a..a + b).collect() };
                 // a method's self register belongs to the method, not the arguments
                 let regs = all.iter().copied().filter(|&r| method.is_none() || r != a + 1).collect::<Vec<_>>();
-                let mut operands = self.take(&regs)?.into_iter();
+                // a builtin the compiler can FASTCALL reads local arguments in place, after the
+                // others are evaluated; any other call copies them in order
+                let fast = self.fastcall.as_ref().is_some_and(|f| f.call_pc == self.pc);
+                self.args_in_order = !fast && method.is_some() || !fast && !self.maybe_builtin(a);
+                let operands = self.take(&regs);
+                self.args_in_order = false;
+                let mut operands = operands?.into_iter();
                 let func = operands.next().unwrap();
                 let args = operands.map(Operand::expr).collect::<Vec<_>>();
                 let multret = c == 0 || c > 2;
@@ -1443,7 +1477,11 @@ impl Lifter<'_> {
             _ => None,
         };
         if let Some(table_id) = constructing {
-            let values = self.take(&regs)?;
+            // a constructor copies its items into their registers in order, like call arguments
+            self.args_in_order = true;
+            let values = self.take(&regs);
+            self.args_in_order = false;
+            let values = values?;
             // anything else above the table (an inlined body's own locals, say) was evaluated
             // before these values were stored, so it becomes locals first
             if self.slots[table_reg as usize] == Slot::Pending(table_id) && self.index_of(table_id) + 1 < self.pending.len() {

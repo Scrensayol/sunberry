@@ -33,7 +33,7 @@ enum Command {
     Check {
         #[command(flatten)]
         common: Common,
-        /// Defaults to harness/fixtures and luau-lifter/tests/cases
+        /// Defaults to harness/fixtures, luau-lifter/tests/cases and core/tests/cases
         paths: Vec<PathBuf>,
     },
     /// Round-trip generated programs
@@ -108,6 +108,10 @@ struct Baseline {
     generator: String,
     // decompiler -> "case profile"
     failing: BTreeMap<String, Vec<String>>,
+    // the same for refusals: a decompiler that refuses instead of guessing shouldn't start
+    // refusing something it used to do
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    refused: BTreeMap<String, Vec<String>>,
 }
 
 fn main() -> ExitCode {
@@ -195,7 +199,7 @@ fn main() -> ExitCode {
         Command::Check { common, paths } => {
             let paths = if paths.is_empty() {
                 let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-                vec![root.join("fixtures"), root.join("../luau-lifter/tests/cases")]
+                vec![root.join("fixtures"), root.join("../luau-lifter/tests/cases"), root.join("../core/tests/cases")]
             } else {
                 paths
             };
@@ -434,6 +438,14 @@ fn run(common: &Common, cases: Vec<Case>, reduce: bool, generator_version: &str)
                     (name.clone(), keys)
                 })
                 .collect(),
+            refused: {
+                let mut refused = BTreeMap::<String, Vec<String>>::new();
+                for (case, profile, d, _, _) in &refusals {
+                    refused.entry(decompilers[*d].name().to_string()).or_default().push(format!("{case} {profile}"));
+                }
+                refused.values_mut().for_each(|keys| keys.sort());
+                refused
+            },
         };
         if common.update_baseline {
             fs::write(path, serde_json::to_string_pretty(&current).unwrap() + "\n").expect("write baseline");
@@ -454,16 +466,18 @@ fn run(common: &Common, cases: Vec<Case>, reduce: bool, generator_version: &str)
         let mut regressed = false;
         for decompiler in &decompilers {
             let name = decompiler.name();
-            let empty = Vec::new();
-            let (was, now) = (known.failing.get(name).unwrap_or(&empty), current.failing.get(name).unwrap_or(&empty));
-            let new = now.iter().filter(|k| !was.contains(k)).collect::<Vec<_>>();
-            let fixed = was.iter().filter(|k| !now.contains(k)).count();
-            if !new.is_empty() {
-                regressed = true;
-                println!("{name}: {} new failures against the baseline: {}", new.len(), new.iter().take(20).map(|k| k.as_str()).collect::<Vec<_>>().join(", "));
-            }
-            if fixed > 0 {
-                println!("{name}: {fixed} baseline failures pass now; rerun with --update-baseline to lock that in");
+            for (what, known, current) in [("failures", &known.failing, &current.failing), ("refusals", &known.refused, &current.refused)] {
+                let empty = Vec::new();
+                let (was, now) = (known.get(name).unwrap_or(&empty), current.get(name).unwrap_or(&empty));
+                let new = now.iter().filter(|k| was.binary_search(k).is_err()).collect::<Vec<_>>();
+                let fixed = was.iter().filter(|k| now.binary_search(k).is_err()).count();
+                if !new.is_empty() {
+                    regressed = true;
+                    println!("{name}: {} new {what} against the baseline: {}", new.len(), new.iter().take(20).map(|k| k.as_str()).collect::<Vec<_>>().join(", "));
+                }
+                if fixed > 0 {
+                    println!("{name}: {fixed} baseline {what} are gone now; rerun with --update-baseline to lock that in");
+                }
             }
         }
         return if regressed { ExitCode::FAILURE } else { ExitCode::SUCCESS };

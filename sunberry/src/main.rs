@@ -32,7 +32,7 @@ async fn main() -> Result<(), std::io::Error> {
             core,
         } => decompile(&input, &output, encode_key, lua51, name, core)?,
         commands::Commands::Disasm { input, encode_key } => commands::disasm(&input, encode_key)?,
-        commands::Commands::Serve { port, luau, lua51 } => serve(port, luau, lua51).await?,
+        commands::Commands::Serve { port, luau, lua51, core } => serve(port, luau, lua51, core).await?,
     }
 
     // Done

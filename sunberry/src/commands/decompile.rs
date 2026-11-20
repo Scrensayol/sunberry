@@ -2,7 +2,9 @@ use std::path::Path;
 
 use base64::prelude::*;
 
-pub fn decompile_no_io<T>(bytecode: T, encode_key: u8, lua51: bool, name: Option<&str>) -> String
+use super::Core;
+
+pub fn decompile_no_io<T>(bytecode: T, encode_key: u8, lua51: bool, name: Option<&str>, core: Core) -> String
 where
     T: Into<Vec<u8>>,
 {
@@ -12,9 +14,27 @@ where
     }
 
     if lua51 {
-        lua51_lifter::decompile_bytecode(&bytecode)
-    } else {
-        luau_lifter::decompile_script(&bytecode, encode_key, name)
+        return lua51_lifter::decompile_bytecode(&bytecode);
+    }
+    match core {
+        Core::Old => luau_lifter::decompile_script(&bytecode, encode_key, name),
+        Core::Next => match next(&bytecode, encode_key) {
+            Ok(text) => text,
+            // the new core refuses what it can't do exactly; the old one still gives something
+            // to read, marked so nobody mistakes it for an exact decompile
+            Err(why) => {
+                let old = luau_lifter::decompile_script(&bytecode, encode_key, name);
+                format!("-- sunberry: the new core refused this script ({why})\n-- below is the old core's output, which may not be exact\n\n{old}")
+            }
+        },
+    }
+}
+
+fn next(bytecode: &[u8], encode_key: u8) -> Result<String, String> {
+    match std::panic::catch_unwind(|| sunberry_core::decompile(bytecode, encode_key)) {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("it panicked".to_string()),
     }
 }
 
@@ -29,22 +49,12 @@ pub fn decompile(
     encode_key: u8,
     lua51: bool,
     name: Option<String>,
-    core: super::Core,
+    core: Core,
 ) -> Result<(), std::io::Error> {
-    if core == super::Core::Next && !lua51 {
-        let out = match sunberry_core::decompile(&read_bytecode(input)?, encode_key) {
-            Ok(text) => text,
-            Err(e) => {
-                eprintln!("next core: {e}");
-                format!("-- next core: {e}\n")
-            }
-        };
-        return std::fs::write(output, out);
-    }
     let bytecode = std::fs::read(input)?;
     // scripts are usually dumped as <ScriptName>.luauc
     let name = name.or_else(|| Some(input.file_stem()?.to_string_lossy().into_owned()));
-    let out = decompile_no_io(bytecode, encode_key, lua51, name.as_deref());
+    let out = decompile_no_io(bytecode, encode_key, lua51, name.as_deref(), core);
     std::fs::write(output, out)
 }
 

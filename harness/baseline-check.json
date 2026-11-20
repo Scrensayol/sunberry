@@ -1,0 +1,9 @@
+{
+  "generator": "typed-v2",
+  "failing": {
+    "sunberry": [
+      "captured_args O2g1",
+      "captured_args O2g2"
+    ]
+  }
+}

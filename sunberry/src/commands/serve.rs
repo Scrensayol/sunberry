@@ -9,14 +9,17 @@ use tokio::net::TcpListener;
 use tower_http::compression::CompressionLayer;
 use tracing::info;
 
-use crate::commands::decompile_no_io;
+use crate::commands::{Core, decompile_no_io};
 
-pub async fn serve(port: u16, luau: bool, lua51: bool) -> Result<(), std::io::Error> {
+pub async fn serve(port: u16, luau: bool, lua51: bool, core: Core) -> Result<(), std::io::Error> {
     // Build our application with a route
     let mut app = Router::new().route("/", get(ok));
 
     if luau {
-        app = app.route("/luau/decompile", post(decompile_luau));
+        app = app.route(
+            "/luau/decompile",
+            post(move |query: Query<LuauQuery>, body: Bytes| decompile_luau(query, body, core)),
+        );
     }
 
     if lua51 {
@@ -48,19 +51,28 @@ struct LuauQuery {
     encode_key: u8,
     /// the script's name, so a module's returned table can be named after it
     name: Option<String>,
+    /// `old` or `next`, overriding the server's `--core` for this request
+    core: Option<String>,
 }
 
-async fn decompile_luau(Query(query): Query<LuauQuery>, body: Bytes) -> String {
-    decompile_blocking(body, query.encode_key, false, query.name).await
+async fn decompile_luau(Query(query): Query<LuauQuery>, body: Bytes, default: Core) -> String {
+    let core = match query.core.as_deref() {
+        None => default,
+        Some(name) => match <Core as clap::ValueEnum>::from_str(name, true) {
+            Ok(core) => core,
+            Err(_) => return format!("-- unknown core {name:?}, expected old or next\n"),
+        },
+    };
+    decompile_blocking(body, query.encode_key, false, query.name, core).await
 }
 
 async fn decompile_lua51(body: Bytes) -> String {
-    decompile_blocking(body, default_encode_key(), true, None).await
+    decompile_blocking(body, default_encode_key(), true, None, Core::Old).await
 }
 
 /// Big scripts take seconds, so keep them off the async workers
-async fn decompile_blocking(body: Bytes, encode_key: u8, lua51: bool, name: Option<String>) -> String {
-    tokio::task::spawn_blocking(move || decompile_no_io(body, encode_key, lua51, name.as_deref()))
+async fn decompile_blocking(body: Bytes, encode_key: u8, lua51: bool, name: Option<String>, core: Core) -> String {
+    tokio::task::spawn_blocking(move || decompile_no_io(body, encode_key, lua51, name.as_deref(), core))
         .await
         .unwrap_or_else(|_| "-- decompiler panicked".to_string())
 }
