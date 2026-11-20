@@ -1858,8 +1858,27 @@ impl Lifter<'_> {
         // part of one folds to, across a run of expression code; which of them really are the
         // condition's is checked per candidate
         let mut tests = vec![first];
+        // a loop in the middle (an inlined body's) is one piece of a part's code: its own tests
+        // aren't the condition's. Keyed by where it starts, its PREP included, to its back edge
+        let mut loops = HashMap::<usize, usize>::new();
+        for back in first + 1..end {
+            let insn = self.insns[back];
+            if let Some(target) = insn.target()
+                && target <= insn.pc
+                && let Some(&head) = self.index_of.get(target).filter(|&&h| h != usize::MAX && h > first + 1)
+            {
+                let prep = matches!(self.insns[head - 1].op, Op::FORNPREP | Op::FORGPREP | Op::FORGPREP_INEXT | Op::FORGPREP_NEXT);
+                let start = if prep { head - 1 } else { head };
+                let entry = loops.entry(start).or_insert(back);
+                *entry = (*entry).max(back);
+            }
+        }
         let mut j = first + 1;
         while j < end {
+            if let Some(&back) = loops.get(&j) {
+                j = back + 1;
+                continue;
+            }
             let insn = self.insns[j];
             let forward_jump = matches!(insn.op, Op::JUMP | Op::JUMPX) && insn.target().is_some_and(|t| t > insn.pc);
             // (statements too: an inlined body's can sit between a condition's tests)
@@ -1976,8 +1995,11 @@ impl Lifter<'_> {
                 for i in tests[n - 1] + 1..k {
                     written = written.union(liveness::writes(&self.insns[i]));
                 }
+                // (later parts of the condition count too: an inlined body's `local kind = ...`
+                // that the next tests compare against)
                 let after = [then_pc, else_pc]
                     .into_iter()
+                    .chain(starts[n + 1..].iter().copied())
                     .filter_map(|pc| self.index_of.get(pc).filter(|&&i| i != usize::MAX))
                     .fold(Regs::default(), |acc, &i| acc.union(self.live_in.get(i).copied().unwrap_or_default()));
                 let out = written.intersect(after).iter().collect::<Vec<_>>();
@@ -2735,6 +2757,22 @@ fn tidy_condition(e: Expr) -> Expr {
 impl Lifter<'_> {
     fn reduce_condition(&mut self, mut nodes: Vec<Option<CondNode>>) -> Option<(Vec<Stmt>, Expr)> {
         let not = |e: Expr| Expr::Unary(UnOp::Not, Box::new(e));
+        // a test whose two ways lead to the same place (`x and nil` inside an `or`, which
+        // folding leaves as a jump to the next instruction) only looks at a value. When looking
+        // can't run anything, nothing depends on it, and the test goes
+        while let Some(i) = (1..nodes.len())
+            .find(|&i| matches!(&nodes[i], Some(n) if n.t == n.f && n.pre.is_empty() && inert(&n.pred)))
+        {
+            let to = nodes[i].take().unwrap().t;
+            for n in nodes.iter_mut().flatten() {
+                if n.t == Succ::Node(i) {
+                    n.t = to;
+                }
+                if n.f == Succ::Node(i) {
+                    n.f = to;
+                }
+            }
+        }
         let mut scoped = Vec::new();
         loop {
             let mut changed = false;
@@ -2891,6 +2929,15 @@ pub(crate) fn simplify_choice(p: Expr, t: Expr, f: Expr) -> Expr {
             Expr::Binary(BinOp::Or, Box::new(Expr::Binary(BinOp::And, Box::new(p), x)), y)
         }
         (t, f) => Expr::IfElse(Box::new(p), Box::new(t), Box::new(f)),
+    }
+}
+
+// reading it can't call anything (no metamethod, no environment lookup)
+fn inert(e: &Expr) -> bool {
+    match e {
+        Expr::Local(_) | Expr::Upvalue(_) | Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_) => true,
+        Expr::Unary(UnOp::Not, inner) => inert(inner),
+        _ => false,
     }
 }
 
