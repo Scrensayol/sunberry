@@ -33,7 +33,7 @@ enum Command {
     Check {
         #[command(flatten)]
         common: Common,
-        /// Defaults to harness/fixtures, luau-lifter/tests/cases and core/tests/cases
+        /// Defaults to harness/fixtures, luau-lifter/tests/cases, core/tests/cases and samples/luau
         paths: Vec<PathBuf>,
     },
     /// Round-trip generated programs
@@ -199,7 +199,7 @@ fn main() -> ExitCode {
         Command::Check { common, paths } => {
             let paths = if paths.is_empty() {
                 let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-                vec![root.join("fixtures"), root.join("../luau-lifter/tests/cases"), root.join("../core/tests/cases")]
+                vec![root.join("fixtures"), root.join("../luau-lifter/tests/cases"), root.join("../core/tests/cases"), root.join("../samples/luau")]
             } else {
                 paths
             };
