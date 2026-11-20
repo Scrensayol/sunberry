@@ -37,6 +37,10 @@ sudo loginctl enable-linger "$USER"   # keep it running while you're logged out
 
 ## What's different from shiny
 
+**A new core that refuses instead of guessing.** Sunberry decompiles with a core written from scratch. Instead of rebuilding control flow from a graph, it replays what Luau's compiler does in reverse, so every construct comes back the way the compiler emitted it. It's checked by a round-trip harness: generate a program, compile it at six optimization and debug levels, decompile it, recompile the output, run both and compare what they print. Across 24,000 generated programs, the new core has no output that behaves differently. The 0.4% it can't reproduce exactly, it refuses. When that happens, `decompile` and `serve` hand back the original core's output under a comment saying so. `--core old` (or `?core=old`) uses the original core directly.
+
+**Inlined functions come back.** At `-O2`, Luau copies small local functions into their callers. The new core spots those copies and turns them back into calls, but only when the copy matches the function exactly, with every argument and upvalue accounted for. That restored about 9,000 calls in a dump of 33,000 Roblox scripts.
+
 **About 4x faster.** Times for one 1.8 MB Roblox script (1,970 functions, 78,396 lines of output):
 
 | Machine | shiny | Sunberry |
@@ -44,6 +48,8 @@ sudo loginctl enable-linger "$USER"   # keep it running while you're logged out
 | Raspberry Pi 5 (4x Cortex-A76) | 3.35 s | **0.58 s** |
 | x86 desktop, 1 thread | 1.87 s | **0.88 s** |
 | x86 desktop, 4 threads | 1.87 s | **0.43 s** |
+
+Those times are for the original core. On this script the new core runs about the same number of instructions, and over the whole dump it used 16% less CPU.
 
 Where it comes from:
 
@@ -53,7 +59,7 @@ Where it comes from:
 - Two quadratic loops in SSA construction and destruction are now linear.
 - Expressions collect the locals they read into one vector per tree instead of nested vectors.
 
-**Readable names.** Locals are named after what they hold when that's clear, instead of `v1` and `v_u_2`:
+**Readable names.** Locals are named after what they hold when that's clear, instead of `v1` and `v_u_2`, and functions get their own names back from the bytecode:
 
 ```lua
 local Players = game:GetService("Players")
@@ -62,7 +68,7 @@ local part = Instance.new("Part")
 local time = tick()
 ```
 
-Names come from `GetService`, `WaitForChild` and `FindFirst*` arguments, required modules, `Instance.new` class names, string index keys, closure names and globals. They stay unique within a script and never shadow a global the script uses. Bytecode compiled with debug level 2 keeps the original local names, and those are used as-is.
+Names come from `GetService`, `WaitForChild` and `FindFirst*` arguments, required modules, `Instance.new` class names, string index keys and function names, which Luau keeps even without debug info (`local function loadFlag(p1)`). They stay unique within a script and never shadow a global the script uses. Bytecode compiled with debug level 2 keeps the original local names, and those are used as-is.
 
 Event handlers and loops get the parameter names you'd expect from Roblox's API:
 
@@ -83,18 +89,18 @@ end
 **Methods look like methods.** Functions on a class table that use their first parameter as an object print with `:` and `self`, the way they were written:
 
 ```lua
-function v_u_4:Update(p14)
-	local v17 = self:GetHumanoid()
-	if self.lastUpdate == nil or p14 > 1 then
+function TransparencyController:Update(p11)
+	local CurrentCamera = workspace.CurrentCamera
+	if CurrentCamera and self.enabled then
 ```
 
 This never changes behaviour, since `function X:m()` is exactly `X.m = function(self)`.
 
 **Modules are named after their script.** When a module returns a local, that local takes the script's name, so `local v_u_4 = setmetatable({}, BaseCamera)` reads `local ClassicCamera = ...` and `return ClassicCamera`. The CLI uses the input file's name (or `--name`), and `serve` takes a `?name=` parameter.
 
-**Smaller things:** `x = x + 1` prints as `x += 1`, `("a %*"):format(b)` turns back into `` `a {b}` ``, identifier table keys drop the brackets (`{ kind = "x" }`), and constructors name their object `self`.
+**Smaller things:** `x = x + 1` prints as `x += 1`, `("a %*"):format(b)` turns back into `` `a {b}` ``, identifier table keys drop the brackets (`{ kind = "x" }`), constructors name their object `self`, unused loop variables and parameters are `_`, and long `if … then … elseif …` expressions get a line per branch.
 
-**Output that compiles, and means the same thing.** All 33,514 scripts in a dump from a Roblox game decompile to code that compiles. Luau has no `goto`, so a function that can't be structured without a `goto` gets its smallest unstructurable region written as a state machine instead. Shiny gets some common loops wrong without any error: a loop that stores what it found and breaks loses the `break`, so it keeps going and ends up with the last match. A local written in a loop and read after it could end up declared inside the loop. Sunberry fixes both.
+**Output that compiles, and means the same thing.** All 33,514 scripts in a dump from a Roblox game decompile to code that compiles, 99.75% of them with the new core and the rest with the original as a fallback. The details that usually trip decompilers up are handled exactly: the compiler folds `x ^ 3` with `pow()` but runs it as `x * x * x`, NaN keeps its sign, operands are read where Luau reads them, and builtins called through `FASTCALL` keep their argument order. Shiny gets some common loops wrong without any error. A loop that stores what it found and breaks loses the `break`, so it keeps going and ends up with the last match, and a local written in a loop and read after it can end up declared inside the loop.
 
 **Deterministic output.** The same bytecode always decompiles to the same text, at any thread count. In shiny, some statement order depended on memory addresses.
 
@@ -119,7 +125,10 @@ Options:
 sunberry decompile -i Script.luauc -o Script.lua   # Roblox bytecode, encode key 203 by default
 sunberry decompile -e 1 -i vanilla.luauc -o out.lua # bytecode from luau-compile
 sunberry serve --port 3000                           # listens on all interfaces
+sunberry decompile --core old -i Script.luauc -o Script.lua  # the original core
 ```
+
+`serve` takes `?core=old` per request, and `--core old` changes its default.
 
 `RAYON_NUM_THREADS` caps how many cores a decompile uses.
 

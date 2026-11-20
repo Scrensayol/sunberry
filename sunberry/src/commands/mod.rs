@@ -4,10 +4,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Core {
-    /// the current decompiler
+    /// the original decompiler, from shiny and medal
     Old,
-    /// the rewrite: refuses what it can't do exactly instead of guessing, and then falls
-    /// back to the old core's output, marked as such
+    /// the rewrite (default): refuses what it can't do exactly instead of guessing, and then
+    /// falls back to the old core's output, marked as such
     Next,
 }
 
@@ -42,7 +42,7 @@ pub enum Commands {
         name: Option<String>,
 
         /// Which decompiler core to use for Luau
-        #[arg(long, value_enum, default_value_t = Core::Old)]
+        #[arg(long, value_enum, default_value_t = Core::Next)]
         core: Core,
     },
 
@@ -70,7 +70,7 @@ pub enum Commands {
         lua51: bool,
 
         /// Which decompiler core to use for Luau when a request doesn't say (`?core=`)
-        #[arg(long, value_enum, default_value_t = Core::Old)]
+        #[arg(long, value_enum, default_value_t = Core::Next)]
         core: Core,
     },
 }
