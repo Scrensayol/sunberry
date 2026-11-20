@@ -1,48 +1,48 @@
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
-local function onCharacter(v1)
-	v1:WaitForChild("Humanoid").Died:Connect(function()
-		print(v1.Name, "died")
+local function onCharacter(p1)
+	p1:WaitForChild("Humanoid").Died:Connect(function()
+		print(p1.Name, "died")
 	end)
 end
-Players.PlayerAdded:Connect(function(v2)
-	print("joined", v2.Name, v2.UserId)
-	v2.CharacterAdded:Connect(onCharacter)
-	v2.Chatted:Connect(function(v3)
-		if v3 == "/reset" and v2.Character then
-			v2.Character:BreakJoints()
+Players.PlayerAdded:Connect(function(player)
+	print("joined", player.Name, player.UserId)
+	player.CharacterAdded:Connect(onCharacter)
+	player.Chatted:Connect(function(message)
+		if message == "/reset" and player.Character then
+			player.Character:BreakJoints()
 		end
 	end)
 end)
-workspace.ChildAdded:Connect(function(v4)
-	if v4:IsA("BasePart") then
-		v4.Anchored = true
+workspace.ChildAdded:Connect(function(child)
+	if child:IsA("BasePart") then
+		child.Anchored = true
 	end
 end)
-workspace:WaitForChild("Pad").Touched:Connect(function(v5)
-	local v6 = Players:GetPlayerFromCharacter(v5.Parent)
-	if v6 then
-		print(v6.Name, "touched the pad")
+workspace:WaitForChild("Pad").Touched:Connect(function(hit)
+	local v2 = Players:GetPlayerFromCharacter(hit.Parent)
+	if v2 then
+		print(v2.Name, "touched the pad")
 	end
 end)
-UserInputService.InputBegan:Connect(function(v7, v8)
-	if not v8 and v7.KeyCode == Enum.KeyCode.E then
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if not gameProcessed and input.KeyCode == Enum.KeyCode.E then
 		print("interact")
 	end
 end)
-local v9 = 0
-RunService.Heartbeat:Connect(function(v10)
-	v9 += v10
+local v3 = 0
+RunService.Heartbeat:Connect(function(deltaTime)
+	v3 += deltaTime
 end)
-for _, v in ipairs(workspace:GetChildren()) do
-	print(v.Name)
+for _, child2 in ipairs(workspace:GetChildren()) do
+	print(child2.Name)
 end
-for _, v11 in workspace:GetDescendants() do
-	if v11:IsA("Light") then
-		v11.Enabled = false
+for _, descendant in workspace:GetDescendants() do
+	if descendant:IsA("Light") then
+		descendant.Enabled = false
 	end
 end
-for _, v12 in pairs(Players:GetPlayers()) do
-	print(v12.DisplayName, v9)
+for _, player2 in pairs(Players:GetPlayers()) do
+	print(player2.DisplayName, v3)
 end

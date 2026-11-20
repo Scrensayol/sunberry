@@ -18,7 +18,7 @@ where
     }
     match core {
         Core::Old => luau_lifter::decompile_script(&bytecode, encode_key, name),
-        Core::Next => match next(&bytecode, encode_key) {
+        Core::Next => match next(&bytecode, encode_key, name) {
             Ok(text) => text,
             // the new core refuses what it can't do exactly; the old one still gives something
             // to read, marked so nobody mistakes it for an exact decompile
@@ -30,8 +30,8 @@ where
     }
 }
 
-fn next(bytecode: &[u8], encode_key: u8) -> Result<String, String> {
-    match std::panic::catch_unwind(|| sunberry_core::decompile(bytecode, encode_key)) {
+fn next(bytecode: &[u8], encode_key: u8, name: Option<&str>) -> Result<String, String> {
+    match std::panic::catch_unwind(|| sunberry_core::decompile_named(bytecode, encode_key, name)) {
         Ok(Ok(text)) => Ok(text),
         Ok(Err(e)) => Err(e.to_string()),
         Err(_) => Err("it panicked".to_string()),

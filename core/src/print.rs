@@ -132,6 +132,38 @@ fn escape_into(bytes: &[u8], quote: char, out: &mut String) {
     }
 }
 
+// whether `local` is indexed or has a method called on it in `body` (closures inside see it
+// through their captures, which can't be a parameter's own uses)
+fn used_as_object(body: &[Stmt], local: u32) -> bool {
+    fn expr(e: &Expr, local: u32) -> bool {
+        match e {
+            Expr::Index(t, k) => **t == Expr::Local(local) || expr(t, local) || expr(k, local),
+            Expr::MethodCall { object, args, .. } => **object == Expr::Local(local) || expr(object, local) || args.iter().any(|a| expr(a, local)),
+            Expr::Call { func, args, .. } => expr(func, local) || args.iter().any(|a| expr(a, local)),
+            Expr::Binary(_, a, b) => expr(a, local) || expr(b, local),
+            Expr::Unary(_, a) => expr(a, local),
+            Expr::IfElse(a, b, c) => expr(a, local) || expr(b, local) || expr(c, local),
+            Expr::Table(fields) => fields.iter().any(|f| match f {
+                Field::Positional(v) => expr(v, local),
+                Field::Keyed(k, v) => expr(k, local) || expr(v, local),
+            }),
+            _ => false,
+        }
+    }
+    body.iter().any(|stmt| {
+        let here = match stmt {
+            Stmt::Local { values, .. } | Stmt::Return(values) => values.iter().any(|v| expr(v, local)),
+            Stmt::Assign { targets, values } => targets.iter().chain(values).any(|v| expr(v, local)),
+            Stmt::Call(e) => expr(e, local),
+            Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::Repeat { cond, .. } => expr(cond, local),
+            Stmt::NumericFor { from, to, step, .. } => expr(from, local) || expr(to, local) || step.as_ref().is_some_and(|s| expr(s, local)),
+            Stmt::GenericFor { values, .. } => values.iter().any(|v| expr(v, local)),
+            Stmt::LocalFunction { .. } | Stmt::Break | Stmt::Continue | Stmt::Do(_) => false,
+        };
+        here || stmt.bodies().into_iter().any(|b| used_as_object(b, local))
+    })
+}
+
 fn compound(target: &Expr) -> bool {
     match target {
         Expr::Local(_) | Expr::Upvalue(_) | Expr::Global(_) => true,
@@ -195,6 +227,8 @@ struct Printer<'a> {
     scopes: Vec<Scope>,
     // names called with `:` somewhere: a function stored under one is likely a method
     methods: HashSet<Vec<u8>>,
+    // tables set up as classes (`X.__index = X`), by printed name
+    class_tables: HashSet<String>,
     // per function, the locals something reads, writes or captures
     used: Vec<HashSet<u32>>,
 }
@@ -216,7 +250,7 @@ pub fn print_chunk(functions: &[Function], main: usize) -> String {
             used
         })
         .collect();
-    let mut printer = Printer { functions, reserved, taken: HashSet::new(), counter: 0, scopes: Vec::new(), methods, used };
+    let mut printer = Printer { functions, reserved, taken: HashSet::new(), counter: 0, scopes: Vec::new(), methods, used, class_tables: HashSet::new() };
     printer.scopes.push(Scope { proto: main, locals: vec![None; functions[main].names.len()], upvalues: Vec::new() });
     let mut out = String::new();
     printer.body(&functions[main].body, 0, &mut out);
@@ -399,9 +433,25 @@ fn collect_globals(body: &[Stmt], out: &mut HashSet<Vec<u8>>) {
 
 impl Printer<'_> {
     fn declare(&mut self, local: u32) -> String {
+        self.declare_as(local, "v")
+    }
+
+    // `prefix` for a local with no name to go on: v1, or p1 for a parameter
+    fn declare_as(&mut self, local: u32, prefix: &str) -> String {
         let proto = self.scopes.last().unwrap().proto;
         let wanted = self.functions[proto].names.get(local as usize).cloned().flatten().filter(|n| is_identifier(n));
-        let free = |p: &Self, n: &str| !p.taken.contains(n) && !p.reserved.contains(n.as_bytes());
+        // every method has a `self` of its own, so `self` isn't handed out once like other
+        // names; it's only given where no other `self` could be in sight
+        if wanted.as_deref() == Some(b"self") {
+            let visible = self.scopes.iter().any(|s| s.locals.iter().flatten().chain(&s.upvalues).any(|n| n == "self"));
+            // the main chunk's objects are class tables, not a constructor's object
+            if !visible && self.scopes.len() > 1 && !self.reserved.contains(&b"self"[..]) {
+                self.scopes.last_mut().unwrap().locals[local as usize] = Some("self".into());
+                return "self".into();
+            }
+        }
+        let wanted = wanted.filter(|n| n != b"self");
+        let free = |p: &Self, n: &str| !p.taken.contains(n) && !p.reserved.contains(n.as_bytes()) && n != "self";
         let name = match wanted.map(|n| String::from_utf8(n).unwrap()) {
             // a name of its own, numbered from 2 when it's taken
             Some(base) => (1..)
@@ -410,7 +460,7 @@ impl Printer<'_> {
                 .unwrap(),
             None => loop {
                 self.counter += 1;
-                let candidate = format!("v{}", self.counter);
+                let candidate = format!("{prefix}{}", self.counter);
                 if free(self, &candidate) {
                     break candidate;
                 }
@@ -423,13 +473,13 @@ impl Printer<'_> {
 
     // a loop variable or parameter nothing uses is `_`, unless `_` already names something
     // that could be in scope or is a global the chunk reads
-    fn declare_maybe_unused(&mut self, local: u32) -> String {
+    fn declare_maybe_unused(&mut self, local: u32, prefix: &str) -> String {
         let proto = self.scopes.last().unwrap().proto;
         if !self.used[proto].contains(&local) && !self.taken.contains("_") && !self.reserved.contains(&b"_"[..]) {
             self.scopes.last_mut().unwrap().locals[local as usize] = Some("_".into());
             return "_".into();
         }
-        self.declare(local)
+        self.declare_as(local, prefix)
     }
 
     fn local(&self, local: u32) -> String {
@@ -446,6 +496,14 @@ impl Printer<'_> {
     }
 
     fn stmt(&mut self, stmt: &Stmt, indent: usize) -> String {
+        if let Stmt::Assign { targets, values } = stmt
+            && let ([Expr::Index(table, key)], [value]) = (&targets[..], &values[..])
+            && **key == Expr::String(b"__index".to_vec())
+            && **table == *value
+            && let Some(path) = self.path(value)
+        {
+            self.class_tables.insert(path);
+        }
         match stmt {
             // `local f = function` can't see f, so it is `local function f`
             Stmt::Local { locals, values } if locals.len() == 1 && matches!(values[..], [Expr::Closure(_)]) => {
@@ -463,7 +521,7 @@ impl Printer<'_> {
                 let Expr::Closure(closure) = &values[0] else { unreachable!() };
                 let path = self.path(&targets[0]).unwrap();
                 let method = match &targets[0] {
-                    Expr::Index(_, key) => matches!(key.as_ref(), Expr::String(k) if self.is_method(closure, k)),
+                    Expr::Index(table, key) => matches!(key.as_ref(), Expr::String(k) if self.is_method(closure, table, k)),
                     _ => false,
                 };
                 if method {
@@ -537,7 +595,7 @@ impl Printer<'_> {
             Stmt::NumericFor { var, from, to, step, body } => {
                 let (from, to) = (self.expr(from, indent), self.expr(to, indent));
                 let step = step.as_ref().map(|s| format!(", {}", self.expr(s, indent))).unwrap_or_default();
-                let var = self.declare_maybe_unused(*var);
+                let var = self.declare_maybe_unused(*var, "v");
                 let mut out = format!("for {var} = {from}, {to}{step} do\n");
                 self.block(body, indent + 1, &mut out);
                 out.push_str(&"\t".repeat(indent));
@@ -546,7 +604,7 @@ impl Printer<'_> {
             }
             Stmt::GenericFor { vars, values, body } => {
                 let values = self.list(values, indent);
-                let vars = vars.iter().map(|&v| self.declare_maybe_unused(v)).collect::<Vec<_>>();
+                let vars = vars.iter().map(|&v| self.declare_maybe_unused(v, "v")).collect::<Vec<_>>();
                 let mut out = format!("for {} in {values} do\n", vars.join(", "));
                 self.block(body, indent + 1, &mut out);
                 out.push_str(&"\t".repeat(indent));
@@ -800,15 +858,19 @@ impl Printer<'_> {
     }
 
     // `t.m = function(self, ...)` as `function t:m(...)`: when debug info calls the first
-    // parameter self, or the name is called with `:` somewhere. Not when the body sees an
+    // parameter self, or it's used as an object and the function sits on a class table
+    // (`t.__index = t`) or its name is called with `:` somewhere. Not when the body sees an
     // outer `self` (the parameter would hide it) or `self` is a global here.
-    fn is_method(&self, closure: &Closure, name: &[u8]) -> bool {
+    fn is_method(&self, closure: &Closure, table: &Expr, name: &[u8]) -> bool {
         let function = &self.functions[closure.proto];
         let Some(&first) = function.params.first() else { return false };
         let named = function.names.get(first as usize).cloned().flatten();
         let likely = match &named {
             Some(n) => n == b"self",
-            None => self.methods.contains(name),
+            None => {
+                let class = self.path(table).is_some_and(|p| self.class_tables.contains(&p));
+                (class || self.methods.contains(name)) && used_as_object(&function.body, first)
+            }
         };
         let parent = self.scopes.last().unwrap();
         let outer_self = closure.captures.iter().any(|c| {
@@ -844,7 +906,7 @@ impl Printer<'_> {
                 self.scopes.last_mut().unwrap().locals[p as usize] = Some("self".into());
                 continue;
             }
-            params.push(self.declare_maybe_unused(p));
+            params.push(self.declare_maybe_unused(p, "p"));
         }
         if function.is_vararg {
             params.push("...".into());

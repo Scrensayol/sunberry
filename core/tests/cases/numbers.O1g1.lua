@@ -1,6 +1,6 @@
 local huge = math.huge
-local function power(v1, v2)
-	return v1 ^ v2
+local function power(p1, p2)
+	return p1 ^ p2
 end
 print(1.4142135623730951, 27, 9, power(3, 3), power(2, 0.5))
 print(huge, -huge, true, 1 / -huge)

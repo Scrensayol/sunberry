@@ -38,6 +38,11 @@ pub fn disassemble(data: &[u8], key: u8) -> Result<String, Error> {
 }
 
 pub fn decompile(data: &[u8], key: u8) -> Result<String, Error> {
+    decompile_named(data, key, None)
+}
+
+// `script`: the script's name, which the table a module returns is named after
+pub fn decompile_named(data: &[u8], key: u8, script: Option<&str>) -> Result<String, Error> {
     let chunk = bytecode::read(data, key)?;
     // functions lift independently; names are only chosen while printing, top-down
     // the first failing function by id, so errors don't depend on thread timing
@@ -49,9 +54,7 @@ pub fn decompile(data: &[u8], key: u8) -> Result<String, Error> {
         .collect::<Result<Vec<_>, _>>()?;
     let mut functions = deinline(&chunk, lifted);
     let protos = chunk.protos.iter().map(|p| p.debug_name.clone()).collect::<Vec<_>>();
-    for function in &mut functions {
-        names::infer(function, &protos);
-    }
+    names::infer(&mut functions, &protos, chunk.main, script);
     Ok(print::print_chunk(&functions, chunk.main))
 }
 

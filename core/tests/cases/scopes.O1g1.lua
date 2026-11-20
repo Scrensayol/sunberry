@@ -1,9 +1,9 @@
-local function scan(v1)
+local function scan(p1)
 	local v2 = 0
 	local v3 = {}
 	local v4 = 1
-	while v4 <= #v1 do
-		local v5 = string.sub(v1, v4, v4)
+	while v4 <= #p1 do
+		local v5 = string.sub(p1, v4, v4)
 		if v5 == "(" then
 			v2 += 1
 		elseif v5 == ")" then
@@ -40,11 +40,11 @@ for _, v in v6 do
 	table.insert(v10, v())
 end
 print(table.concat(v10, ","))
-local function g(v11)
+local function g(p11)
 	local v12 = 0
 	repeat
 		v12 += 1
-		local v13 = v11[v12]
+		local v13 = p11[v12]
 	until v13 == nil or v13 < 0
 	return v12
 end

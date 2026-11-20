@@ -1,26 +1,26 @@
 local v1 = {}
-local function tap(v2, v3)
-	table.insert(v1, v2)
-	return v3
+local function tap(p2, p3)
+	table.insert(v1, p2)
+	return p3
 end
-local function clamp(v4, v5, v6)
-	if v4 < v5 then
-		return v5
+local function clamp(p4, p5, p6)
+	if p4 < p5 then
+		return p5
 	end
-	if v6 < v4 then
-		return v6
+	if p6 < p4 then
+		return p6
 	end
-	return v4
+	return p4
 end
-local function guard(v7)
-	if not v7 then
+local function guard(p7)
+	if not p7 then
 		return
 	end
-	table.insert(v1, "guarded " .. tostring(v7))
+	table.insert(v1, "guarded " .. tostring(p7))
 end
 local v8 = 0
-local function bump(v9)
-	v8 += v9
+local function bump(p9)
+	v8 += p9
 end
 local v10 = tap("l", 1) + tap("r", 2) * tap("m", 3)
 local v11 = tap("p", false) and tap("q", 1) or tap("z", 2)
@@ -32,8 +32,8 @@ for i = -2, 12, 5 do
 end
 guard(nil)
 guard("yes")
-local function scaled(v13)
-	return clamp(v13 * 2, 1, 9)
+local function scaled(p13)
+	return clamp(p13 * 2, 1, 9)
 end
 if clamp(v10, 0, 5) == 5 and scaled(3) > 4 then
 	print("both")

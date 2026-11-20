@@ -1,6 +1,6 @@
-local function distance(v1, v2, v3, v4)
-	local v5 = v3 - v1
-	local v6 = v4 - v2
+local function distance(p1, p2, p3, p4)
+	local v5 = p3 - p1
+	local v6 = p4 - p2
 	return math.sqrt(v5 * v5 + v6 * v6)
 end
 local v7 = {{0, 0}, {3, 4}, {6, 8}}

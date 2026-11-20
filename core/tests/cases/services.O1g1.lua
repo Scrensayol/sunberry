@@ -13,16 +13,16 @@ part.Anchored = true
 part.CanCollide = false
 part.Size = Vector3.new(1, 1, 1)
 part.Parent = workspace
-local v1
-v1 = tick()
+local time
+time = tick()
 RunService.Heartbeat:Connect(function(_)
 	if Humanoid and Humanoid.Health > 0 then
 		part.Position = Character:GetPivot().Position + Vector3.new(0, Config.MarkerHeight, 0)
 	end
-	if tick() - v1 > Config.Lifetime then
+	if tick() - time > Config.Lifetime then
 		part:Destroy()
 	end
 end)
-Damage.OnClientEvent:Connect(function(v2, v3)
-	print(("took %d damage from %s"):format(v2, v3.Name))
+Damage.OnClientEvent:Connect(function(p1, p2)
+	print(("took %d damage from %s"):format(p1, p2.Name))
 end)
