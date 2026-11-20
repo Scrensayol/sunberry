@@ -13,16 +13,16 @@ print((1 / 0), (-1 / 0), true, -0)
 print(3, -4, -2, 0.5)
 print(16, 1000, 0.0015, 123456789012)
 local acc = 1
-acc = acc * 1
-acc = acc + 0.5
-acc = acc * 2
-acc = acc + 0.5
-acc = acc * 3
-acc = acc + 0.5
-acc = acc * 4
-acc = acc + 0.5
-acc = acc * 5
-acc = acc + 0.5
+acc *= 1
+acc += 0.5
+acc *= 2
+acc += 0.5
+acc *= 3
+acc += 0.5
+acc *= 4
+acc += 0.5
+acc *= 5
+acc += 0.5
 print(acc)
-local message = ("%* cubed is %*, %* letters"):format(3, 27, 4)
+local message = `{3} cubed is {27}, {4} letters`
 print(message)

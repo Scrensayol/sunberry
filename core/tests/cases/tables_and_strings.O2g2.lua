@@ -18,7 +18,7 @@ local settings = {
 	[10] = "ten"
 }
 local lo2, hi2 = minMax(4, 8, 15, 16, 23, 42)
-local summary = ("range %*..%*, volume %*%%"):format(lo2, hi2, settings.volume * 100)
+local summary = `range {lo2}..{hi2}, volume {settings.volume * 100}%`
 print(summary, #settings.tags, settings.keybinds.jump, settings[10])
 local parts = {}
 for name, key in pairs(settings.keybinds) do

@@ -1,49 +1,49 @@
 local v1 = {}
-local function v4(v2, v3)
+local function tap(v2, v3)
 	table.insert(v1, v2)
 	return v3
 end
-local function v8(v5, v6, v7)
-	if v5 < v6 then
+local function clamp(v4, v5, v6)
+	if v4 < v5 then
+		return v5
+	end
+	if v6 < v4 then
 		return v6
 	end
-	if v7 < v5 then
-		return v7
-	end
-	return v5
+	return v4
 end
-local function v10(v9)
-	if not v9 then
+local function guard(v7)
+	if not v7 then
 		return
 	end
-	table.insert(v1, "guarded " .. tostring(v9))
+	table.insert(v1, "guarded " .. tostring(v7))
 end
-local v11 = 0
-local function v13(v12)
-	v11 = v11 + v12
+local v8 = 0
+local function bump(v9)
+	v8 += v9
 end
-local v14 = v4("l", 1) + v4("r", 2) * v4("m", 3)
-local v15 = v4("p", false) and v4("q", 1) or v4("z", 2)
-local v16 = {}
-v16[v4("ck", "count")] = (v16.count or 0) + v4("cv", 1)
+local v10 = tap("l", 1) + tap("r", 2) * tap("m", 3)
+local v11 = tap("p", false) and tap("q", 1) or tap("z", 2)
+local v12 = {}
+v12[tap("ck", "count")] = (v12.count or 0) + tap("cv", 1)
 for i = -2, 12, 5 do
-	print(i, v8(i, 0, 10))
-	v13(i)
+	print(i, clamp(i, 0, 10))
+	bump(i)
 end
-v10(nil)
-v10("yes")
-local function v18(v17)
-	return v8(v17 * 2, 1, 9)
+guard(nil)
+guard("yes")
+local function scaled(v13)
+	return clamp(v13 * 2, 1, 9)
 end
-if v8(v14, 0, 5) == 5 and v18(3) > 4 then
+if clamp(v10, 0, 5) == 5 and scaled(3) > 4 then
 	print("both")
 end
-while 0 < v11 do
-	local v19 = v8
-	local v20 = v11
-	v11 = v11 - v19(v20, 1, 7)
-	if v11 % 3 == 0 then
+while 0 < v8 do
+	local v14 = clamp
+	local v15 = v8
+	v8 -= v14(v15, 1, 7)
+	if v8 % 3 == 0 then
 		break
 	end
 end
-print(v14, v15, v16.count, v11, table.concat(v1, ","))
+print(v10, v11, v12.count, v8, table.concat(v1, ","))

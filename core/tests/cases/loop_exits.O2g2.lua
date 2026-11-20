@@ -1,8 +1,8 @@
 local v1 = {}
-local function v2()
+local function get()
 	return {[2] = {seen = true}}
 end
-v1.get = v2
+v1.get = get
 local function seen(id)
 	local e = ({[2] = {seen = true}})[id]
 	return if e == nil then false else e.seen ~= nil
@@ -48,7 +48,7 @@ local function nextShown(tips2, from)
 	return "none"
 end
 local tips3 = {{toShow = true, id = "a"}, {toShow = false, id = "b"}, {toShow = true, id = "c"}}
-local v3 = print
+local v2 = print
 local index3
 for i3 = 1, #tips3 do
 	if tips3[i3].toShow then
@@ -56,7 +56,7 @@ for i3 = 1, #tips3 do
 		break
 	end
 end
-local v4 = if index3 == nil then "none" else "show " .. index3 .. " " .. tips3[index3].id
+local v3 = if index3 == nil then "none" else "show " .. index3 .. " " .. tips3[index3].id
 local index4
 for i4 = 2, #tips3 do
 	if tips3[i4].toShow then
@@ -64,7 +64,7 @@ for i4 = 2, #tips3 do
 		break
 	end
 end
-local v5 = if index4 == nil then "none" else "show " .. index4 .. " " .. tips3[index4].id
+local v4 = if index4 == nil then "none" else "show " .. index4 .. " " .. tips3[index4].id
 local index5
 for i5 = 4, #tips3 do
 	if tips3[i5].toShow then
@@ -72,11 +72,11 @@ for i5 = 4, #tips3 do
 		break
 	end
 end
-v3(v4, v5, if index5 == nil then "none" else "show " .. index5 .. " " .. tips3[index5].id)
+v2(v3, v4, if index5 == nil then "none" else "show " .. index5 .. " " .. tips3[index5].id)
 local function findKey(t, want)
 	local key
-	for k, v6 in t do
-		if v6 == want then
+	for k, v5 in t do
+		if v5 == want then
 			key = k
 			break
 		end
@@ -89,10 +89,10 @@ end
 print(findKey({"x", "y", "z"}, "y"), (findKey({"x"}, "q")))
 local function conv(list)
 	local out = {}
-	for _, v7 in list do
-		local v8 = typeof(v7)
-		v7 = if v8 == "number" then v7 else tonumber(v7) or -1
-		table.insert(out, v7 * 2)
+	for _, v6 in list do
+		local v7 = typeof(v6)
+		v6 = if v7 == "number" then v6 else tonumber(v6) or -1
+		table.insert(out, v6 * 2)
 	end
 	return table.concat(out, ",")
 end
@@ -100,8 +100,8 @@ local function conv2(n)
 	local out2 = {}
 	for i6 = 1, n do
 		local i7 = i6
-		local v9 = i7 % 2
-		i7 = if v9 == 0 then i7 * 100 else i7
+		local v8 = i7 % 2
+		i7 = if v8 == 0 then i7 * 100 else i7
 		table.insert(out2, i7)
 	end
 	return table.concat(out2, ",")
@@ -109,7 +109,7 @@ end
 print(conv({1, "2", "x", 4}), conv2(4))
 local function m(items, opts)
 	local res = {}
-	for _2, it in items do
+	for _, it in items do
 		if it.name then
 			local n2 = it.name
 			if opts and opts.skip and opts.skip[n2 .. "*"] then
@@ -131,8 +131,8 @@ local function m(items, opts)
 		end
 	end
 	local keys = {}
-	for k3, v10 in res do
-		table.insert(keys, k3 .. "=" .. v10)
+	for k3, v9 in res do
+		table.insert(keys, k3 .. "=" .. v9)
 	end
 	table.sort(keys)
 	return table.concat(keys, ",")

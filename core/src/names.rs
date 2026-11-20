@@ -1,13 +1,16 @@
-// Names for locals that debug info didn't name, from what they hold: a service, a module,
-// a child looked up by name, a field, a loop's key and value. Only a suggestion: the printer
-// still makes every name unique and keeps clear of globals the chunk uses.
+// Names for locals that debug info didn't name, from what they hold: a function's own name,
+// a service, a module, a child looked up by name, a field, a loop's key and value. Only a
+// suggestion: the printer still makes every name unique and keeps clear of globals the chunk
+// uses.
 
-use crate::ast::{Expr, Function, Stmt};
+use crate::ast::{Closure, Expr, Function, Stmt};
 use crate::print::is_identifier;
 
-pub fn infer(function: &mut Function) {
+// `protos`: each function's own name, which Luau keeps even at debug level 1
+pub fn infer(function: &mut Function, protos: &[Option<Vec<u8>>]) {
+    name_returned_function(function, protos);
     let mut hints = vec![None; function.names.len()];
-    walk(&function.body, &mut hints);
+    walk(&function.body, &mut hints, protos);
     for (name, hint) in function.names.iter_mut().zip(hints) {
         if name.is_none() {
             *name = hint;
@@ -24,10 +27,33 @@ fn set(hints: &mut [Option<Vec<u8>>], local: u32, name: Option<Vec<u8>>) {
     }
 }
 
-fn walk(body: &[Stmt], hints: &mut [Option<Vec<u8>>]) {
+// `return function(...) ... end` from a function the source named, usually a module's
+// `local function Attendance(props) ... end return Attendance`: give it its name back
+fn name_returned_function(function: &mut Function, protos: &[Option<Vec<u8>>]) {
+    let Some(Stmt::Return(values)) = function.body.last() else { return };
+    let [Expr::Closure(closure)] = &values[..] else { return };
+    let Some(name) = proto_name(closure, protos) else { return };
+    let closure = closure.clone();
+    let local = function.names.len() as u32;
+    function.names.push(Some(name));
+    function.body.pop();
+    function.body.push(Stmt::Local { locals: vec![local], values: vec![Expr::Closure(closure)] });
+    function.body.push(Stmt::Return(vec![Expr::Local(local)]));
+}
+
+fn proto_name(closure: &Closure, protos: &[Option<Vec<u8>>]) -> Option<Vec<u8>> {
+    protos.get(closure.proto).cloned().flatten().filter(|n| is_identifier(n))
+}
+
+fn walk(body: &[Stmt], hints: &mut [Option<Vec<u8>>], protos: &[Option<Vec<u8>>]) {
+    let hint = |e: &Expr| match e {
+        Expr::Closure(c) => proto_name(c, protos),
+        e => hint(e),
+    };
     for stmt in body {
         match stmt {
             Stmt::Local { locals, values } if locals.len() == 1 && values.len() == 1 => set(hints, locals[0], hint(&values[0])),
+            Stmt::LocalFunction { local, closure } => set(hints, *local, proto_name(closure, protos)),
             Stmt::Local { locals, values } if locals.len() == 2 && values.len() == 1 && is_pcall(&values[0]) => {
                 set(hints, locals[0], Some(b"success".to_vec()));
                 set(hints, locals[1], Some(b"result".to_vec()));
@@ -53,7 +79,7 @@ fn walk(body: &[Stmt], hints: &mut [Option<Vec<u8>>]) {
             _ => {}
         }
         for nested in stmt.bodies() {
-            walk(nested, hints);
+            walk(nested, hints, protos);
         }
     }
 }

@@ -1,4 +1,4 @@
-local function v2(v1)
+local function classify(v1)
 	if v1 < 0 then
 		return "negative"
 	end
@@ -10,31 +10,31 @@ local function v2(v1)
 	end
 	return "odd"
 end
-local function v6(v3)
-	local v4 = 0
-	local v5 = 1
-	while v4 < v3 do
-		v4 = v4 + v5
-		v5 = v5 + 1
+local function sumUntil(v2)
+	local v3 = 0
+	local v4 = 1
+	while v3 < v2 do
+		v3 += v4
+		v4 += 1
 	end
-	return v4, v5
+	return v3, v4
 end
-local function v10(v7)
-	local v8 = v7
+local function firstPrimeAfter(v5)
+	local v6 = v5
 	repeat
-		v8 = v8 + 1
-		local v9 = 1 < v8
-		for i = 2, math.floor(math.sqrt(v8)) do
-			if v8 % i == 0 then
-				v9 = false
+		v6 += 1
+		local v7 = 1 < v6
+		for i = 2, math.floor(math.sqrt(v6)) do
+			if v6 % i == 0 then
+				v7 = false
 				break
 			end
 		end
-	until v9
-	return v8
+	until v7
+	return v6
 end
-local v11 = {}
-for i2, v in ipairs({
+local v8 = {}
+for _, v in ipairs({
 	"a",
 	"b",
 	"a",
@@ -43,12 +43,12 @@ for i2, v in ipairs({
 	"a"
 }) do
 	if v ~= "c" then
-		v11[v] = (v11[v] or 0) + 1
+		v8[v] = (v8[v] or 0) + 1
 	end
 end
-for k, v12 in pairs(v11) do
-	print(k, v12, v2(v12))
+for k, v9 in pairs(v8) do
+	print(k, v9, classify(v9))
 end
-for i3 = 10, 1, -3 do
-	print(i3, v6(i3), v10(i3))
+for i2 = 10, 1, -3 do
+	print(i2, sumUntil(i2), firstPrimeAfter(i2))
 end

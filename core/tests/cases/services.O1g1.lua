@@ -15,7 +15,7 @@ part.Size = Vector3.new(1, 1, 1)
 part.Parent = workspace
 local v1
 v1 = tick()
-RunService.Heartbeat:Connect(function(v2)
+RunService.Heartbeat:Connect(function(_)
 	if Humanoid and Humanoid.Health > 0 then
 		part.Position = Character:GetPivot().Position + Vector3.new(0, Config.MarkerHeight, 0)
 	end
@@ -23,6 +23,6 @@ RunService.Heartbeat:Connect(function(v2)
 		part:Destroy()
 	end
 end)
-Damage.OnClientEvent:Connect(function(v3, v4)
-	print(("took %d damage from %s"):format(v3, v4.Name))
+Damage.OnClientEvent:Connect(function(v2, v3)
+	print(("took %d damage from %s"):format(v2, v3.Name))
 end)

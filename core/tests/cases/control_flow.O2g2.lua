@@ -14,15 +14,15 @@ local function sumUntil(limit)
 	local total = 0
 	local i = 1
 	while total < limit do
-		total = total + i
-		i = i + 1
+		total += i
+		i += 1
 	end
 	return total, i
 end
 local function firstPrimeAfter(n2)
 	local candidate = n2
 	repeat
-		candidate = candidate + 1
+		candidate += 1
 		local prime = 1 < candidate
 		for d = 2, math.floor((math.sqrt(candidate))) do
 			if candidate % d == 0 then

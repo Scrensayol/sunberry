@@ -11,14 +11,14 @@ function Account:deposit(amount)
 	if amount <= 0 then
 		error("deposit must be positive")
 	end
-	self.balance = self.balance + amount
+	self.balance += amount
 	table.insert(self.history, {kind = "deposit", amount = amount})
 end
 function Account:withdraw(amount2)
 	if self.balance < amount2 then
 		return false, "insufficient funds"
 	end
-	self.balance = self.balance - amount2
+	self.balance -= amount2
 	table.insert(self.history, {kind = "withdraw", amount = amount2})
 	return true
 end

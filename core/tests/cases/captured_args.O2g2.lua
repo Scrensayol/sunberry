@@ -1,6 +1,6 @@
 local n = 1
 local function bump()
-	n = n + 10
+	n += 10
 	return n
 end
 local max

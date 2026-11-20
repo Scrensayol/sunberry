@@ -35,16 +35,16 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 end)
 local elapsed = 0
 RunService.Heartbeat:Connect(function(deltaTime)
-	elapsed = elapsed + deltaTime
+	elapsed += deltaTime
 end)
 for _, child2 in ipairs(workspace:GetChildren()) do
 	print(child2.Name)
 end
-for _2, descendant in workspace:GetDescendants() do
+for _, descendant in workspace:GetDescendants() do
 	if descendant:IsA("Light") then
 		descendant.Enabled = false
 	end
 end
-for _3, player2 in pairs(Players:GetPlayers()) do
+for _, player2 in pairs(Players:GetPlayers()) do
 	print(player2.DisplayName, elapsed)
 end

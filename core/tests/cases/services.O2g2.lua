@@ -15,7 +15,7 @@ marker.Size = Vector3.new(1, 1, 1)
 marker.Parent = workspace
 local started
 started = tick()
-RunService.Heartbeat:Connect(function(dt)
+RunService.Heartbeat:Connect(function(_)
 	if humanoid and humanoid.Health > 0 then
 		marker.Position = character:GetPivot().Position + Vector3.new(0, config.MarkerHeight, 0)
 	end

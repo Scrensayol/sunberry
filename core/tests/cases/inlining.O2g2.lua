@@ -20,7 +20,7 @@ local function guard(value2)
 end
 local counter = 0
 local function bump(by)
-	counter = counter + by
+	counter += by
 end
 local sum = tap("l", 1) + tap("r", 2) * tap("m", 3)
 local short = tap("p", false) and tap("q", 1) or tap("z", 2)
@@ -45,7 +45,7 @@ if clamp(sum, 0, 5) == 5 and 6 > 4 then
 	print("both")
 end
 while 0 < counter do
-	counter = counter - clamp(counter, 1, 7)
+	counter -= clamp(counter, 1, 7)
 	if counter % 3 == 0 then
 		break
 	end

@@ -1,9 +1,9 @@
 local Shapes = {}
 Shapes.util = {}
-local function v1(w, h)
+local function area(w, h)
 	return w * h
 end
-Shapes.util.area = v1
+Shapes.util.area = area
 function Shapes.new(kind, w2, h2)
 	return (setmetatable({kind = kind, w = w2, h = h2}, {__index = Shapes}))
 end

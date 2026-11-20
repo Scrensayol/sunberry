@@ -89,6 +89,17 @@ pub fn number(n: f64) -> String {
 pub fn string(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() + 2);
     out.push('"');
+    escape_into(bytes, '"', &mut out);
+    out.push('"');
+    out
+}
+
+// the literal text between an interpolated string's `{}` parts
+fn interpolated_text(bytes: &[u8], out: &mut String) {
+    escape_into(bytes, '`', out);
+}
+
+fn escape_into(bytes: &[u8], quote: char, out: &mut String) {
     let mut rest = bytes;
     while !rest.is_empty() {
         let (valid, bad) = match std::str::from_utf8(rest) {
@@ -97,7 +108,12 @@ pub fn string(bytes: &[u8]) -> String {
         };
         for c in valid.chars() {
             match c {
-                '"' => out.push_str("\\\""),
+                c if c == quote => {
+                    out.push('\\');
+                    out.push(c);
+                }
+                // `{` opens an expression in an interpolated string
+                '{' if quote == '`' => out.push_str("\\{"),
                 '\\' => out.push_str("\\\\"),
                 '\n' => out.push_str("\\n"),
                 '\r' => out.push_str("\\r"),
@@ -114,8 +130,55 @@ pub fn string(bytes: &[u8]) -> String {
             None => rest = &[],
         }
     }
-    out.push('"');
-    out
+}
+
+fn compound(target: &Expr) -> bool {
+    match target {
+        Expr::Local(_) | Expr::Upvalue(_) | Expr::Global(_) => true,
+        Expr::Index(table, key) => {
+            matches!(table.as_ref(), Expr::Local(_)) && matches!(key.as_ref(), Expr::Local(_) | Expr::String(_) | Expr::Number(_))
+        }
+        _ => false,
+    }
+}
+
+fn compound_symbol(op: BinOp, right: &Expr) -> Option<&'static str> {
+    Some(match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::IDiv => "//",
+        BinOp::Mod => "%",
+        BinOp::Pow => "^",
+        // `s = s .. a .. b` concatenates all three at once; `s ..= a .. b` doesn't
+        BinOp::Concat if !matches!(right, Expr::Binary(BinOp::Concat, ..)) => "..",
+        _ => return None,
+    })
+}
+
+// `("%* of %*"):format(a, b)` is exactly what Luau compiles `{a} of {b}` in backticks to:
+// the literal text with `%` doubled and `%*` for each expression
+// (one value, like the call it stands for: one whose results spread stays a call)
+fn interpolation(object: &Expr, method: &[u8], args: &[Expr], multret: bool) -> Option<Vec<Vec<u8>>> {
+    let Expr::String(format) = object else { return None };
+    if multret || method != b"format" || args.is_empty() || args.last().is_some_and(Expr::expands) {
+        return None;
+    }
+    let mut parts = vec![Vec::new()];
+    let mut bytes = format.iter();
+    while let Some(&b) = bytes.next() {
+        if b != b'%' {
+            parts.last_mut().unwrap().push(b);
+            continue;
+        }
+        match bytes.next() {
+            Some(b'%') => parts.last_mut().unwrap().push(b'%'),
+            Some(b'*') => parts.push(Vec::new()),
+            _ => return None,
+        }
+    }
+    (parts.len() == args.len() + 1).then_some(parts)
 }
 
 struct Scope {
@@ -132,6 +195,8 @@ struct Printer<'a> {
     scopes: Vec<Scope>,
     // names called with `:` somewhere: a function stored under one is likely a method
     methods: HashSet<Vec<u8>>,
+    // per function, the locals something reads, writes or captures
+    used: Vec<HashSet<u32>>,
 }
 
 pub fn print_chunk(functions: &[Function], main: usize) -> String {
@@ -143,11 +208,86 @@ pub fn print_chunk(functions: &[Function], main: usize) -> String {
     }
     // printed for vector constants
     reserved.insert(b"Vector3".to_vec());
-    let mut printer = Printer { functions, reserved, taken: HashSet::new(), counter: 0, scopes: Vec::new(), methods };
+    let used = functions
+        .iter()
+        .map(|f| {
+            let mut used = HashSet::new();
+            used_in(&f.body, &mut used);
+            used
+        })
+        .collect();
+    let mut printer = Printer { functions, reserved, taken: HashSet::new(), counter: 0, scopes: Vec::new(), methods, used };
     printer.scopes.push(Scope { proto: main, locals: vec![None; functions[main].names.len()], upvalues: Vec::new() });
     let mut out = String::new();
     printer.body(&functions[main].body, 0, &mut out);
     out
+}
+
+fn used_in(body: &[Stmt], out: &mut HashSet<u32>) {
+    fn expr(e: &Expr, out: &mut HashSet<u32>) {
+        match e {
+            Expr::Local(l) => {
+                out.insert(*l);
+            }
+            Expr::Index(a, b) | Expr::Binary(_, a, b) => {
+                expr(a, out);
+                expr(b, out);
+            }
+            Expr::Unary(_, a) => expr(a, out),
+            Expr::IfElse(a, b, c) => {
+                expr(a, out);
+                expr(b, out);
+                expr(c, out);
+            }
+            Expr::Call { func, args, .. } => {
+                expr(func, out);
+                args.iter().for_each(|a| expr(a, out));
+            }
+            Expr::MethodCall { object, args, .. } => {
+                expr(object, out);
+                args.iter().for_each(|a| expr(a, out));
+            }
+            Expr::Table(fields) => fields.iter().for_each(|f| match f {
+                Field::Positional(v) => expr(v, out),
+                Field::Keyed(k, v) => {
+                    expr(k, out);
+                    expr(v, out);
+                }
+            }),
+            Expr::Closure(c) => closure(c, out),
+            Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_) | Expr::Vector(_) | Expr::VarArg { .. } => {}
+            Expr::Upvalue(_) | Expr::Global(_) | Expr::Tested(_) => {}
+        }
+    }
+    fn closure(c: &Closure, out: &mut HashSet<u32>) {
+        for capture in &c.captures {
+            if let Capture::Local(l) = capture {
+                out.insert(*l);
+            }
+        }
+    }
+    for stmt in body {
+        match stmt {
+            Stmt::Local { values, .. } | Stmt::Return(values) => values.iter().for_each(|v| expr(v, out)),
+            Stmt::Assign { targets, values } => targets.iter().chain(values).for_each(|v| expr(v, out)),
+            Stmt::Call(e) => expr(e, out),
+            Stmt::LocalFunction { local, closure: c } => {
+                out.insert(*local);
+                closure(c, out);
+            }
+            Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::Repeat { cond, .. } => expr(cond, out),
+            Stmt::NumericFor { from, to, step, .. } => {
+                expr(from, out);
+                expr(to, out);
+                step.iter().for_each(|s| expr(s, out));
+            }
+            Stmt::GenericFor { values, .. } => values.iter().for_each(|v| expr(v, out)),
+            Stmt::Break | Stmt::Continue | Stmt::Do(_) => {}
+        }
+        for body in stmt.bodies() {
+            used_in(body, out);
+        }
+    }
 }
 
 fn collect_methods(body: &[Stmt], out: &mut HashSet<Vec<u8>>) {
@@ -281,6 +421,17 @@ impl Printer<'_> {
         name
     }
 
+    // a loop variable or parameter nothing uses is `_`, unless `_` already names something
+    // that could be in scope or is a global the chunk reads
+    fn declare_maybe_unused(&mut self, local: u32) -> String {
+        let proto = self.scopes.last().unwrap().proto;
+        if !self.used[proto].contains(&local) && !self.taken.contains("_") && !self.reserved.contains(&b"_"[..]) {
+            self.scopes.last_mut().unwrap().locals[local as usize] = Some("_".into());
+            return "_".into();
+        }
+        self.declare(local)
+    }
+
     fn local(&self, local: u32) -> String {
         self.scopes.last().unwrap().locals[local as usize].clone().expect("locals are declared before use")
     }
@@ -338,11 +489,24 @@ impl Printer<'_> {
                 let function = self.closure(closure, indent);
                 format!("local function {name}{}", &function["function".len()..])
             }
+            // `x = x + y` as `x += y`, where the target is read and written the same way both
+            // times: a register, a global, or a register's field with a constant or register key
+            Stmt::Assign { targets, values }
+                if let ([target], [Expr::Binary(op, left, right)]) = (&targets[..], &values[..])
+                    && **left == *target
+                    && compound(target)
+                    && let Some(symbol) = compound_symbol(*op, right) =>
+            {
+                let target = self.expr(target, indent);
+                format!("{target} {symbol}= {}", self.expr(right, indent))
+            }
             Stmt::Assign { targets, values } => {
                 let targets = targets.iter().map(|t| self.expr(t, indent)).collect::<Vec<_>>();
                 let values = self.list_for(values, targets.len(), indent);
                 format!("{} = {values}", targets.join(", "))
             }
+            // a string literal can't start a statement, so no interpolation here
+            Stmt::Call(Expr::MethodCall { object, method, args, .. }) => self.method_call(object, method, args, indent),
             Stmt::Call(call) => self.expr(call, indent),
             Stmt::Return(values) => {
                 let values = self.list(values, indent);
@@ -373,7 +537,7 @@ impl Printer<'_> {
             Stmt::NumericFor { var, from, to, step, body } => {
                 let (from, to) = (self.expr(from, indent), self.expr(to, indent));
                 let step = step.as_ref().map(|s| format!(", {}", self.expr(s, indent))).unwrap_or_default();
-                let var = self.declare(*var);
+                let var = self.declare_maybe_unused(*var);
                 let mut out = format!("for {var} = {from}, {to}{step} do\n");
                 self.block(body, indent + 1, &mut out);
                 out.push_str(&"\t".repeat(indent));
@@ -382,7 +546,7 @@ impl Printer<'_> {
             }
             Stmt::GenericFor { vars, values, body } => {
                 let values = self.list(values, indent);
-                let vars = vars.iter().map(|&v| self.declare(v)).collect::<Vec<_>>();
+                let vars = vars.iter().map(|&v| self.declare_maybe_unused(v)).collect::<Vec<_>>();
                 let mut out = format!("for {} in {values} do\n", vars.join(", "));
                 self.block(body, indent + 1, &mut out);
                 out.push_str(&"\t".repeat(indent));
@@ -478,7 +642,7 @@ impl Printer<'_> {
         let truncated = matches!(
             expr,
             Expr::VarArg { multret: false } | Expr::Call { multret: false, .. } | Expr::MethodCall { multret: false, .. }
-        );
+        ) && !matches!(expr, Expr::MethodCall { object, method, args, multret } if interpolation(object, method, args, *multret).is_some());
         let text = self.expr(expr, indent);
         if truncated { format!("({text})") } else { text }
     }
@@ -489,7 +653,9 @@ impl Printer<'_> {
     }
 
     fn prefix(&mut self, expr: &Expr, indent: usize) -> String {
-        let wrap = !is_prefix(expr);
+        // `(`{a}`):upper()`: an interpolated string can't be called or indexed bare
+        let interpolated = matches!(expr, Expr::MethodCall { object, method, args, multret } if interpolation(object, method, args, *multret).is_some());
+        let wrap = !is_prefix(expr) || interpolated;
         self.operand(expr, wrap, indent)
     }
 
@@ -515,10 +681,23 @@ impl Printer<'_> {
                 let func = self.prefix(func, indent);
                 format!("{func}({})", self.list(args, indent))
             }
-            Expr::MethodCall { object, method, args, .. } => {
-                let object = self.prefix(object, indent);
-                format!("{object}:{}({})", String::from_utf8_lossy(method), self.list(args, indent))
+            Expr::MethodCall { object, method, args, multret } if let Some(parts) = interpolation(object, method, args, *multret) => {
+                let mut out = String::from("`");
+                for (i, part) in parts.iter().enumerate() {
+                    interpolated_text(part, &mut out);
+                    if let Some(arg) = args.get(i) {
+                        let text = self.expr(arg, indent);
+                        // `{{` isn't allowed in an interpolated string
+                        let text = if text.starts_with('{') { format!("({text})") } else { text };
+                        out.push('{');
+                        out.push_str(&text);
+                        out.push('}');
+                    }
+                }
+                out.push('`');
+                out
             }
+            Expr::MethodCall { object, method, args, .. } => self.method_call(object, method, args, indent),
             Expr::Binary(op, left, right) => {
                 let (p, right_assoc, symbol) = binary_precedence(*op);
                 let (lp, rp) = (precedence(left), precedence(right));
@@ -546,15 +725,37 @@ impl Printer<'_> {
             }
             Expr::Table(fields) => self.table(fields, indent),
             Expr::Closure(closure) => self.closure(closure, indent),
-            Expr::IfElse(cond, a, b) => {
-                let cond = self.operand(cond, precedence(cond) == IF_ELSE, indent);
-                // `else` swallows everything to its right, so a nested one there is fine bare
-                let a = self.operand(a, precedence(a) == IF_ELSE, indent);
-                let b = self.expr(b, indent);
-                format!("if {cond} then {a} else {b}")
+            Expr::IfElse(..) => {
+                // `else if` chains read as `elseif`; a long one gets a line per branch
+                let mut branches = Vec::new();
+                let mut rest = expr;
+                while let Expr::IfElse(cond, a, b) = rest {
+                    let cond = self.operand(cond, precedence(cond) == IF_ELSE, indent + 1);
+                    let a = self.operand(a, precedence(a) == IF_ELSE, indent + 1);
+                    branches.push((cond, a));
+                    rest = b;
+                }
+                let otherwise = self.expr(rest, indent + 1);
+                let mut parts = branches
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (cond, a))| format!("{} {cond} then {a}", if i == 0 { "if" } else { "elseif" }))
+                    .collect::<Vec<_>>();
+                parts.push(format!("else {otherwise}"));
+                let line = parts.join(" ");
+                if line.len() <= 100 || line.contains('\n') {
+                    line
+                } else {
+                    parts.join(&format!("\n{}", "\t".repeat(indent + 1)))
+                }
             }
             Expr::Tested(_) => unreachable!("value regions never leave a tested placeholder"),
         }
+    }
+
+    fn method_call(&mut self, object: &Expr, method: &[u8], args: &[Expr], indent: usize) -> String {
+        let object = self.prefix(object, indent);
+        format!("{object}:{}({})", String::from_utf8_lossy(method), self.list(args, indent))
     }
 
     fn table(&mut self, fields: &[Field], indent: usize) -> String {
@@ -643,7 +844,7 @@ impl Printer<'_> {
                 self.scopes.last_mut().unwrap().locals[p as usize] = Some("self".into());
                 continue;
             }
-            params.push(self.declare(p));
+            params.push(self.declare_maybe_unused(p));
         }
         if function.is_vararg {
             params.push("...".into());

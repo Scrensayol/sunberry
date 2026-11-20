@@ -5,19 +5,19 @@ local function scan(s)
 	while i <= #s do
 		local c = string.sub(s, i, i)
 		if c == "(" then
-			depth = depth + 1
+			depth += 1
 		elseif c == ")" then
-			depth = depth - 1
+			depth -= 1
 			if depth < 0 then
 				return "unbalanced at " .. i
 			end
 		elseif c == "x" and depth == 0 then
 			table.insert(out, i)
 		else
-			i = i + 1
+			i += 1
 			continue
 		end
-		i = i + 1
+		i += 1
 	end
 	if depth ~= 0 then
 		return "open"
@@ -28,7 +28,7 @@ print(scan("x(x)x"), scan("(()"), scan("())x"), scan(""))
 local fs = {}
 local i2 = 0
 repeat
-	i2 = i2 + 1
+	i2 += 1
 	local x = i2 * 3
 	local function v1()
 		return x
@@ -43,7 +43,7 @@ print(table.concat(r, ","))
 local function g(t)
 	local n = 0
 	repeat
-		n = n + 1
+		n += 1
 		local v = t[n]
 	until v == nil or v < 0
 	return n

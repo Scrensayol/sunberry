@@ -48,8 +48,9 @@ pub fn decompile(data: &[u8], key: u8) -> Result<String, Error> {
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
     let mut functions = deinline(&chunk, lifted);
+    let protos = chunk.protos.iter().map(|p| p.debug_name.clone()).collect::<Vec<_>>();
     for function in &mut functions {
-        names::infer(function);
+        names::infer(function, &protos);
     }
     Ok(print::print_chunk(&functions, chunk.main))
 }

@@ -1,7 +1,7 @@
 local function makeCounter(start, step)
 	local value = start
 	return function()
-		value = value + step
+		value += step
 		return value
 	end, function()
 		value = start
@@ -11,7 +11,7 @@ local value2 = 10
 local v1
 v1 = 5
 local function v2()
-	value2 = value2 + v1
+	value2 += v1
 	return value2
 end
 local v3
