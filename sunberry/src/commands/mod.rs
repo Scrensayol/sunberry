@@ -44,6 +44,12 @@ pub enum Commands {
         /// Which decompiler core to use for Luau
         #[arg(long, value_enum, default_value_t = Core::Next)]
         core: Core,
+
+        /// With the new core: when it refuses a script, print why and exit with status 3
+        /// instead of falling back to the old core's output (what test suites like Rosetta
+        /// want: a refusal isn't a wrong decompile)
+        #[arg(long, default_value_t = false)]
+        strict: bool,
     },
 
     /// Disassemble Luau bytecode (raw or base64) with the new core's reader

@@ -7,5 +7,9 @@ result.lua
 
 Tests
 
-# round-trip harness runs: failing cases, reduced programs, reports
-harness/out/
+# the round-trip harness moved to Rosetta (https://github.com/Scrensayol/rosetta); a local copy
+# can stay here untracked
+/harness/
+# Rosetta runs (failing cases, reduced programs, reports) and a checkout of it, as CI makes
+/out/
+/rosetta/

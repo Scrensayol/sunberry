@@ -9,7 +9,6 @@ members = [
     "restructure",
     "luau-worker",
     "sunberry",
-    "harness",
     "core",
 ]
 

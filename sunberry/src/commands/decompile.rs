@@ -50,10 +50,22 @@ pub fn decompile(
     lua51: bool,
     name: Option<String>,
     core: Core,
+    strict: bool,
 ) -> Result<(), std::io::Error> {
     let bytecode = std::fs::read(input)?;
     // scripts are usually dumped as <ScriptName>.luauc
     let name = name.or_else(|| Some(input.file_stem()?.to_string_lossy().into_owned()));
+    if strict && !lua51 && matches!(core, Core::Next) {
+        let bytecode = BASE64_STANDARD.decode(&bytecode).unwrap_or(bytecode);
+        // (a panic is left to crash the process: that's a bug, not a refusal)
+        return match sunberry_core::decompile_named(&bytecode, encode_key, name.as_deref()) {
+            Ok(text) => std::fs::write(output, text),
+            Err(e) => {
+                eprintln!("unsupported: {e}");
+                std::process::exit(3);
+            }
+        };
+    }
     let out = decompile_no_io(bytecode, encode_key, lua51, name.as_deref(), core);
     std::fs::write(output, out)
 }
