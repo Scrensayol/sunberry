@@ -5,13 +5,12 @@ local function tap(name, v)
 end
 local a = tap("a", 1)
 local b = tap("b", 2)
-local v2 = b
-tap("b2")
-local b2 = a
-a = tap("a2", v2)
-local v3 = a
-tap("x")
-local v4 = b2
-tap("y")
-local t = {x = v3, y = v4}
+local v1 = tap("b2", b)
+local b2 = tap("a2", a)
+a = v1
+local t = {}
+local v2 = tap("x", a)
+local v3 = tap("y", b2)
+t.x = v2
+t.y = v3
 print(table.concat(log, ","), a, b2, t.x, t.y)

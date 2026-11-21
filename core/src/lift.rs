@@ -3392,7 +3392,22 @@ impl Lifter<'_> {
             // for where the region lifts at all, or the tries multiply (each nested sandbox
             // tries every copy inside it at every length)
             let mut lifted = Vec::new();
-            for (end, returns, nested) in (at + 1..=longest).rev().flat_map(modes) {
+            // a match that binds arguments to values made before the region but leaves out the
+            // newest one (arguments are evaluated just before the body) is a poor one: Luau
+            // 0.746+ elides moves, so a longer region can take in the caller's next move and
+            // still match with the arguments shifted. Those are tried last, after every length.
+            let mut weak = Vec::new();
+            let mut tries = (at + 1..=longest).rev().flat_map(modes).map(|t| (t, true)).collect::<Vec<_>>();
+            let mut k = 0;
+            loop {
+                if k == tries.len() {
+                    if weak.is_empty() {
+                        break;
+                    }
+                    tries.extend(weak.drain(..).map(|t| (t, false)));
+                }
+                let ((end, returns, nested), strict) = tries[k];
+                k += 1;
                 if !self.closed_region(at, end, returns) || returns && !(callee_flow && self.returns_early(at, end)) {
                     continue;
                 }
@@ -3415,6 +3430,9 @@ impl Lifter<'_> {
                 self.nested -= 1;
                 self.inlining_off = off;
                 self.restore(&start);
+                let newest = self.pending.last().map(|p| p.reg);
+                let pending_at = |slots: &[Slot], r: u8| matches!(slots[r as usize], Slot::Pending(_));
+                let slots_before = self.slots.clone();
                 // calls made back inside are only for matching: the new upvalues they took go
                 // (the subject still names them, so matching sees them)
                 let seen_extra = self.extra.clone();
@@ -3450,6 +3468,16 @@ impl Lifter<'_> {
                         }
                         continue;
                     };
+                    // (a local bound as an argument says nothing: Luau passes it without a copy)
+                    if strict
+                        && plan.binds.iter().any(|b| matches!(b, Bind::Reg(r) if pending_at(&slots_before, *r)))
+                        && newest.is_some_and(|n| !plan.binds.contains(&Bind::Reg(n)))
+                    {
+                        if !weak.contains(&(end, returns, nested)) {
+                            weak.push((end, returns, nested));
+                        }
+                        continue;
+                    }
                     // a new upvalue is numbered now: one level down, the sandbox may have given
                     // other functions new upvalues since `func` was worked out
                     let n = self.proto.num_upvalues as usize;
@@ -3589,6 +3617,14 @@ impl Lifter<'_> {
             self.ret = outer_ret;
             return Ok((!variants.is_empty()).then_some(variants));
         }
+        // Luau 0.746+ leaves out the move when an inlined call returns a parameter: the result
+        // is the register the argument went into, which the region never writes. Those are
+        // registers read after it that hold a value made just before (flushed into a new local)
+        let kept = live
+            .without(written)
+            .iter()
+            .filter(|&r| matches!(self.slots[r as usize], Slot::Local(l) if start.get(&l).is_some_and(|&(sr, new)| new && sr == r)))
+            .collect::<Vec<_>>();
         let stmts = self.sub_body(|l| l.block(at, end, &exits))?;
         if stmts.iter().any(Stmt::terminates) {
             return Ok(None);
@@ -3629,6 +3665,18 @@ impl Lifter<'_> {
             return Ok(None);
         }
         let mut variants = Vec::new();
+        // a result the region never wrote (see `kept`), when it wrote none of its own
+        // (the newest value first: arguments are evaluated just before the body)
+        if targets.is_empty() && self.pending.is_empty() {
+            let mut kept = kept.iter().filter_map(|&r| match self.slots[r as usize] {
+                Slot::Local(l) => Some((l, r)),
+                _ => None,
+            }).collect::<Vec<_>>();
+            kept.sort_unstable_by(|a, b| b.cmp(a));
+            for (l, r) in kept {
+                variants.push(Sub { stmts: stmts.clone(), values: vec![Expr::Local(l)], many: false, targets: vec![r], start: start.clone(), returns: false });
+            }
+        }
         // as results: each one is an assignment at the very end
         {
             let mut stmts = stmts.clone();
@@ -3669,7 +3717,19 @@ impl Lifter<'_> {
         self.at = end - 1;
         self.pc = self.insns[end - 1].pc;
         let regs = plan.binds.iter().filter_map(|b| if let Bind::Reg(r) = b { Some(*r) } else { None }).collect::<Vec<_>>();
-        let operands = self.take_exprs(&regs)?;
+        // what counts is whether an argument is read after the region: a loop in the callee's
+        // body reads its parameter again within it. (A result register that also held an
+        // argument, see `kept` in `sandbox`: its later reads are the call's result.)
+        let after = self.live_in.get(end).copied().unwrap_or_default();
+        let ignore = sub.targets.iter().copied().chain(regs.iter().copied().filter(|&r| !after.has(r))).collect::<Vec<_>>();
+        let operands = self
+            .take_ignoring(&regs, &ignore)?
+            .into_iter()
+            .map(|o| match o {
+                Operand::Expr(e) => Ok(e),
+                Operand::Method(..) => Err(self.unsupported("NAMECALL result read as a value")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut operands = operands.into_iter();
         let mut args = plan
             .binds
