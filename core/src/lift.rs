@@ -82,6 +82,9 @@ struct Lifter<'a> {
     slots: Vec<Slot>,
     pending: Vec<Pending>,
     next_id: u64,
+    // next_id when the last statement was emitted: pending values from before it were made
+    // before that statement, not just before what comes next
+    emitted_id: u64,
     body: Vec<Stmt>,
     names: Vec<Option<Vec<u8>>>,
     // a local a closure captured by value is never assigned again in the source, so a later
@@ -183,6 +186,7 @@ struct Snapshot {
     slots: Vec<Slot>,
     pending: Vec<Pending>,
     next_id: u64,
+    emitted_id: u64,
     body: usize,
     names: usize,
     by_value: Vec<bool>,
@@ -267,6 +271,7 @@ pub fn lift(chunk: &Chunk, proto_id: usize, inline: Option<&Ctx>) -> Result<Lift
         slots: vec![Slot::Free; 256],
         pending: Vec::new(),
         next_id: 0,
+        emitted_id: 0,
         body: Vec::new(),
         names: Vec::new(),
         by_value: Vec::new(),
@@ -702,7 +707,13 @@ impl Lifter<'_> {
     }
 
     fn starts_local(&self, reg: u8) -> bool {
-        self.proto.locals.iter().any(|l| l.register == reg && l.start_pc == self.pc + 1)
+        let pc = self.pc;
+        // Luau 0.746+ can put an inlined call's argument straight into the variable its result
+        // is assigned to: the callee's parameter starts there while the variable goes on, and
+        // the write is an assignment to the variable
+        let continues = self.proto.locals.iter().any(|o| o.register == reg && o.start_pc <= pc && pc + 1 < o.end_pc);
+        let inlined_next = self.inline.is_some_and(|c| c.run_at(self.proto_id, self.at + 1).is_some()) && !self.inlining_off;
+        self.proto.locals.iter().any(|l| l.register == reg && l.start_pc == pc + 1) && !(continues && inlined_next)
     }
 
     // Whether a write to `reg` is an assignment to the local it holds. In straight-line code
@@ -892,6 +903,7 @@ impl Lifter<'_> {
             self.flush_for_statement()?;
         }
         self.body.push(stmt);
+        self.emitted_id = self.next_id;
         Ok(())
     }
 
@@ -1732,6 +1744,7 @@ impl Lifter<'_> {
             slots: self.slots.clone(),
             pending: self.pending.clone(),
             next_id: self.next_id,
+            emitted_id: self.emitted_id,
             body: self.body.len(),
             names: self.names.len(),
             by_value: self.by_value.clone(),
@@ -1749,6 +1762,7 @@ impl Lifter<'_> {
         self.slots.clone_from(&s.slots);
         self.pending.clone_from(&s.pending);
         self.next_id = s.next_id;
+        self.emitted_id = s.emitted_id;
         self.body.truncate(s.body);
         self.names.truncate(s.names);
         self.by_value.clone_from(&s.by_value);
@@ -3433,6 +3447,16 @@ impl Lifter<'_> {
                 let newest = self.pending.last().map(|p| p.reg);
                 let pending_at = |slots: &[Slot], r: u8| matches!(slots[r as usize], Slot::Pending(_));
                 let slots_before = self.slots.clone();
+                // (or a variable the statement just before assigned, when it holds the value
+                // through the region: the argument Luau put straight into it, see `starts_local`)
+                let assigned = match self.body.last() {
+                    Some(Stmt::Assign { targets, values }) if values.len() == 1 => match targets[..] {
+                        [Expr::Local(l)] => self.slots.iter().position(|s| *s == Slot::Local(l)).map(|r| r as u8),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+                .filter(|&r| self.live_in.get(end).is_some_and(|live| live.has(r)) && (at..end).all(|k| !liveness::writes(&self.insns[k]).has(r)));
                 // calls made back inside are only for matching: the new upvalues they took go
                 // (the subject still names them, so matching sees them)
                 let seen_extra = self.extra.clone();
@@ -3469,9 +3493,13 @@ impl Lifter<'_> {
                         continue;
                     };
                     // (a local bound as an argument says nothing: Luau passes it without a copy)
+                    let binds_reg = plan.binds.iter().any(|b| matches!(b, Bind::Reg(_)));
                     if strict
-                        && plan.binds.iter().any(|b| matches!(b, Bind::Reg(r) if pending_at(&slots_before, *r)))
-                        && newest.is_some_and(|n| !plan.binds.contains(&Bind::Reg(n)))
+                        && (plan.binds.iter().any(|b| matches!(b, Bind::Reg(r) if pending_at(&slots_before, *r)))
+                            && newest.is_some_and(|n| !plan.binds.contains(&Bind::Reg(n)))
+                            || binds_reg
+                                && assigned.is_some_and(|r| !plan.binds.contains(&Bind::Reg(r)))
+                                && newest.is_none_or(|n| !plan.binds.contains(&Bind::Reg(n))))
                     {
                         if !weak.contains(&(end, returns, nested)) {
                             weak.push((end, returns, nested));
@@ -3568,6 +3596,17 @@ impl Lifter<'_> {
     // an `if` can't say without repeating code), and so is reaching the end
     fn sandbox(&mut self, at: usize, end: usize, returns: bool) -> Result<Option<Vec<Sub>>, Error> {
         let before = self.names.len();
+        // (before the flush below: a variable the statement just before the region assigned,
+        // see `kept` and `starts_local`)
+        let assigned_last = match self.body.last() {
+            Some(Stmt::Assign { targets, values }) if values.len() == 1 => match targets[..] {
+                [Expr::Local(l)] if !self.ever_by_ref[l as usize] => Some(l),
+                _ => None,
+            },
+            _ => None,
+        };
+        // values made since the last statement (an argument is evaluated just before the body)
+        let fresh = self.pending.iter().filter(|p| p.id >= self.emitted_id).map(|p| p.reg).collect::<Vec<_>>();
         self.flush()?;
         let mut start = HashMap::new();
         for (r, slot) in self.slots.iter().enumerate() {
@@ -3619,11 +3658,12 @@ impl Lifter<'_> {
         }
         // Luau 0.746+ leaves out the move when an inlined call returns a parameter: the result
         // is the register the argument went into, which the region never writes. Those are
-        // registers read after it that hold a value made just before (flushed into a new local)
+        // registers read after it that hold a value made just before (flushed into a new local,
+        // or `assigned_last`)
         let kept = live
             .without(written)
             .iter()
-            .filter(|&r| matches!(self.slots[r as usize], Slot::Local(l) if start.get(&l).is_some_and(|&(sr, new)| new && sr == r)))
+            .filter(|&r| matches!(self.slots[r as usize], Slot::Local(l) if start.get(&l).is_some_and(|&(sr, new)| (new && fresh.contains(&r) || assigned_last == Some(l)) && sr == r)))
             .collect::<Vec<_>>();
         let stmts = self.sub_body(|l| l.block(at, end, &exits))?;
         if stmts.iter().any(Stmt::terminates) {
@@ -3672,7 +3712,8 @@ impl Lifter<'_> {
                 Slot::Local(l) => Some((l, r)),
                 _ => None,
             }).collect::<Vec<_>>();
-            kept.sort_unstable_by(|a, b| b.cmp(a));
+            // (the variable just assigned last: a value made after that statement is newer)
+            kept.sort_unstable_by_key(|&(l, r)| (assigned_last == Some(l), std::cmp::Reverse((l, r))));
             for (l, r) in kept {
                 variants.push(Sub { stmts: stmts.clone(), values: vec![Expr::Local(l)], many: false, targets: vec![r], start: start.clone(), returns: false });
             }
@@ -3742,6 +3783,28 @@ impl Lifter<'_> {
             .collect::<Vec<_>>();
         while args.last() == Some(&Expr::Nil) {
             args.pop();
+        }
+        // `b = a; b = f(b)`, where Luau put the argument straight into b (see `starts_local`),
+        // is `b = f(a)` when nothing else in the call can see the difference
+        if let [t] = sub.targets[..]
+            && let Slot::Local(l) = self.slots[t as usize]
+            && !self.ever_by_ref[l as usize]
+            // (a value still waiting to be read may be b's new value)
+            && self.pending.iter().all(|p| matches!(p.value, Value::Table(..)))
+            && let Some(Stmt::Assign { targets, values }) = self.body.last()
+            && targets[..] == [Expr::Local(l)]
+            && let [value] = &values[..]
+            && (pure_constant(value) || matches!(value, Expr::Local(x) if *x != l && !self.ever_by_ref[*x as usize]))
+            && args.iter().filter(|a| **a == Expr::Local(l)).count() == 1
+            && args.iter().all(|a| pure_constant(a) || matches!(a, Expr::Local(_)))
+        {
+            let value = value.clone();
+            self.body.pop();
+            for a in &mut args {
+                if *a == Expr::Local(l) {
+                    *a = value.clone();
+                }
+            }
         }
         let n = sub.targets.len();
         let call = Expr::Call { func: Box::new(func), args, multret: sub.many || n > 1 };
