@@ -706,6 +706,15 @@ impl Lifter<'_> {
         Ok(())
     }
 
+    // an instruction that is a statement whatever surrounds it: a call whose results nobody
+    // takes, a global or upvalue store. Not in a copy of an inlined function, which may turn
+    // back into a call that's a value
+    fn statement_at(&self, i: usize) -> bool {
+        let insn = &self.insns[i];
+        (matches!(insn.op, Op::CALL) && insn.c == 1 || matches!(insn.op, Op::SETGLOBAL | Op::SETUPVAL))
+            && !(self.inline.is_some_and(|c| c.run_at(self.proto_id, i).is_some()) && !self.inlining_off)
+    }
+
     fn starts_local(&self, reg: u8) -> bool {
         let pc = self.pc;
         // Luau 0.746+ can put an inlined call's argument straight into the variable its result
@@ -1990,6 +1999,10 @@ impl Lifter<'_> {
                 *entry = (*entry).max(back);
             }
         }
+        // a condition's tests jump to its then branch, its else, or the start of a later part:
+        // past the farthest target, in a part that doesn't start there, is after the condition
+        // (whatever follows the `if`)
+        let mut reach = self.insns[first].target().unwrap_or(0);
         let mut j = first + 1;
         while j < end {
             if let Some(&back) = loops.get(&j) {
@@ -1997,11 +2010,16 @@ impl Lifter<'_> {
                 continue;
             }
             let insn = self.insns[j];
+            let part = self.pc_at(tests.last().unwrap() + 1);
+            if insn.pc >= reach && part != reach {
+                break;
+            }
             let forward_jump = matches!(insn.op, Op::JUMP | Op::JUMPX) && insn.target().is_some_and(|t| t > insn.pc);
             // (statements too: an inlined body's can sit between a condition's tests)
             let statement = matches!(insn.op, Op::CALL | Op::CALLFB | Op::SETGLOBAL | Op::SETUPVAL | Op::CLOSEUPVALS);
             if is_test(insn.op) || forward_jump {
                 tests.push(j);
+                reach = reach.max(insn.target().unwrap_or(0));
             } else if !is_expression(&insn) && insn.op != Op::LOADB && !statement {
                 break;
             }
@@ -2019,7 +2037,13 @@ impl Lifter<'_> {
         // One whose parts need no statements reads as the source did; parts with statements
         // (through a flag) are the fallback.
         let mut last = None;
+        // (the first statement among the parts: without statements, no condition reaches past it;
+        // see `condition`)
+        let first_statement = (first + 1..end).find(|&i| self.statement_at(i)).unwrap_or(usize::MAX);
         for (statements, n) in [false, true].into_iter().flat_map(|s| (1..=tests.len()).rev().map(move |n| (s, n))) {
+            if !statements && tests[n - 1] > first_statement {
+                continue;
+            }
             let then_index = tests[n - 1] + 1;
             let then_pc = self.pc_at(then_index);
             let Some(nodes) = self.condition_nodes(&tests[..n], then_pc, &normalize) else { continue };
@@ -2121,6 +2145,12 @@ impl Lifter<'_> {
                     .fold(Regs::default(), |acc, &i| acc.union(self.live_in.get(i).copied().unwrap_or_default()));
                 let out = written.intersect(after).iter().collect::<Vec<_>>();
                 if !out.is_empty() && !statements {
+                    return Err(self.unsupported("condition code with statements"));
+                }
+                // (known without lifting it: a call whose results nobody takes, or a global or
+                // upvalue store, is a statement. Lifting first can cost the whole branch, nested
+                // `if`s and all, when the candidate's last part is the jump over an else)
+                if !statements && (tests[n - 1] + 1..k).any(|i| self.statement_at(i)) {
                     return Err(self.unsupported("condition code with statements"));
                 }
                 for &r in &out {
