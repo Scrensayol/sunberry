@@ -2821,6 +2821,19 @@ impl Lifter<'_> {
         breaks
     }
 
+    // whether a for loop's back-edge at pc `t` goes to the top of its body: the compiler threads
+    // it through JUMPs there, and through one it then turned into a copy of the RETURN it led
+    // to (`for ... do break end` right before a `break` out of an enclosing loop that ends
+    // the function)
+    fn back_to_top(&self, prep: usize, t: usize) -> bool {
+        if self.exits_from(prep + 1).contains(&t) {
+            return true;
+        }
+        let top = self.insns.get(prep + 1);
+        let target = self.index_of.get(t).filter(|&&i| i != usize::MAX).and_then(|&i| self.insns.get(i));
+        matches!((top, target), (Some(a), Some(b)) if a.op == Op::RETURN && b.op == Op::RETURN && a.a == b.a && a.b == b.b)
+    }
+
     fn numeric_for(&mut self, prep: usize, end: usize, exits: &[usize]) -> Result<usize, Error> {
         let insn = self.insns[prep];
         let a = insn.a;
@@ -2831,8 +2844,7 @@ impl Lifter<'_> {
         };
         let exit = back + 1;
         // (the back-edge is threaded too: through JUMPs at the top of the body)
-        let top = self.exits_from(prep + 1);
-        if self.insns[back].op != Op::FORNLOOP || !self.insns[back].target().is_some_and(|t| top.contains(&t)) {
+        if self.insns[back].op != Op::FORNLOOP || !self.insns[back].target().is_some_and(|t| self.back_to_top(prep, t)) {
             return Err(self.unsupported("FORNPREP without its FORNLOOP"));
         }
         // evaluated from, to, step: the order the source has them
@@ -2857,8 +2869,7 @@ impl Lifter<'_> {
         let a = insn.a;
         let back = self.idx(insn.target().unwrap())?;
         let looping = self.insns[back];
-        let top = self.exits_from(prep + 1);
-        if looping.op != Op::FORGLOOP || !looping.target().is_some_and(|t| top.contains(&t)) {
+        if looping.op != Op::FORGLOOP || !looping.target().is_some_and(|t| self.back_to_top(prep, t)) {
             return Err(self.unsupported("FORGPREP without its FORGLOOP"));
         }
         let exit = back + 1;

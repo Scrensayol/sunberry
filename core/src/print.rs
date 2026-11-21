@@ -4,8 +4,10 @@ use crate::ast::{BinOp, Capture, Closure, Expr, Field, Function, Stmt, UnOp};
 
 const KEYWORDS: &[&str] = &[
     "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in", "local", "nil", "not",
-    "or", "repeat", "return", "then", "true", "until", "while", "continue",
+    "or", "repeat", "return", "then", "true", "until", "while",
 ];
+// (`continue` isn't one: Luau only reads it as a statement where it can't be a call or an
+// assignment, so `while continue do` reads a variable)
 
 pub fn is_identifier(name: &[u8]) -> bool {
     let Ok(name) = std::str::from_utf8(name) else { return false };
