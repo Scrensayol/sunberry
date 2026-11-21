@@ -1,64 +1,64 @@
 local v1 = {}
 v1.__index = v1
-function v1.new(p2)
-	local self = setmetatable({x = p2}, v1)
-	local v3 = setmetatable({x = -p2}, v1)
-	self.peer = v3
+function v1.new(x)
+	local self = setmetatable({x = x}, v1)
+	local v2 = setmetatable({x = -x}, v1)
+	self.peer = v2
 	function self.get()
-		return self.x + v3.x
+		return self.x + v2.x
 	end
 	return self
 end
 function v1:clone()
 	return (setmetatable({x = self.x}, v1))
 end
-function v1.spawner(p4)
-	return function(p5)
-		return (setmetatable({x = p4.x + p5}, v1))
+function v1:spawner()
+	return function(p3)
+		return (setmetatable({x = self.x + p3}, v1))
 	end
 end
-local v6 = setmetatable({}, {__index = v1})
-v6.__index = v6
-function v6.new(p7)
-	local self = setmetatable(v1.new(p7), v6)
+local v4 = setmetatable({}, {__index = v1})
+v4.__index = v4
+function v4.new(p5)
+	local self = setmetatable(v1.new(p5), v4)
 	self.sub = true
 	return self
 end
 local function signal()
-	local v8 = {}
+	local v6 = {}
 	return {
-		Connect = function(_, p9)
-			table.insert(v8, p9)
+		Connect = function(_, p7)
+			table.insert(v6, p7)
 		end,
 		Fire = function(_, ...)
-			for _, v in v8 do
+			for _, v in v6 do
 				v(...)
 			end
 		end
 	}
 end
-local v10 = {PlayerAdded = signal(), Stepped = signal()}
-local v11 = {}
+local v8 = {PlayerAdded = signal(), Stepped = signal()}
+local v9 = {}
 local function onStep(time, deltaTime)
-	table.insert(v11, time + deltaTime)
+	table.insert(v9, time + deltaTime)
 end
-v10.PlayerAdded:Connect(function(player)
-	table.insert(v11, player .. " joined")
+v8.PlayerAdded:Connect(function(player)
+	table.insert(v9, player .. " joined")
 end)
-v10.Stepped:Connect(onStep)
-v10.PlayerAdded:Fire("luna")
-v10.Stepped:Fire(1, 0.5)
-local v12 = {
+v8.Stepped:Connect(onStep)
+v8.PlayerAdded:Fire("luna")
+v8.Stepped:Fire(1, 0.5)
+local v10 = {
 	GetChildren = function(_)
 		return {"a", "b", "c"}
 	end
 }
-for _, child in v12:GetChildren() do
-	table.insert(v11, child)
+for _, child in v10:GetChildren() do
+	table.insert(v9, child)
 end
-for i, child2 in ipairs(v12:GetChildren()) do
-	table.insert(v11, i .. child2)
+for i, child2 in ipairs(v10:GetChildren()) do
+	table.insert(v9, i .. child2)
 end
-local v13 = v1.new(2)
-local v14 = v6.new(5)
-print(v13.get(), v13:clone().x, v13:spawner()(3).x, v14.sub, v14.get(), table.concat(v11, ","))
+local v11 = v1.new(2)
+local v12 = v4.new(5)
+print(v11.get(), v11:clone().x, v11:spawner()(3).x, v12.sub, v12.get(), table.concat(v9, ","))

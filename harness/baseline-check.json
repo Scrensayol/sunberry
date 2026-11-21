@@ -3,7 +3,13 @@
   "failing": {
     "sunberry": [
       "captured_args O2g1",
-      "captured_args O2g2"
+      "captured_args O2g2",
+      "nested_inlining O2g1",
+      "nested_inlining O2g2",
+      "refusals O1g1",
+      "refusals O1g2",
+      "refusals O2g1",
+      "refusals O2g2"
     ]
   }
 }

@@ -95,34 +95,33 @@ local v17 = {}
 for i4 = 1, 3 do
 	local v18 = i4 * 2
 	if i4 ~= 2 then
-		local function v19()
+		table.insert(v17, function()
 			return i4 + v18
-		end
-		table.insert(v17, v19)
+		end)
 	end
 end
-local v20 = {}
+local v19 = {}
 for _, v7 in v17 do
-	table.insert(v20, v7())
+	table.insert(v19, v7())
 end
-print(table.concat(v20, ","))
-local function f2(p21, p22)
-	local v23 = 0
-	for _, v10 in p21 do
-		v23 += 1
+print(table.concat(v19, ","))
+local function f2(p20, p21)
+	local v22 = 0
+	for _, v10 in p20 do
+		v22 += 1
 		if v10 > 10 then
-			if p22 then
+			if p21 then
 				print("big flag", v10)
-				return v23
+				return v22
 			end
 			print("big", v10)
-			return -v23
+			return -v22
 		end
 	end
 	return 0
 end
-local function g2(p24)
-	for _, v13 in p24 do
+local function g2(p23)
+	for _, v13 in p23 do
 		if v13 == 1 then
 			print("one")
 			return

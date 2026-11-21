@@ -68,6 +68,43 @@ fn is_prefix(expr: &Expr) -> bool {
     )
 }
 
+// the operands of a chain of one operator, `a or b or c` however it nests
+fn flatten<'e>(op: BinOp, e: &'e Expr, out: &mut Vec<&'e Expr>) {
+    match e {
+        Expr::Binary(o, left, right) if *o == op => {
+            flatten(op, left, out);
+            flatten(op, right, out);
+        }
+        e => out.push(e),
+    }
+}
+
+fn is_chain(e: &Expr) -> bool {
+    matches!(e, Expr::Binary(BinOp::And | BinOp::Or, ..))
+}
+
+// printed text moved one level deeper (strings never hold a raw line break)
+fn deeper(text: &str) -> String {
+    text.replace('\n', "\n\t")
+}
+
+// whether parts joined by `sep` fit in `limit` on the lines where they meet: the lines inside a
+// part spread over several (a closure, a table, a wrapped call) were already laid out at its level
+fn fits(parts: &[&str], sep: &str, limit: usize) -> bool {
+    let mut line = 0;
+    for (i, part) in parts.iter().enumerate() {
+        let first = part.split('\n').next().unwrap();
+        line += if i == 0 { 0 } else { sep.len() } + first.len();
+        if let Some((_, last)) = part.rsplit_once('\n') {
+            if line > limit {
+                return false;
+            }
+            line = last.len();
+        }
+    }
+    line <= limit
+}
+
 pub fn number(n: f64) -> String {
     // 0 / 0 makes x86's default NaN, which has the sign bit set; negating it clears the sign.
     // The lifter refuses NaNs with any other payload.
@@ -132,36 +169,77 @@ fn escape_into(bytes: &[u8], quote: char, out: &mut String) {
     }
 }
 
-// whether `local` is indexed or has a method called on it in `body` (closures inside see it
-// through their captures, which can't be a parameter's own uses)
-fn used_as_object(body: &[Stmt], local: u32) -> bool {
-    fn expr(e: &Expr, local: u32) -> bool {
-        match e {
-            Expr::Index(t, k) => **t == Expr::Local(local) || expr(t, local) || expr(k, local),
-            Expr::MethodCall { object, args, .. } => **object == Expr::Local(local) || expr(object, local) || args.iter().any(|a| expr(a, local)),
-            Expr::Call { func, args, .. } => expr(func, local) || args.iter().any(|a| expr(a, local)),
-            Expr::Binary(_, a, b) => expr(a, local) || expr(b, local),
-            Expr::Unary(_, a) => expr(a, local),
-            Expr::IfElse(a, b, c) => expr(a, local) || expr(b, local) || expr(c, local),
-            Expr::Table(fields) => fields.iter().any(|f| match f {
-                Field::Positional(v) => expr(v, local),
-                Field::Keyed(k, v) => expr(k, local) || expr(v, local),
-            }),
-            _ => false,
-        }
-    }
-    body.iter().any(|stmt| {
-        let here = match stmt {
-            Stmt::Local { values, .. } | Stmt::Return(values) => values.iter().any(|v| expr(v, local)),
-            Stmt::Assign { targets, values } => targets.iter().chain(values).any(|v| expr(v, local)),
-            Stmt::Call(e) => expr(e, local),
-            Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::Repeat { cond, .. } => expr(cond, local),
-            Stmt::NumericFor { from, to, step, .. } => expr(from, local) || expr(to, local) || step.as_ref().is_some_and(|s| expr(s, local)),
-            Stmt::GenericFor { values, .. } => values.iter().any(|v| expr(v, local)),
-            Stmt::LocalFunction { .. } | Stmt::Break | Stmt::Continue | Stmt::Do(_) => false,
+// whether `local` is indexed or has a method called on it in `body`, or in a closure there that
+// captures it
+fn used_as_object(functions: &[Function], body: &[Stmt], local: u32) -> bool {
+    fn uses(functions: &[Function], body: &[Stmt], var: &Expr) -> bool {
+        let expr = |e: &Expr| {
+            let mut found = false;
+            visit_expr(e, &mut |e| match e {
+                Expr::Index(t, _) | Expr::MethodCall { object: t, .. } if **t == *var => found = true,
+                Expr::Closure(c) => found |= captured_use(functions, c, var),
+                _ => {}
+            });
+            found
         };
-        here || stmt.bodies().into_iter().any(|b| used_as_object(b, local))
-    })
+        body.iter().any(|stmt| {
+            let here = match stmt {
+                Stmt::Local { values, .. } | Stmt::Return(values) => values.iter().any(expr),
+                Stmt::Assign { targets, values } => targets.iter().chain(values).any(expr),
+                Stmt::Call(e) => expr(e),
+                Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::Repeat { cond, .. } => expr(cond),
+                Stmt::NumericFor { from, to, step, .. } => expr(from) || expr(to) || step.as_ref().is_some_and(expr),
+                Stmt::GenericFor { values, .. } => values.iter().any(expr),
+                Stmt::LocalFunction { closure, .. } => captured_use(functions, closure, var),
+                Stmt::Break | Stmt::Continue | Stmt::Do(_) => false,
+            };
+            here || stmt.bodies().into_iter().any(|b| uses(functions, b, var))
+        })
+    }
+    fn captured_use(functions: &[Function], closure: &Closure, var: &Expr) -> bool {
+        closure.captures.iter().enumerate().any(|(k, c)| {
+            let same = match (c, var) {
+                (Capture::Local(l), Expr::Local(v)) => l == v,
+                (Capture::Upvalue(u), Expr::Upvalue(v)) => u == v,
+                _ => false,
+            };
+            same && uses(functions, &functions[closure.proto].body, &Expr::Upvalue(k as u8))
+        })
+    }
+    uses(functions, body, &Expr::Local(local))
+}
+
+// every expression inside `e`, `e` included, but not inside functions it creates
+fn visit_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
+    f(e);
+    match e {
+        Expr::Index(a, b) | Expr::Binary(_, a, b) => {
+            visit_expr(a, f);
+            visit_expr(b, f);
+        }
+        Expr::Unary(_, a) => visit_expr(a, f),
+        Expr::IfElse(a, b, c) => {
+            visit_expr(a, f);
+            visit_expr(b, f);
+            visit_expr(c, f);
+        }
+        Expr::Call { func, args, .. } => {
+            visit_expr(func, f);
+            args.iter().for_each(|a| visit_expr(a, f));
+        }
+        Expr::MethodCall { object, args, .. } => {
+            visit_expr(object, f);
+            args.iter().for_each(|a| visit_expr(a, f));
+        }
+        Expr::Table(fields) => fields.iter().for_each(|field| match field {
+            Field::Positional(v) => visit_expr(v, f),
+            Field::Keyed(k, v) => {
+                visit_expr(k, f);
+                visit_expr(v, f);
+            }
+        }),
+        _ => {}
+    }
 }
 
 fn compound(target: &Expr) -> bool {
@@ -566,9 +644,19 @@ impl Printer<'_> {
                     format!("function {path}{}", &function["function".len()..])
                 }
             }
+            Stmt::Local { locals, values } if locals.len() == 1 && values.len() == 1 && is_chain(&values[0]) => {
+                let name = self.declare(locals[0]);
+                let prefix = format!("local {name} = ");
+                format!("{prefix}{}", self.chain(&values[0], prefix.len(), indent))
+            }
             Stmt::Local { locals, values } => {
+                // `Roact.Component:extend("Name")` makes a class whose functions are methods
+                let class = matches!(&values[..], [Expr::MethodCall { method, args, .. }] if method == b"extend" && matches!(args[..], [Expr::String(_)]));
                 let values = self.list_for(values, locals.len(), indent);
                 let names = locals.iter().map(|&l| self.declare(l)).collect::<Vec<_>>();
+                if class {
+                    self.class_tables.insert(names[0].clone());
+                }
                 if values.is_empty() {
                     format!("local {}", names.join(", "))
                 } else {
@@ -591,6 +679,10 @@ impl Printer<'_> {
                 let target = self.expr(target, indent);
                 format!("{target} {symbol}= {}", self.expr(right, indent))
             }
+            Stmt::Assign { targets, values } if targets.len() == 1 && values.len() == 1 && is_chain(&values[0]) => {
+                let prefix = format!("{} = ", self.expr(&targets[0], indent));
+                format!("{prefix}{}", self.chain(&values[0], prefix.len(), indent))
+            }
             Stmt::Assign { targets, values } => {
                 let targets = targets.iter().map(|t| self.expr(t, indent)).collect::<Vec<_>>();
                 let values = self.list_for(values, targets.len(), indent);
@@ -599,6 +691,7 @@ impl Printer<'_> {
             // a string literal can't start a statement, so no interpolation here
             Stmt::Call(Expr::MethodCall { object, method, args, .. }) => self.method_call(object, method, args, indent),
             Stmt::Call(call) => self.expr(call, indent),
+            Stmt::Return(values) if values.len() == 1 && is_chain(&values[0]) => format!("return {}", self.chain(&values[0], "return ".len(), indent)),
             Stmt::Return(values) => {
                 let values = self.list(values, indent);
                 if values.is_empty() { "return".into() } else { format!("return {values}") }
@@ -620,7 +713,7 @@ impl Printer<'_> {
                 let mut out = "repeat\n".to_string();
                 self.block(body, indent + 1, &mut out);
                 // the condition sees the body's locals, so it is printed after them
-                let cond = self.expr(cond, indent);
+                let cond = if is_chain(cond) { self.chain(cond, "until ".len(), indent) } else { self.expr(cond, indent) };
                 out.push_str(&"\t".repeat(indent));
                 out.push_str(&format!("until {cond}"));
                 out
@@ -822,7 +915,9 @@ impl Printer<'_> {
                 let (lp, rp) = (precedence(left), precedence(right));
                 let compare = p == COMPARE;
                 let left = self.operand(left, lp < p || (lp == p && (right_assoc || compare)), indent);
-                let right = self.operand(right, rp < p || (rp == p && (!right_assoc || compare)), indent);
+                // `a and (b and c)` is `a and b and c`: same value, same order of evaluation
+                let same = matches!(op, BinOp::And | BinOp::Or) && matches!(right.as_ref(), Expr::Binary(o, ..) if o == op);
+                let right = self.operand(right, rp < p || (rp == p && (!right_assoc || compare) && !same), indent);
                 format!("{left} {symbol} {right}")
             }
             // `a ~= b` is defined as `not (a == b)`, metamethods included (unlike `<`, where
@@ -849,27 +944,56 @@ impl Printer<'_> {
                 let mut branches = Vec::new();
                 let mut rest = expr;
                 while let Expr::IfElse(cond, a, b) = rest {
-                    let cond = self.operand(cond, precedence(cond) == IF_ELSE, indent + 1);
-                    let a = self.operand(a, precedence(a) == IF_ELSE, indent + 1);
-                    branches.push((cond, a));
+                    let cond_text = self.operand(cond, precedence(cond) == IF_ELSE, indent + 1);
+                    let text = self.operand(a, precedence(a) == IF_ELSE, indent + 1);
+                    branches.push((Some(cond_text), a.as_ref(), text));
                     rest = b;
                 }
-                let otherwise = self.expr(rest, indent + 1);
-                let mut parts = branches
+                let text = self.expr(rest, indent + 1);
+                branches.push((None, rest, text));
+                let heads = branches
                     .iter()
                     .enumerate()
-                    .map(|(i, (cond, a))| format!("{} {cond} then {a}", if i == 0 { "if" } else { "elseif" }))
+                    .map(|(i, (cond, ..))| match cond {
+                        Some(cond) => format!("{} {cond} then", if i == 0 { "if" } else { "elseif" }),
+                        None => "else".into(),
+                    })
                     .collect::<Vec<_>>();
-                parts.push(format!("else {otherwise}"));
-                let line = parts.join(" ");
-                if line.len() <= 100 || line.contains('\n') {
-                    line
-                } else {
-                    parts.join(&format!("\n{}", "\t".repeat(indent + 1)))
+                let parts = heads.iter().zip(&branches).map(|(head, (.., text))| format!("{head} {text}")).collect::<Vec<_>>();
+                // a nested if-expression spread over lines reads best with every branch around it on its own line
+                let nested = branches.iter().any(|(_, value, text)| matches!(value, Expr::IfElse(..)) && text.contains('\n'));
+                if !nested && fits(&parts.iter().map(String::as_str).collect::<Vec<_>>(), " ", 100) {
+                    return parts.join(" ");
                 }
+                // a value too long to follow its condition goes on a line of its own below it
+                let mut lines = Vec::new();
+                for (head, (.., text)) in heads.iter().zip(&branches) {
+                    if fits(&[head, text], " ", 120) {
+                        lines.push(format!("{head} {text}"));
+                    } else {
+                        lines.push(format!("{head}\n{}{}", "\t".repeat(indent + 2), deeper(text)));
+                    }
+                }
+                lines.join(&format!("\n{}", "\t".repeat(indent + 1)))
             }
             Expr::Tested(_) => unreachable!("value regions never leave a tested placeholder"),
         }
+    }
+
+    // A statement's only value that is an `and`/`or` chain; past 120 characters (with the
+    // statement's start, `prefix` long) a line per operand of its loosest operator. Each
+    // operand is printed once: printing a closure again would name its locals again.
+    fn chain(&mut self, value: &Expr, prefix: usize, indent: usize) -> String {
+        let Expr::Binary(op, ..) = value else { unreachable!() };
+        let mut parts = Vec::new();
+        flatten(*op, value, &mut parts);
+        let (p, _, symbol) = binary_precedence(*op);
+        let texts = parts.iter().map(|part| self.operand(part, precedence(part) <= p, indent + 1)).collect::<Vec<_>>();
+        let line = texts.join(&format!(" {symbol} "));
+        if prefix + line.len() <= 120 || line.contains('\n') {
+            return line;
+        }
+        texts.join(&format!("\n{}{symbol} ", "\t".repeat(indent + 1)))
     }
 
     // an `if` or `while` condition; a long `a and b or c` chain gets a line per operand of its
@@ -880,23 +1004,14 @@ impl Printer<'_> {
         if line.len() <= 100 || line.contains('\n') {
             return line;
         }
-        // `(a or b) or c` reads as `a or b or c`; a same-operator right side keeps its parentheses
+        // `(a or b) or c` and `a or (b or c)` both read as `a or b or c`
         let mut parts = Vec::new();
-        let mut rest = cond;
-        while let Expr::Binary(o, left, right) = rest
-            && o == op
-        {
-            parts.push(right.as_ref());
-            rest = left;
-        }
-        parts.push(rest);
-        parts.reverse();
+        flatten(*op, cond, &mut parts);
         let (p, _, symbol) = binary_precedence(*op);
         let inner = "\t".repeat(indent + 1);
         let mut out = String::from("\n");
         for (i, part) in parts.iter().enumerate() {
-            let wrap = if i == 0 { precedence(part) < p } else { precedence(part) <= p };
-            let text = self.operand(part, wrap, indent + 1);
+            let text = self.operand(part, precedence(part) <= p, indent + 1);
             out.push_str(&inner);
             if i > 0 {
                 out.push_str(symbol);
@@ -917,17 +1032,20 @@ impl Printer<'_> {
     // `f(a, b)`; past 120 characters, with two or more arguments that fit on a line each, one
     // argument per line
     fn arguments(&mut self, func: String, args: &[Expr], indent: usize) -> String {
-        let list = self.list(args, indent);
-        if args.len() < 2 || func.len() + list.len() <= 120 || list.contains('\n') || func.contains('\n') {
-            return format!("{func}({list})");
-        }
-        let last = args.len() - 1;
-        let inner = "\t".repeat(indent + 1);
-        let lines = args
+        let last = args.len().saturating_sub(1);
+        let items = args
             .iter()
             .enumerate()
-            .map(|(i, a)| format!("{inner}{}", if i == last { self.expr_last(a, indent + 1) } else { self.expr(a, indent + 1) }))
+            .map(|(i, a)| if i == last { self.expr_last(a, indent) } else { self.expr(a, indent) })
             .collect::<Vec<_>>();
+        let list = items.join(", ");
+        let open = format!("{func}(");
+        if args.len() < 2 || fits(&[&open, &list, ")"], "", 120) || func.contains('\n') {
+            return format!("{func}({list})");
+        }
+        // printed once: printing a closure again would name its locals again
+        let inner = "\t".repeat(indent + 1);
+        let lines = items.iter().map(|item| format!("{inner}{}", deeper(item))).collect::<Vec<_>>();
         format!("{func}(\n{}\n{})", lines.join(",\n"), "\t".repeat(indent))
     }
 
@@ -984,7 +1102,9 @@ impl Printer<'_> {
             Some(n) => n == b"self",
             None => {
                 let class = self.path(table).is_some_and(|p| self.class_tables.contains(&p));
-                (class || self.methods.contains(name)) && used_as_object(&function.body, first)
+                // React calls these on the class, not on an object
+                let stat = matches!(name, b"getDerivedStateFromProps" | b"getDerivedStateFromError");
+                (class || self.methods.contains(name)) && !stat && used_as_object(self.functions, &function.body, first)
             }
         };
         let parent = self.scopes.last().unwrap();

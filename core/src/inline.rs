@@ -32,10 +32,15 @@ pub fn reason(why: &'static str) {
 }
 
 // a function as lifted, before the output-only passes (pinning, `do` scoping)
+#[derive(Clone)]
 pub struct Raw {
+    // false for a function whose first lift failed: nothing is known about its body
+    pub ok: bool,
     pub params: Vec<u32>,
     pub is_vararg: bool,
     pub body: Vec<Stmt>,
+    // parameters the compiler's type info says are booleans
+    pub flags: Vec<bool>,
 }
 
 // instructions whose lines belong to other functions' bodies, in runs without control flow
@@ -56,6 +61,11 @@ pub struct Ctx {
     pub runs: Vec<Vec<Run>>,
     // for each function, instruction index -> candidate callees there (innermost first)
     pub callees: Vec<HashMap<usize, Vec<usize>>>,
+    // for each function, the functions it calls by the local they're kept in (which an
+    // inlined copy of it may have had inlined into it too)
+    pub calls: Vec<Vec<usize>>,
+    // whether it calls one of its parameters (a function passed in can be inlined with it)
+    pub calls_param: Vec<bool>,
 }
 
 impl Ctx {
@@ -64,9 +74,11 @@ impl Ctx {
     }
 }
 
-// an inlined body never contains a RETURN of its own (its returns jump to the end)
-fn breaks_run(insn: &crate::bytecode::Insn) -> bool {
-    insn.op == Op::RETURN
+// an inlined body never contains a RETURN of its own (its returns jump to the end), except
+// where Luau copied the RETURN a jump went to over the jump: one with a copy further on
+fn breaks_run(insns: &[crate::bytecode::Insn], i: usize) -> bool {
+    let r = &insns[i];
+    r.op == Op::RETURN && (r.b == 0 || !insns[i + 1..].iter().any(|o| o.op == Op::RETURN && o.a == r.a && o.b == r.b))
 }
 
 pub fn context(chunk: &Chunk, raw: Vec<Raw>, functions: &[Function]) -> Ctx {
@@ -87,8 +99,23 @@ pub fn context(chunk: &Chunk, raw: Vec<Raw>, functions: &[Function]) -> Ctx {
             continue;
         }
         let insns = proto.insns();
-        let last = lines[insns.last().unwrap().pc];
         let first = proto.line_defined;
+        // (its last instruction can carry an inlined function's line: then its own lines end
+        // before the next function defined after it that isn't inside it)
+        let mut last = lines[insns.last().unwrap().pc];
+        let inside = |mut x: usize| {
+            while x != usize::MAX {
+                if x == q {
+                    return true;
+                }
+                x = parent[x];
+            }
+            false
+        };
+        let next = (0..n).filter(|&o| !inside(o) && chunk.protos[o].line_defined > first).map(|o| chunk.protos[o].line_defined).min().unwrap_or(u32::MAX);
+        if last < first {
+            last = insns.iter().map(|i| lines[i.pc]).filter(|&l| l >= first && l < next).max().unwrap_or(first);
+        }
         span[q] = last.saturating_sub(first);
         let mut own = insns.iter().map(|i| lines[i.pc]).filter(|&l| l >= first && l <= last).collect::<Vec<_>>();
         own.sort_unstable();
@@ -116,7 +143,7 @@ pub fn context(chunk: &Chunk, raw: Vec<Raw>, functions: &[Function]) -> Ctx {
             let mut i = 0;
             while i < insns.len() {
                 let start = i;
-                while i < insns.len() && !breaks_run(&insns[i]) {
+                while i < insns.len() && !breaks_run(&insns, i) {
                     let found = by_line
                         .get(&lines[insns[i].pc])
                         .map(|qs| qs.iter().copied().filter(|&q| q != c && !ancestors.contains(&q)).collect::<Vec<_>>())
@@ -168,13 +195,83 @@ pub fn context(chunk: &Chunk, raw: Vec<Raw>, functions: &[Function]) -> Ctx {
             Capture::Upvalue(k) => resolve(parent, *k as usize, site, captures, depth + 1),
         }
     }
-    let origin = chunk
+    let origin: Vec<Vec<Option<(usize, u32)>>> = chunk
         .protos
         .iter()
         .enumerate()
         .map(|(x, proto)| (0..proto.num_upvalues as usize).map(|u| resolve(x, u, &site, &captures, 0)).collect())
         .collect();
-    Ctx { raw, site, origin, holder, runs, callees }
+    // what each function calls through an upvalue, as the functions kept there
+    let mut calls = Vec::with_capacity(n);
+    let mut calls_param = Vec::with_capacity(n);
+    for f in 0..n {
+        let mut funcs = Vec::new();
+        for stmt in &raw[f].body {
+            called(stmt, &mut funcs);
+        }
+        calls.push(
+            (0..n)
+                .filter(|&q| {
+                    holder[q].is_some_and(|h| funcs.iter().any(|e| matches!(e, Expr::Upvalue(u) if origin[f].get(*u as usize) == Some(&Some(h)))))
+                })
+                .collect(),
+        );
+        calls_param.push(funcs.iter().any(|e| matches!(e, Expr::Local(l) if raw[f].params.contains(l))));
+    }
+    Ctx { raw, site, origin, holder, runs, callees, calls, calls_param }
+}
+
+// the function expressions a statement calls, nested statements included (not closures')
+fn called(stmt: &Stmt, out: &mut Vec<Expr>) {
+    fn expr(e: &Expr, out: &mut Vec<Expr>) {
+        match e {
+            Expr::Index(a, b) | Expr::Binary(_, a, b) => {
+                expr(a, out);
+                expr(b, out);
+            }
+            Expr::Unary(_, a) => expr(a, out),
+            Expr::IfElse(a, b, c) => {
+                expr(a, out);
+                expr(b, out);
+                expr(c, out);
+            }
+            Expr::Call { func, args, .. } => {
+                out.push((**func).clone());
+                expr(func, out);
+                args.iter().for_each(|a| expr(a, out));
+            }
+            Expr::MethodCall { object, args, .. } => {
+                expr(object, out);
+                args.iter().for_each(|a| expr(a, out));
+            }
+            Expr::Table(fields) => fields.iter().for_each(|f| match f {
+                Field::Positional(v) => expr(v, out),
+                Field::Keyed(k, v) => {
+                    expr(k, out);
+                    expr(v, out);
+                }
+            }),
+            _ => {}
+        }
+    }
+    match stmt {
+        Stmt::Local { values, .. } | Stmt::Return(values) => values.iter().for_each(|v| expr(v, out)),
+        Stmt::Assign { targets, values } => targets.iter().chain(values).for_each(|v| expr(v, out)),
+        Stmt::Call(e) => expr(e, out),
+        Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::Repeat { cond, .. } => expr(cond, out),
+        Stmt::NumericFor { from, to, step, .. } => {
+            expr(from, out);
+            expr(to, out);
+            step.iter().for_each(|s| expr(s, out));
+        }
+        Stmt::GenericFor { values, .. } => values.iter().for_each(|v| expr(v, out)),
+        Stmt::LocalFunction { .. } | Stmt::Break | Stmt::Continue | Stmt::Do(_) => {}
+    }
+    for body in stmt.bodies() {
+        for s in body {
+            called(s, out);
+        }
+    }
 }
 
 fn visit_closures(body: &[Stmt], f: &mut dyn FnMut(&Closure, Option<u32>)) {
@@ -244,6 +341,8 @@ pub struct Sub {
     // locals holding what was in registers when the region started: register, and whether
     // it was a temporary (an argument evaluated for this call) rather than a local
     pub start: HashMap<u32, (u8, bool)>,
+    // lifted with jumps to the end as `return`s of the results (see `Lifter::sandbox`)
+    pub returns: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -262,12 +361,13 @@ pub enum Upvalues<'a> {
     // created in the caller: its closure's captures there
     Here(&'a [Capture]),
     // created in an enclosing function: the caller sees the same variables as its upvalues
-    Outer { callee: usize, caller: usize },
+    // (its own, then the new ones in `extra`, see `Lifter::extra`)
+    Outer { callee: usize, caller: usize, extra: &'a [usize] },
 }
 
 pub fn unify(ctx: &Ctx, callee: usize, upvalues: Upvalues, sub: &Sub) -> Option<Plan> {
     let raw = &ctx.raw[callee];
-    if raw.is_vararg {
+    if raw.is_vararg || !raw.ok {
         return None;
     }
     let mutated = raw.params.iter().map(|&p| assigned(ctx, &raw.body, &Expr::Local(p))).collect::<Vec<_>>();
@@ -278,9 +378,17 @@ pub fn unify(ctx: &Ctx, callee: usize, upvalues: Upvalues, sub: &Sub) -> Option<
                 Some(Capture::Upvalue(k)) => *s == Expr::Upvalue(*k),
                 None => false,
             },
-            Upvalues::Outer { callee, caller } => {
+            Upvalues::Outer { callee, caller, extra } => {
                 let Some(Some(var)) = ctx.origin[*callee].get(u as usize) else { return false };
-                matches!(s, Expr::Upvalue(k) if ctx.origin[*caller].get(*k as usize) == Some(&Some(*var)))
+                let own = &ctx.origin[*caller];
+                match *s {
+                    Expr::Upvalue(k) if (k as usize) < own.len() => own[k as usize] == Some(*var),
+                    // one the caller gets for a function it calls made back (one level down)
+                    Expr::Upvalue(k) => extra.get(k as usize - own.len()).is_some_and(|&p| ctx.holder[p] == Some(*var)),
+                    // the local itself, where the caller declares it
+                    Expr::Local(l) => *var == (*caller, l),
+                    _ => false,
+                }
             }
         }
     };
@@ -295,12 +403,28 @@ pub fn unify(ctx: &Ctx, callee: usize, upvalues: Upvalues, sub: &Sub) -> Option<
         map: HashMap::new(),
         taken: HashSet::new(),
         results: None,
+        returns: false,
+        flags: raw.flags.clone(),
     };
     let body = normalize(&raw.body);
     let n = sub.targets.len();
     let values = &sub.values;
     let mut m = matcher();
-    let matched = match body.split_last() {
+    // both as function bodies, laid out alike: falling off the end returns nothing
+    if sub.returns {
+        let mut body = raw.body.clone();
+        if !ends_in_return(&body) {
+            body.push(Stmt::Return(Vec::new()));
+        }
+        m.returns = true;
+        if !m.stmts(&sink(normalize(&body)), &sink(normalize(&sub.stmts))) {
+            if why {
+                eprintln!("   (no match as returns; binds {:?})", m.binds);
+            }
+            return None;
+        }
+    }
+    let matched = sub.returns || match body.split_last() {
         // straight to one `return` at the end: its values are the result registers'
         Some((Stmt::Return(vals), prefix)) => {
             m.stmts(prefix, &sub.stmts) && {
@@ -385,6 +509,28 @@ fn normalize(body: &[Stmt]) -> Vec<Stmt> {
     out
 }
 
+// A body's last `return` after an `if` goes into the branches that don't end in one
+// (`if c then a() end; return` is `if c then a(); return else return end`), all the way
+// down: a branch reaching the end returns whether or not the code spells it out.
+fn sink(mut body: Vec<Stmt>) -> Vec<Stmt> {
+    let n = body.len();
+    if n >= 2 && matches!(body[n - 1], Stmt::Return(_)) && matches!(body[n - 2], Stmt::If { .. }) {
+        let ret = body.pop().unwrap();
+        let Some(Stmt::If { cond, then_body, else_body }) = body.pop() else { unreachable!() };
+        let with = |mut b: Vec<Stmt>| {
+            if !ends_in_return(&b) {
+                b.push(ret.clone());
+            }
+            sink(b)
+        };
+        body.push(Stmt::If { cond, then_body: with(then_body), else_body: with(else_body) });
+    } else if let Some(Stmt::If { then_body, else_body, .. }) = body.last_mut() {
+        *then_body = sink(std::mem::take(then_body));
+        *else_body = sink(std::mem::take(else_body));
+    }
+    body
+}
+
 fn if_stmt(cond: Expr, t: Vec<Stmt>, e: Vec<Stmt>) -> Stmt {
     if t.is_empty() && !e.is_empty() {
         Stmt::If { cond: Expr::Unary(UnOp::Not, Box::new(cond)), then_body: e, else_body: t }
@@ -393,7 +539,7 @@ fn if_stmt(cond: Expr, t: Vec<Stmt>, e: Vec<Stmt>) -> Stmt {
     }
 }
 
-fn ends_in_return(body: &[Stmt]) -> bool {
+pub fn ends_in_return(body: &[Stmt]) -> bool {
     match body.last() {
         Some(Stmt::Return(_)) => true,
         Some(Stmt::If { then_body, else_body, .. }) => ends_in_return(then_body) && ends_in_return(else_body),
@@ -479,7 +625,7 @@ fn assigned(ctx: &Ctx, body: &[Stmt], target: &Expr) -> bool {
                 Capture::Local(l) => Expr::Local(*l),
                 Capture::Upvalue(k) => Expr::Upvalue(*k),
             };
-            seen == *target && assigned(ctx, &ctx.raw[c.proto].body, &Expr::Upvalue(u as u8))
+            seen == *target && (!ctx.raw[c.proto].ok || assigned(ctx, &ctx.raw[c.proto].body, &Expr::Upvalue(u as u8)))
         })
     }
     let mut found = false;
@@ -505,6 +651,10 @@ struct Matcher<'a> {
     taken: HashSet<u32>,
     // the variables the region's branches assign the results to (`return` assigns them)
     results: Option<Vec<Expr>>,
+    // a `return` against one of the region's returns of its result registers
+    returns: bool,
+    // parameters typed boolean: one an inlined call left out was false, not nil
+    flags: Vec<bool>,
 }
 
 fn flipped(s: &Stmt) -> Stmt {
@@ -709,7 +859,7 @@ impl Matcher<'_> {
 
     fn closure(&mut self, a: &Closure, b: &Closure) -> bool {
         let (qa, qb) = (&self.ctx.raw[a.proto], &self.ctx.raw[b.proto]);
-        if a.captures.len() != b.captures.len() || qa.params.len() != qb.params.len() || qa.is_vararg != qb.is_vararg {
+        if !qa.ok || !qb.ok || a.captures.len() != b.captures.len() || qa.params.len() != qb.params.len() || qa.is_vararg != qb.is_vararg {
             return false;
         }
         let as_expr = |c: &Capture| match c {
@@ -734,6 +884,8 @@ impl Matcher<'_> {
             map: HashMap::new(),
             taken: HashSet::new(),
             results: None,
+            returns: false,
+            flags: Vec::new(),
         };
         qa.params.iter().zip(&qb.params).all(|(x, y)| inner.declare(*x, *y)) && inner.stmts(&qa.body, &qb.body)
     }
@@ -749,7 +901,60 @@ impl Matcher<'_> {
             let Some((Stmt::Assign { targets, values }, b)) = b.split_last() else { return false };
             return *targets == results && self.stmts(a, b) && self.result_list(vals, values);
         }
-        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| self.stmt(x, y))
+        let saved = (self.binds.clone(), self.map.clone(), self.taken.clone());
+        if a.len() == b.len() && a.iter().zip(b).all(|(x, y)| self.stmt(x, y)) {
+            return true;
+        }
+        (self.binds, self.map, self.taken) = saved;
+        // Luau inlines a call with missing arguments as if they were nil (and constant ones
+        // as those constants), and folds the branches that test them: `if dictionary then
+        // ... end` is gone from the copy. A parameter only such tests read was nil (false
+        // where it's typed boolean) or, if the branch for a truthy one is what's left, true.
+        let Some(k) = (0..a.len()).find(|&k| matches!(&a[k], Stmt::If { cond, .. } if self.foldable(cond))) else { return false };
+        let Stmt::If { cond, then_body, else_body } = &a[k] else { unreachable!() };
+        for truthy_guess in [false, true] {
+            let saved = (self.binds.clone(), self.map.clone(), self.taken.clone());
+            let mut uses = Vec::new();
+            visit_params(cond, &self.params, &mut uses);
+            for &i in &uses {
+                if self.binds[i] == Bind::Unbound {
+                    let falsy = if self.flags.get(i) == Some(&true) { Expr::Bool(false) } else { Expr::Nil };
+                    self.binds[i] = Bind::Const(if truthy_guess { Expr::Bool(true) } else { falsy });
+                }
+            }
+            if let Some(v) = self.eval(cond) {
+                let branch = if truthy(&v) { then_body } else { else_body };
+                let folded = a[..k].iter().chain(branch).chain(&a[k + 1..]).cloned().collect::<Vec<_>>();
+                // laid out again the way both sides were (a return the fold brought up)
+                let folded = normalize(&folded);
+                let folded = if self.returns { sink(folded) } else { folded };
+                if self.stmts(&folded, b) {
+                    return true;
+                }
+            }
+            (self.binds, self.map, self.taken) = saved;
+        }
+        false
+    }
+
+    // a condition that reads parameters (none of them assigned in the callee) and nothing else
+    // that isn't constant
+    fn foldable(&mut self, cond: &Expr) -> bool {
+        let mut uses = Vec::new();
+        visit_params(cond, &self.params, &mut uses);
+        if uses.is_empty() || uses.iter().any(|&i| self.mutated[i] || matches!(self.binds[i], Bind::Reg(_))) {
+            return false;
+        }
+        // with the unbound ones as nil, everything else in it has to fold too
+        let saved = self.binds.clone();
+        for &i in &uses {
+            if self.binds[i] == Bind::Unbound {
+                self.binds[i] = Bind::Const(Expr::Nil);
+            }
+        }
+        let ok = self.eval(cond).is_some();
+        self.binds = saved;
+        ok
     }
 
     fn stmt(&mut self, p: &Stmt, s: &Stmt) -> bool {
@@ -775,6 +980,7 @@ impl Matcher<'_> {
                 self.list(va, vb) && self.list(ta, tb)
             }
             (Stmt::Call(a), Stmt::Call(b)) => self.expr(a, b),
+            (Stmt::Return(a), Stmt::Return(b)) if self.returns => self.result_list(a, b),
             (Stmt::Return(a), Stmt::Return(b)) => self.list(a, b),
             (Stmt::If { .. }, s @ Stmt::If { .. }) => {
                 let (Stmt::If { cond: c, then_body: t, else_body: e }, Stmt::If { cond: d, then_body: u, else_body: f }) = (p, &flipped(s)) else {
@@ -946,5 +1152,29 @@ fn visit_closures_mut(body: &mut [Stmt], f: &mut dyn FnMut(&mut Closure)) {
         for nested in stmt.bodies_mut() {
             visit_closures_mut(nested, f);
         }
+    }
+}
+
+// the parameters (by index) `e` reads
+fn visit_params(e: &Expr, params: &[u32], out: &mut Vec<usize>) {
+    match e {
+        Expr::Local(l) => {
+            if let Some(i) = params.iter().position(|p| p == l)
+                && !out.contains(&i)
+            {
+                out.push(i);
+            }
+        }
+        Expr::Unary(_, a) => visit_params(a, params, out),
+        Expr::Binary(_, a, b) | Expr::Index(a, b) => {
+            visit_params(a, params, out);
+            visit_params(b, params, out);
+        }
+        Expr::IfElse(a, b, c) => {
+            visit_params(a, params, out);
+            visit_params(b, params, out);
+            visit_params(c, params, out);
+        }
+        _ => {}
     }
 }

@@ -20,10 +20,21 @@ pub fn infer(functions: &mut [Function], protos: &[Name], main: usize, script: O
     let mut params = HashMap::<usize, Vec<&'static str>>::new();
     for function in functions.iter() {
         event_handlers(&function.body, &mut HashMap::new(), &mut params);
+        // table.sort(list, function(a, b) ... end)
+        visit(&function.body, &mut |e| {
+            if let Expr::Call { func, args, .. } = e
+                && let [_, Expr::Closure(c)] = &args[..]
+                && let Expr::Index(t, k) = func.as_ref()
+                && **t == Expr::Global(b"table".to_vec())
+                && **k == Expr::String(b"sort".to_vec())
+            {
+                params.entry(c.proto).or_insert_with(|| vec!["a", "b"]);
+            }
+        });
     }
     for (id, function) in functions.iter_mut().enumerate() {
         let mut hints = vec![None; function.names.len()];
-        walk(&function.body, &mut hints, protos);
+        walk(&function.body, &mut hints, &function.names, protos);
         for (&param, name) in function.params.iter().zip(params.get(&id).into_iter().flatten()) {
             set(&mut hints, param, Some(name.as_bytes().to_vec()));
         }
@@ -37,6 +48,33 @@ pub fn infer(functions: &mut [Function], protos: &[Name], main: usize, script: O
         for (name, hint) in function.names.iter_mut().zip(hints) {
             if name.is_none() {
                 *name = hint;
+            }
+        }
+    }
+    // locals holding what a getter reached through an upvalue returns (`getSecTool()` called
+    // from another function), once the functions that hold those getters have their names
+    let up = upvalue_names(functions, main);
+    for (id, function) in functions.iter_mut().enumerate() {
+        let names = up.get(id).cloned().unwrap_or_default();
+        getter_locals(&function.body, &mut function.names, &names);
+    }
+    // then parameters named after what their calls pass (twice, so a name passed on through
+    // another function's parameter gets there too)
+    for _ in 0..2 {
+        // in a fixed order: which of two clashing names wins mustn't change from run to run
+        let mut names = call_site_names(functions, main).into_iter().collect::<Vec<_>>();
+        names.sort_by_key(|(key, _)| *key);
+        for ((id, i), name) in names {
+            let Some(name) = name else { continue };
+            let function = &mut functions[id];
+            // `transparency` next to `Transparency` would only confuse
+            let clash = function.params.iter().any(|&p| function.names.get(p as usize).cloned().flatten().is_some_and(|n| n.eq_ignore_ascii_case(&name)));
+            if let Some(&param) = function.params.get(i)
+                && let Some(slot) = function.names.get_mut(param as usize)
+                && slot.is_none()
+                && !clash
+            {
+                *slot = Some(name);
             }
         }
     }
@@ -78,14 +116,22 @@ fn set(hints: &mut [Name], local: u32, name: Name) {
     }
 }
 
-fn walk(body: &[Stmt], hints: &mut [Name], protos: &[Name]) {
-    let hint = |e: &Expr| match e {
+fn walk(body: &[Stmt], hints: &mut [Name], names: &[Name], protos: &[Name]) {
+    let hint = |e: &Expr, hints: &[Name]| match e {
         Expr::Closure(c) => proto_name(c, protos),
+        // `local secTool = getSecTool()`, with getSecTool a local function
+        Expr::Call { func, .. } if let Expr::Local(f) = func.as_ref() => {
+            let name = names.get(*f as usize).cloned().flatten().or_else(|| hints.get(*f as usize).cloned().flatten());
+            name.and_then(|n| getter(&n))
+        }
         e => hint(e),
     };
     for stmt in body {
         match stmt {
-            Stmt::Local { locals, values } if locals.len() == 1 && values.len() == 1 => set(hints, locals[0], hint(&values[0])),
+            Stmt::Local { locals, values } if locals.len() == 1 && values.len() == 1 => {
+                let name = hint(&values[0], hints);
+                set(hints, locals[0], name)
+            }
             Stmt::LocalFunction { local, closure } => set(hints, *local, proto_name(closure, protos)),
             Stmt::Local { locals, values } if locals.len() == 2 && values.len() == 1 && is_pcall(&values[0]) => {
                 set(hints, locals[0], Some(b"success".to_vec()));
@@ -93,7 +139,8 @@ fn walk(body: &[Stmt], hints: &mut [Name], protos: &[Name]) {
             }
             Stmt::Assign { targets, values } if targets.len() == 1 && values.len() == 1 => {
                 if let Expr::Local(l) = targets[0] {
-                    set(hints, l, hint(&values[0]));
+                    let name = hint(&values[0], hints);
+                    set(hints, l, name);
                 }
             }
             Stmt::NumericFor { var, .. } => set(hints, *var, Some(b"i".to_vec())),
@@ -113,7 +160,7 @@ fn walk(body: &[Stmt], hints: &mut [Name], protos: &[Name]) {
             _ => {}
         }
         for nested in stmt.bodies() {
-            walk(nested, hints, protos);
+            walk(nested, hints, names, protos);
         }
     }
 }
@@ -140,10 +187,20 @@ fn hint(e: &Expr) -> Name {
             Some(Expr::String(s)) => Some(s.clone()),
             _ => None,
         },
+        // part:GetMass() is the mass
+        Expr::MethodCall { method, .. } if getter(method).is_some() => getter(method),
+        // Roact.Component:extend("ScrollButton")
+        Expr::MethodCall { method, args, .. } if method == b"extend" => match &args[..] {
+            [Expr::String(s)] => Some(s.clone()),
+            _ => None,
+        },
         Expr::Call { func, args, .. } => match (func.as_ref(), args.first()) {
             // require(script.Parent.Signal)
             (Expr::Global(g), Some(path)) if g == b"require" => hint(path),
             (Expr::Global(g), None) if g == b"tick" => Some(b"time".to_vec()),
+            // getSecTool(), Util.getPlayerData(player)
+            (Expr::Global(name), _) if getter(name).is_some() => getter(name),
+            (Expr::Index(_, k), _) if let Expr::String(name) = k.as_ref() && getter(name).is_some() => getter(name),
             // setmetatable({}, Class) or setmetatable(Base.new(...), Class): a constructor's
             // object. The printer only uses `self` where no other self is in sight
             (Expr::Global(g), Some(object)) if g == b"setmetatable" && args.len() == 2 && constructed(object) => {
@@ -170,6 +227,81 @@ fn hint(e: &Expr) -> Name {
         Expr::Binary(crate::ast::BinOp::Or, a, _) => hint(a),
         _ => None,
     }
+}
+
+fn getter_locals(body: &[Stmt], names: &mut [Name], upvalues: &[Name]) {
+    for stmt in body {
+        if let Stmt::Local { locals, values } = stmt
+            && let ([local], [Expr::Call { func, .. }]) = (&locals[..], &values[..])
+            && let Expr::Upvalue(u) = func.as_ref()
+            && let Some(Some(name)) = upvalues.get(*u as usize)
+            && let Some(slot) = names.get_mut(*local as usize)
+            && slot.is_none()
+        {
+            *slot = getter(name);
+        }
+        for nested in stmt.bodies() {
+            getter_locals(nested, names, upvalues);
+        }
+    }
+}
+
+// each function's upvalues by name, following captures down from the main chunk
+fn upvalue_names(functions: &[Function], main: usize) -> Vec<Vec<Name>> {
+    fn walk(functions: &[Function], id: usize, up: Vec<Name>, depth: usize, out: &mut Vec<Vec<Name>>) {
+        if out[id].is_empty() {
+            out[id] = up.clone();
+        }
+        if depth > 64 {
+            return;
+        }
+        let function = &functions[id];
+        let mut found = Vec::new();
+        visit(&function.body, &mut |e| {
+            if let Expr::Closure(c) = e {
+                found.push(c.as_ref().clone());
+            }
+        });
+        fn local_closures(body: &[Stmt], out: &mut Vec<Closure>) {
+            for stmt in body {
+                if let Stmt::LocalFunction { closure, .. } = stmt {
+                    out.push(closure.clone());
+                }
+                for nested in stmt.bodies() {
+                    local_closures(nested, out);
+                }
+            }
+        }
+        local_closures(&function.body, &mut found);
+        for c in found {
+            let child = c
+                .captures
+                .iter()
+                .map(|cap| match cap {
+                    crate::ast::Capture::Local(l) => function.names.get(*l as usize).cloned().flatten(),
+                    crate::ast::Capture::Upvalue(u) => up.get(*u as usize).cloned().flatten(),
+                })
+                .collect::<Vec<_>>();
+            walk(functions, c.proto, child, depth + 1, out);
+        }
+    }
+    let mut out = vec![Vec::new(); functions.len()];
+    walk(functions, main, Vec::new(), 0, &mut out);
+    out
+}
+
+// what a getter gets: getSecTool is secTool, GetChildren is children
+fn getter(name: &[u8]) -> Name {
+    let rest = name.strip_prefix(b"get").or_else(|| name.strip_prefix(b"Get"))?;
+    if !rest.first()?.is_ascii_uppercase() {
+        return None;
+    }
+    let mut out = rest.to_vec();
+    // (an acronym stays as it is: GetUI is UI)
+    if out.get(1).is_none_or(|c| !c.is_ascii_uppercase()) {
+        out[0].make_ascii_lowercase();
+    }
+    is_identifier(&out).then_some(out)
 }
 
 fn constructed(object: &Expr) -> bool {
@@ -228,13 +360,25 @@ fn singular(plural: &[u8]) -> Option<Vec<u8>> {
 
 // parameters named after how the function uses them: only ever called is `callback`; the
 // first parameter of a React component (it returns createElement and reads fields off the
-// parameter) is `props`
+// parameter) is `props`; fields and methods only one kind of object has name the rest
 fn param_roles(function: &Function, hints: &mut [Name]) {
     for (i, &param) in function.params.iter().enumerate() {
         let mut called = false;
         let mut other = false;
         let mut indexed = false;
+        let mut role = None;
         visit(&function.body, &mut |e| match e {
+            Expr::Index(t, k) if **t == Expr::Local(param) && role.is_none() => {
+                indexed = true;
+                if let Expr::String(k) = k.as_ref() {
+                    role = field_role(k);
+                }
+            }
+            Expr::MethodCall { object, method, args, .. } if **object == Expr::Local(param) && role.is_none() => {
+                other = true;
+                role = method_role(method);
+                other |= args.contains(&Expr::Local(param));
+            }
             Expr::Call { func, args, .. } => {
                 if **func == Expr::Local(param) {
                     called = true;
@@ -252,8 +396,167 @@ fn param_roles(function: &Function, hints: &mut [Name]) {
             set(hints, param, Some(b"callback".to_vec()));
         } else if i == 0 && indexed && returns_element(&function.body) {
             set(hints, param, Some(b"props".to_vec()));
+        } else if let Some(role) = role {
+            set(hints, param, Some(role.as_bytes().to_vec()));
+        } else {
+            set(hints, param, stored_as(&function.body, param));
         }
     }
+}
+
+// the field a parameter is stored in, `self.name = p` or `{name = p}`, when every such store
+// agrees
+fn stored_as(body: &[Stmt], param: u32) -> Name {
+    fn stores(body: &[Stmt], param: u32, out: &mut Vec<Vec<u8>>) {
+        for stmt in body {
+            if let Stmt::Assign { targets, values } = stmt
+                && targets.len() == values.len()
+            {
+                for (t, v) in targets.iter().zip(values) {
+                    if *v == Expr::Local(param)
+                        && let Expr::Index(_, k) = t
+                        && let Expr::String(k) = k.as_ref()
+                    {
+                        out.push(k.clone());
+                    }
+                }
+            }
+            for nested in stmt.bodies() {
+                stores(nested, param, out);
+            }
+        }
+    }
+    let mut fields = Vec::new();
+    stores(body, param, &mut fields);
+    visit(body, &mut |e| {
+        if let Expr::Table(table) = e {
+            for field in table {
+                if let crate::ast::Field::Keyed(Expr::String(k), v) = field
+                    && *v == Expr::Local(param)
+                {
+                    fields.push(k.clone());
+                }
+            }
+        }
+    });
+    let first = fields.first()?;
+    fields.iter().all(|f| f == first).then(|| first.clone())
+}
+
+// What a local function's call sites pass for each parameter: (function, parameter index) to
+// the name the arguments agree on, or None where they disagree. Calls go through a local the
+// function is stored in, or through an upvalue capturing that local.
+fn call_site_names(functions: &[Function], main: usize) -> HashMap<(usize, usize), Name> {
+    fn local_functions(body: &[Stmt], out: &mut HashMap<u32, usize>, assigned: &mut HashMap<u32, usize>) {
+        for stmt in body {
+            match stmt {
+                Stmt::LocalFunction { local, closure } => {
+                    out.insert(*local, closure.proto);
+                }
+                Stmt::Local { locals, values } if locals.len() == 1 && values.len() == 1 => {
+                    if let Expr::Closure(c) = &values[0] {
+                        out.insert(locals[0], c.proto);
+                    }
+                }
+                Stmt::Assign { targets, values } => {
+                    for (i, t) in targets.iter().enumerate() {
+                        if let Expr::Local(l) = t {
+                            *assigned.entry(*l).or_default() += 1;
+                            if let Some(Expr::Closure(c)) = values.get(i) {
+                                out.entry(*l).or_insert(c.proto);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for nested in stmt.bodies() {
+                local_functions(nested, out, assigned);
+            }
+        }
+    }
+    fn closures(body: &[Stmt], out: &mut Vec<Closure>) {
+        visit(body, &mut |e| {
+            if let Expr::Closure(c) = e {
+                out.push(c.as_ref().clone());
+            }
+        });
+        fn local_closures(body: &[Stmt], out: &mut Vec<Closure>) {
+            for stmt in body {
+                if let Stmt::LocalFunction { closure, .. } = stmt {
+                    out.push(closure.clone());
+                }
+                for nested in stmt.bodies() {
+                    local_closures(nested, out);
+                }
+            }
+        }
+        local_closures(body, out);
+    }
+    fn walk(functions: &[Function], id: usize, up: &[Option<usize>], depth: usize, out: &mut HashMap<(usize, usize), Name>) {
+        let function = &functions[id];
+        let mut locals = HashMap::new();
+        let mut assigned = HashMap::new();
+        local_functions(&function.body, &mut locals, &mut assigned);
+        // a local given more than one function could be calling either
+        locals.retain(|l, _| assigned.get(l).copied().unwrap_or(0) <= 1);
+        visit(&function.body, &mut |e| {
+            let Expr::Call { func, args, .. } = e else { return };
+            let callee = match func.as_ref() {
+                Expr::Local(l) => locals.get(l).copied(),
+                Expr::Upvalue(u) => up.get(*u as usize).copied().flatten(),
+                _ => None,
+            };
+            let Some(callee) = callee else { return };
+            for (i, arg) in args.iter().enumerate() {
+                let name = match arg {
+                    Expr::Local(l) => function.names.get(*l as usize).cloned().flatten(),
+                    Expr::Closure(_) | Expr::Upvalue(_) => None,
+                    other => hint(other),
+                };
+                // (a loop's `v` or `i` says nothing about the parameter)
+                let Some(name) = name.filter(|n| n.len() > 1 && is_identifier(n) && n != b"self") else { continue };
+                out.entry((callee, i)).and_modify(|agreed| if agreed.as_ref() != Some(&name) { *agreed = None }).or_insert(Some(name));
+            }
+        });
+        if depth > 64 {
+            return;
+        }
+        let mut found = Vec::new();
+        closures(&function.body, &mut found);
+        for c in found {
+            let child = c
+                .captures
+                .iter()
+                .map(|cap| match cap {
+                    crate::ast::Capture::Local(l) => locals.get(l).copied(),
+                    crate::ast::Capture::Upvalue(u) => up.get(*u as usize).copied().flatten(),
+                })
+                .collect::<Vec<_>>();
+            walk(functions, c.proto, &child, depth + 1, out);
+        }
+    }
+    let mut out = HashMap::new();
+    walk(functions, main, &[], 0, &mut out);
+    out
+}
+
+// an InputObject, an HTTP response, a Rodux action
+fn field_role(field: &[u8]) -> Option<&'static str> {
+    Some(match field {
+        b"UserInputType" | b"KeyCode" | b"UserInputState" => "input",
+        b"responseBody" | b"StatusCode" => "response",
+        b"payload" => "action",
+        _ => return None,
+    })
+}
+
+// a Rodux store
+fn method_role(method: &[u8]) -> Option<&'static str> {
+    Some(match method {
+        b"dispatch" | b"getState" => "store",
+        _ => return None,
+    })
 }
 
 fn returns_element(body: &[Stmt]) -> bool {

@@ -38,27 +38,11 @@ local function f(a, t2)
 	return hit * 10
 end
 local v1 = print
-local t3 = {1, 3, 4}
-local hit2 = 0
-for _, v3 in t3 do
-	if v3 > 2 then
-		hit2 = v3
-		break
-	end
-end
-local v4 = hit2 * 10
-local t4 = {1}
-local hit3 = 0
-for _, v5 in t4 do
-	if v5 > 2 then
-		hit3 = v5
-		break
-	end
-end
-local v6 = hit3 * 10
-v1(v4, v6, -1 * 10)
+local v3 = f(true, {1, 3, 4})
+local v4 = f(true, {1})
+v1(v3, v4, (f()))
 local out = {}
-local v7 = {9}
+local v5 = {9}
 for i3 = 1, 4 do
 	for j = 1, 4 do
 		if i3 < j then
@@ -100,11 +84,11 @@ local function h(n3)
 	return table.concat(acc, " ")
 end
 print(h(5), h(1))
-local function any_neg(t5)
-	for _, row in t5 do
-		for _, v8 in row do
-			if v8 < 0 then
-				return true, v8
+local function any_neg(t3)
+	for _, row in t3 do
+		for _, v6 in row do
+			if v6 < 0 then
+				return true, v6
 			end
 		end
 	end
@@ -115,10 +99,9 @@ local fs = {}
 for i6 = 1, 3 do
 	local j2 = i6 * 2
 	if i6 ~= 2 then
-		local function v9()
+		table.insert(fs, function()
 			return i6 + j2
-		end
-		table.insert(fs, v9)
+		end)
 	end
 end
 local r2 = {}
@@ -128,82 +111,67 @@ end
 print(table.concat(r2, ","))
 local function f3(list, flag)
 	local n4 = 0
-	for _, v10 in list do
+	for _, v7 in list do
 		n4 += 1
-		if v10 > 10 then
+		if v7 > 10 then
 			if flag then
-				print("big flag", v10)
+				print("big flag", v7)
 				return n4
 			end
-			print("big", v10)
+			print("big", v7)
 			return -n4
 		end
 	end
 	return 0
 end
 local function g2(list2)
-	for _, v11 in list2 do
-		if v11 == 1 then
+	for _, v8 in list2 do
+		if v8 == 1 then
 			print("one")
 			return
 		end
-		if v11 == 2 then
+		if v8 == 2 then
 			print("two")
 			return
 		end
-		print("other", v11)
+		print("other", v8)
 	end
 	print("end")
 end
-local v12 = print
+local v9 = print
 local list3 = {1, 2, 30, 40}
 local n5 = 0
-local v13 = false
-local v14
-for _, v15 in list3 do
+local v10 = false
+local v11
+for _, v12 in list3 do
 	n5 += 1
-	if v15 > 10 then
-		print("big flag", v15)
-		v14 = n5
-		v13 = true
+	if v12 > 10 then
+		print("big flag", v12)
+		v11 = n5
+		v10 = true
 		break
 	end
 end
-if not v13 then
-	v14 = 0
+if not v10 then
+	v11 = 0
 end
-local list4 = {1, 50}
+local v13 = f3({1, 50})
+local list4 = {1}
 local n6 = 0
-local v16 = false
-local v17
-for _, v18 in list4 do
+local v14 = false
+local v15
+for _, v16 in list4 do
 	n6 += 1
-	if v18 > 10 then
-		print("big", v18)
-		v17 = -n6
-		v16 = true
+	if v16 > 10 then
+		print("big flag", v16)
+		v15 = n6
+		v14 = true
 		break
 	end
 end
-if not v16 then
-	v17 = 0
+if not v14 then
+	v15 = 0
 end
-local list5 = {1}
-local n7 = 0
-local v19 = false
-local v20
-for _, v21 in list5 do
-	n7 += 1
-	if v21 > 10 then
-		print("big flag", v21)
-		v20 = n7
-		v19 = true
-		break
-	end
-end
-if not v19 then
-	v20 = 0
-end
-v12(v14, v17, v20)
+v9(v11, v13, v15)
 g2({5, 2, 1})
 g2({5, 6})

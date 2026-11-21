@@ -21,9 +21,9 @@ workspace.ChildAdded:Connect(function(child)
 	end
 end)
 workspace:WaitForChild("Pad").Touched:Connect(function(hit)
-	local v2 = Players:GetPlayerFromCharacter(hit.Parent)
-	if v2 then
-		print(v2.Name, "touched the pad")
+	local playerFromCharacter = Players:GetPlayerFromCharacter(hit.Parent)
+	if playerFromCharacter then
+		print(playerFromCharacter.Name, "touched the pad")
 	end
 end)
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
@@ -31,9 +31,9 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		print("interact")
 	end
 end)
-local v3 = 0
+local v2 = 0
 RunService.Heartbeat:Connect(function(deltaTime)
-	v3 += deltaTime
+	v2 += deltaTime
 end)
 for _, child2 in ipairs(workspace:GetChildren()) do
 	print(child2.Name)
@@ -44,5 +44,5 @@ for _, descendant in workspace:GetDescendants() do
 	end
 end
 for _, player2 in pairs(Players:GetPlayers()) do
-	print(player2.DisplayName, v3)
+	print(player2.DisplayName, v2)
 end

@@ -30,22 +30,21 @@ local v7 = 0
 repeat
 	v7 += 1
 	local v8 = v7 * 3
-	local function v9()
+	table.insert(v6, function()
 		return v8
-	end
-	table.insert(v6, v9)
+	end)
 until v8 > 10
-local v10 = {}
+local v9 = {}
 for _, v in v6 do
-	table.insert(v10, v())
+	table.insert(v9, v())
 end
-print(table.concat(v10, ","))
-local function g(p11)
-	local v12 = 0
+print(table.concat(v9, ","))
+local function g(p10)
+	local v11 = 0
 	repeat
-		v12 += 1
-		local v13 = p11[v12]
-	until v13 == nil or v13 < 0
-	return v12
+		v11 += 1
+		local v12 = p10[v11]
+	until v12 == nil or v12 < 0
+	return v11
 end
 print(g({1, 2, -1, 5}), g({}))

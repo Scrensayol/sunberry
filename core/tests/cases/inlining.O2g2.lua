@@ -32,14 +32,7 @@ for i = -2, 12, 5 do
 end
 table.insert(log, "guarded " .. tostring("yes"))
 local function scaled(n)
-	local x2 = n * 2
-	if x2 < 1 then
-		return 1
-	end
-	if x2 > 9 then
-		return 9
-	end
-	return x2
+	return (clamp(n * 2, 1, 9))
 end
 if clamp(sum, 0, 5) == 5 and 6 > 4 then
 	print("both")

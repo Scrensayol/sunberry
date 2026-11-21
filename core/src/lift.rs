@@ -118,6 +118,16 @@ struct Lifter<'a> {
     // each went into
     inline: Option<&'a Ctx>,
     inlining_off: bool,
+    // how many candidate regions deep this is: a region can hold copies of other functions
+    // (inlined into the function that was inlined here), made back into calls one level down
+    nested: u8,
+    // nested sandboxes this function may still try (see try_inline)
+    nested_budget: usize,
+    // the candidates whose sandboxes this is inside: (where, callee)
+    trying: Vec<(usize, usize)>,
+    // lifting a candidate region as a function body (see `sandbox`): the pcs that mean its
+    // end, where a jump is an early `return`, and the result registers that return gives
+    ret: Option<RetMode>,
     made: Vec<(usize, u32, Vec<Capture>)>,
     // functions this one calls through upvalues it doesn't have yet (numbered after its own).
     // Never rolled back: value paths keep expressions lifted before a restore, and an upvalue
@@ -129,6 +139,19 @@ struct Lifter<'a> {
     work_limit: usize,
     too_big: Option<usize>,
     allow_big: bool,
+}
+
+// a region lifted as a function body (see `Lifter::sandbox`)
+struct RetMode {
+    // the pcs that mean its end
+    ends: Vec<usize>,
+    // the result registers
+    targets: Vec<u8>,
+    // the RETURN at its end, when it ends in one: Luau copies a RETURN over a jump to it
+    at_end: Option<Insn>,
+    // whether a value region may end at its end: `return a and b` is one, but so is
+    // `if c then return a end; return b` copied inline
+    values_to_end: bool,
 }
 
 // where a loop's far exits land, the pcs jumping there, and the flag (see `far_exits`)
@@ -151,6 +174,11 @@ const CONTINUE: usize = usize::MAX - 2;
 const FAR: usize = usize::MAX - 3;
 
 // everything a speculative path can change, to put back if it doesn't work out
+// nested sandboxes a function may try (see try_inline): each one tries every copy inside it at
+// every length, so a few dozen take seconds on a big function; on the corpus 8 finds every
+// nested copy an unlimited budget finds
+const NESTED_BUDGET: usize = 8;
+
 struct Snapshot {
     slots: Vec<Slot>,
     pending: Vec<Pending>,
@@ -259,6 +287,10 @@ pub fn lift(chunk: &Chunk, proto_id: usize, inline: Option<&Ctx>) -> Result<Lift
         trace: std::env::var_os("SUNBERRY_TRACE").is_some(),
         inline,
         inlining_off: false,
+        nested: 0,
+        nested_budget: NESTED_BUDGET,
+        trying: Vec::new(),
+        ret: None,
         made: Vec::new(),
         extra: Vec::new(),
         work: 0,
@@ -1595,7 +1627,8 @@ impl Lifter<'_> {
     // RETURN over a jump to it, so the original can sit outside); returning from either
     // returns the same registers.
     fn normalize(&self, target: usize, first: usize, end: usize, exits: &[usize]) -> usize {
-        if exits.contains(&target) {
+        // (in a region lifted as a function body, its end is wherever it returns to)
+        if exits.contains(&target) || self.returns_to(target) && self.returns_to(exits[0]) {
             return exits[0];
         }
         if let Some(lp) = self.loops.last() {
@@ -1609,6 +1642,20 @@ impl Lifter<'_> {
                 return FAR;
             }
         }
+        // a RETURN like the one the region ends at is its end; otherwise the last copy inside
+        if target > exits[0]
+            && let Some(&i) = self.index_of.get(target)
+            && let Some(insn) = self.insns.get(i)
+            && insn.op == Op::RETURN
+            && let Some(&e) = self.index_of.get(exits[0])
+            && let Some(at_end) = self.insns.get(e)
+            && at_end.op == Op::RETURN
+            && at_end.a == insn.a
+            && at_end.b == insn.b
+            && e >= end
+        {
+            return exits[0];
+        }
         if target > exits[0]
             && let Some(&i) = self.index_of.get(target)
             && let Some(insn) = self.insns.get(i)
@@ -1618,6 +1665,14 @@ impl Lifter<'_> {
             return self.insns[copy].pc;
         }
         target
+    }
+
+    // whether insns[i..end) is only RETURNs that nothing but insns[start..i) jumps to: those
+    // jumps lifted already, so each went to an identical RETURN copy there (`normalize`)
+    fn returns_reached_from(&self, start: usize, i: usize, end: usize) -> bool {
+        let (lo, hi) = (self.pc_at(i), self.pc_at(end));
+        (i..end).all(|k| self.insns[k].op == Op::RETURN)
+            && self.insns.iter().enumerate().all(|(k, ins)| !ins.target().is_some_and(|t| t >= lo && t < hi) || (start..i).contains(&k))
     }
 
     // whether code outside insns[from..to) jumps into it (if not, it's dead)
@@ -1709,7 +1764,7 @@ impl Lifter<'_> {
             // after a return nothing in the region runs (Luau leaves threaded RETURN copies
             // there), unless something jumps in
             if self.body.last().is_some_and(Stmt::terminates) {
-                if self.entered(i, end) {
+                if self.entered(i, end) && !self.returns_reached_from(start, i, end) {
                     return Err(self.unsupported("code after a return that something jumps to"));
                 }
                 return Ok(());
@@ -1720,6 +1775,12 @@ impl Lifter<'_> {
                 continue;
             }
             let insn = self.insns[i];
+            if self.return_copy(&insn) {
+                let targets = self.ret.as_ref().unwrap().targets.clone();
+                self.ret_from(&targets)?;
+                i += 1;
+                continue;
+            }
             match insn.op {
                 Op::FORNPREP => {
                     i = self.numeric_for(i, end, exits)?;
@@ -1784,6 +1845,14 @@ impl Lifter<'_> {
             match insn.op {
                 Op::JUMP | Op::JUMPX => {
                     let target = insn.target().unwrap();
+                    if let Some(r) = &self.ret
+                        && r.ends.contains(&target)
+                    {
+                        let targets = r.targets.clone();
+                        self.ret_from(&targets)?;
+                        i += 1;
+                        continue;
+                    }
                     let loop_target = self.loops.last().map(|l| (l.breaks.contains(&target), l.cont == target));
                     let far = self.loops.last().is_some_and(|l| l.far.contains(&target));
                     if target == insn.pc + 1 || (i + 1 == end && exits.contains(&target)) {
@@ -2110,6 +2179,36 @@ impl Lifter<'_> {
     }
 
     fn finish_if(&mut self, (pre, cond): (Vec<Stmt>, Expr), then_index: usize, else_pc: usize, end: usize, exits: &[usize]) -> Result<usize, Error> {
+        let start = self.snapshot();
+        match self.finish_if_with((pre.clone(), cond.clone()), then_index, else_pc, end, exits, false) {
+            // the then branch's last jump can be a `continue` or `break` rather than the jump
+            // over an else: then what follows is no else, just the code after the `if`
+            Err(e) if self.loop_jump_before(else_pc) => {
+                self.restore(&start);
+                self.finish_if_with((pre, cond), then_index, else_pc, end, exits, true).map_err(|_| e)
+            }
+            other => other,
+        }
+    }
+
+    // whether the instruction before else_pc jumps to the current loop's continue or break
+    fn loop_jump_before(&self, else_pc: usize) -> bool {
+        let Ok(else_index) = self.idx(else_pc) else { return false };
+        let Some(last) = else_index.checked_sub(1).map(|k| self.insns[k]) else { return false };
+        matches!(last.op, Op::JUMP | Op::JUMPX)
+            && last.target().is_some_and(|t| self.loops.last().is_some_and(|l| l.cont == t || l.breaks.contains(&t)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_if_with(
+        &mut self,
+        (pre, cond): (Vec<Stmt>, Expr),
+        then_index: usize,
+        else_pc: usize,
+        end: usize,
+        exits: &[usize],
+        no_else: bool,
+    ) -> Result<usize, Error> {
         self.body.extend(pre);
         // `if c then break end` compiles to one jump to the loop's end when c holds
         if else_pc >= FAR {
@@ -2130,10 +2229,17 @@ impl Lifter<'_> {
         // then [then_index, then_end), else [else_range), and where they meet
         let (then_end, else_range, join) = if else_pc == end_pc {
             (end, None, end)
+        } else if no_else {
+            let else_index = self.idx(else_pc)?;
+            (else_index, None, else_index)
         } else {
             let else_index = self.idx(else_pc)?;
             let last = self.insns[else_index - 1];
             match (last.op, last.target()) {
+                // an inlined body's early `return` (see `sandbox`): the then branch returns
+                (Op::JUMP | Op::JUMPX, Some(t)) if else_index - 1 >= then_index && self.returns_to(t) => {
+                    (else_index, None, else_index)
+                }
                 // (a `break` or `continue` ending the then branch is no jump over an else)
                 (Op::JUMP | Op::JUMPX, Some(t)) if else_index - 1 >= then_index && t > else_pc && normalize(t) < FAR => {
                     let joined = normalize(t);
@@ -2247,6 +2353,9 @@ impl Lifter<'_> {
                 Op::LOADB if i.c != 0 => i.target(),
                 op if is_test(op) => i.target(),
                 _ if is_expression(&i) => None,
+                // a copy of the RETURN at the join (checked below), which Luau put in place of
+                // a jump to it
+                Op::RETURN if i.b != 0 => None,
                 // a call that may turn out to be an inlined function's body
                 _ if self.inline.is_some_and(|c| c.callees[self.proto_id].contains_key(&k)) && !self.inlining_off => None,
                 _ => return Ok(None),
@@ -2265,6 +2374,12 @@ impl Lifter<'_> {
             }
             return Ok(None);
         };
+        if (first + 1..join_index).any(|k| self.insns[k].op == Op::RETURN && !self.join_return(&self.insns[k], join)) {
+            return Ok(None);
+        }
+        if self.ret.as_ref().is_some_and(|r| !r.values_to_end && r.ends.contains(&join)) {
+            return Ok(None);
+        }
         let mut written = Regs::default();
         for i in first..join_index {
             written = written.union(liveness::writes(&self.insns[i]));
@@ -2335,6 +2450,17 @@ impl Lifter<'_> {
             .max();
         if let Some(index) = newest {
             self.flush_oldest(index + 1)?;
+        }
+        // so is the closure of a function inlined in it: a call made back reads it, and it
+        // can't become a local from inside an expression
+        if let Some(ctx) = self.inline
+            && !self.inlining_off
+        {
+            let callees = (first..join_index).filter_map(|k| ctx.callees[self.proto_id].get(&k)).flatten().copied().collect::<Vec<_>>();
+            let closure = self.pending.iter().rposition(|p| p.span == Span::One && matches!(&p.value, Value::Expr(Expr::Closure(c)) if callees.contains(&c.proto)));
+            if let Some(index) = closure {
+                self.flush_oldest(index + 1)?;
+            }
         }
 
         let start = self.snapshot();
@@ -2435,6 +2561,10 @@ impl Lifter<'_> {
             if insn.pc > join {
                 return Err(self.unsupported("value path past its join"));
             }
+            if self.join_return(&insn, join) {
+                self.enter(i)?;
+                return self.region_value(result, base, old).map(Tree::Value);
+            }
             self.enter(i)?;
             let clean = |l: &Self| l.body.len() == fork.body && l.names.len() == fork.names;
             if let Some(n) = self.try_inline(i)? {
@@ -2485,6 +2615,13 @@ impl Lifter<'_> {
         }
     }
 
+    // whether insn is a copy of the RETURN at a value region's join: returning there is the
+    // same as going to the join and returning
+    fn join_return(&self, insn: &Insn, join: usize) -> bool {
+        let at_join = self.index_of.get(join).and_then(|&j| self.insns.get(j));
+        insn.op == Op::RETURN && insn.b != 0 && at_join.is_some_and(|r| r.op == Op::RETURN && r.a == insn.a && r.b == insn.b)
+    }
+
     // at the join: the result register holds the newest pending value and everything else
     // is as the region found it
     fn region_value(&mut self, result: u8, base: &[u64], old: Option<u64>) -> Result<Expr, Error> {
@@ -2527,7 +2664,8 @@ impl Lifter<'_> {
         internal: Regs,
         vars: &[(u8, u32)],
         far: &Far,
-    ) -> Result<(Vec<Stmt>, bool), Error> {
+        until: Option<usize>,
+    ) -> Result<(Vec<Stmt>, bool, usize), Error> {
         self.flush()?;
         let mut written = Regs::default();
         for i in start..back {
@@ -2538,6 +2676,17 @@ impl Lifter<'_> {
             live = live.union(self.live_in.get(*landing).copied().unwrap_or_default());
         }
         let joined = written.intersect(live).without(internal).iter().collect::<Vec<_>>();
+        // `repeat ... until c` with a `continue` (which goes to c): what c reads from the body
+        // has to be in variables on every path there, which only loop variables are
+        if let Some(t) = until {
+            let mut before_tail = Regs::default();
+            for i in start..t {
+                before_tail = before_tail.union(liveness::writes(&self.insns[i]));
+            }
+            if before_tail.intersect(self.live_in[t]).iter().any(|r| !joined.contains(&r)) {
+                return Err(self.unsupported("an until condition reading the body's values"));
+            }
+        }
         for &r in &joined {
             let assignable = matches!(self.slots[r as usize], Slot::Local(l) if !self.by_value[l as usize]);
             if !assignable {
@@ -2551,21 +2700,32 @@ impl Lifter<'_> {
             Some((pcs, _, flag)) => (pcs.clone(), Some(*flag)),
             None => (Vec::new(), None),
         };
-        self.loops.push(LoopCtx { breaks, cont: self.insns[back].pc, continued: false, far: far_pcs, flag });
+        let cont = until.map_or(self.insns[back].pc, |t| self.pc_at(t));
+        self.loops.push(LoopCtx { breaks, cont, continued: false, far: far_pcs, flag });
         let before = self.slots.clone();
         for &(reg, local) in vars {
             self.slots[reg as usize] = Slot::Local(local);
         }
         let exits = self.exits_from(back);
+        // (with an until condition, the body and the condition lift apart: where one ends is
+        // where a `continue` goes)
+        let mut split = 0;
         let body = self.sub_body(|l| {
-            l.block(start, back, &exits)?;
+            if let Some(t) = until {
+                l.block(start, t, &[l.pc_at(t)])?;
+                l.flush_branch()?;
+                split = l.body.len();
+                l.block(t, back, &exits)?;
+            } else {
+                l.block(start, back, &exits)?;
+            }
             l.flush_branch()
         });
         let ctx = self.loops.pop().unwrap();
         self.joins.pop();
         let body = body?;
         self.slots = before;
-        Ok((body, ctx.continued))
+        Ok((body, ctx.continued, split))
     }
 
     // Jumps from inside the loop past its end and past the code that follows it: an inlined
@@ -2578,7 +2738,8 @@ impl Lifter<'_> {
         let mut landing = None;
         for k in start..back {
             let Some(t) = self.insns[k].target() else { continue };
-            if t <= exit_pc || breaks.contains(&t) {
+            // (an early `return` of a region lifted as a function body leaves from anywhere)
+            if t <= exit_pc || breaks.contains(&t) || self.returns_to(t) {
                 continue;
             }
             let index = if exits.contains(&t) { end } else { self.idx(t)? };
@@ -2686,7 +2847,7 @@ impl Lifter<'_> {
         internal.add_range(a as usize, a as usize + 3);
         let breaks = self.breaks_from(prep, exit);
         let far = self.far_exits(prep + 1, back, exit, &breaks, end, exits)?;
-        let (body, _) = self.loop_body(prep + 1, back, exit, breaks, internal, &[(a + 2, var)], &far)?;
+        let (body, _, _) = self.loop_body(prep + 1, back, exit, breaks, internal, &[(a + 2, var)], &far, None)?;
         self.emit(Stmt::NumericFor { var, from, to, step, body })?;
         self.after_far(exit, &far, end, exits)
     }
@@ -2730,7 +2891,7 @@ impl Lifter<'_> {
         internal.add_range(a as usize, a as usize + 3 + (count as usize).max(2));
         let breaks = self.breaks_from(prep, exit);
         let far = self.far_exits(prep + 1, back, exit, &breaks, end, exits)?;
-        let (body, _) = self.loop_body(prep + 1, back, exit, breaks, internal, &vars, &far)?;
+        let (body, _, _) = self.loop_body(prep + 1, back, exit, breaks, internal, &vars, &far, None)?;
         self.emit(Stmt::GenericFor { vars: vars.iter().map(|v| v.1).collect(), values, body })?;
         self.after_far(exit, &far, end, exits)
     }
@@ -2739,10 +2900,54 @@ impl Lifter<'_> {
     // a leading `if c then break end` makes it `while not c`, and a trailing one (with no
     // `continue`, which would skip it) `repeat ... until c`.
     fn jumpback_loop(&mut self, head: usize, back: usize, end: usize, exits: &[usize]) -> Result<usize, Error> {
+        let start = self.snapshot();
+        match self.jumpback_loop_with(head, back, end, exits, None) {
+            Ok(next) => Ok(next),
+            Err(e) => {
+                // a `continue` jumping to the loop's until condition
+                let Some(t) = self.until_tail(head, back) else { return Err(e) };
+                self.restore(&start);
+                self.jumpback_loop_with(head, back, end, exits, Some(t)).map_err(|e2| {
+                    if self.trace {
+                        eprintln!("       loop at {} with its until condition at {}: {e2}", self.insns[head].pc, self.pc_at(t));
+                    }
+                    e
+                })
+            }
+        }
+    }
+
+    // where a `repeat` loop's until condition starts, when the body jumps there: the run of
+    // tests and expression code before the back edge, entered from before it only at its start
+    fn until_tail(&self, head: usize, back: usize) -> Option<usize> {
+        let back_pc = self.insns[back].pc;
+        let mut t = back;
+        while t > head + 1 && (is_test(self.insns[t - 1].op) || is_expression(&self.insns[t - 1])) {
+            t -= 1;
+        }
+        // the first place in it that every jump into it from before goes to
+        (t..back).find(|&ti| {
+            let target = self.insns[ti].pc;
+            let into = |k: usize| self.insns[k].target().filter(|&x| x >= target && x < back_pc);
+            (head..ti).any(|k| into(k).is_some()) && (head..ti).all(|k| into(k).is_none_or(|x| x == target))
+        })
+    }
+
+    fn jumpback_loop_with(&mut self, head: usize, back: usize, end: usize, exits: &[usize], until: Option<usize>) -> Result<usize, Error> {
         let exit = back + 1;
         let breaks = self.breaks_from(head, exit);
         let far = self.far_exits(head, back, exit, &breaks, end, exits)?;
-        let (mut body, continued) = self.loop_body(head, back, exit, breaks, Regs::default(), &[], &far)?;
+        let (mut body, continued, split) = self.loop_body(head, back, exit, breaks, Regs::default(), &[], &far, until)?;
+        if until.is_some() {
+            // the condition is one `if c then break end` of its own
+            let tail = body.split_off(split);
+            let [Stmt::If { cond, then_body, else_body }] = &tail[..] else { return Err(self.unsupported("an until condition that isn't one test")) };
+            if !matches!(then_body[..], [Stmt::Break]) || !else_body.is_empty() || far.is_some() {
+                return Err(self.unsupported("an until condition that isn't one test"));
+            }
+            self.emit(Stmt::Repeat { body, cond: cond.clone() })?;
+            return self.after_far(exit, &far, end, exits);
+        }
         let breaks_if = |s: Option<&Stmt>| matches!(s, Some(Stmt::If { then_body, else_body, .. }) if matches!(then_body[..], [Stmt::Break]) && else_body.is_empty());
         let stmt = if breaks_if(body.first()) {
             let Stmt::If { cond, .. } = body.remove(0) else { unreachable!() };
@@ -2957,6 +3162,54 @@ fn expr_size(e: &Expr) -> usize {
 }
 
 pub(crate) fn simplify_choice(p: Expr, t: Expr, f: Expr) -> Expr {
+    // `p and t` / `p or f` already say it as one condition, unless merging makes the whole
+    // thing a plain `and`/`or` chain
+    if p.is_boolean() && (f == Expr::Bool(false) || t == Expr::Bool(true)) {
+        return match merge(p.clone(), t.clone(), f.clone()) {
+            Some(merged) if !matches!(merged, Expr::IfElse(..)) => merged,
+            _ => simplify_plain(p, t, f),
+        };
+    }
+    match merge(p.clone(), t.clone(), f.clone()) {
+        Some(merged) => merged,
+        None => simplify_plain(p, t, f),
+    }
+}
+
+// A branch that ends in the other branch's value again is one condition: only truthiness
+// counts in a condition, and `p and q` / `p or q` test it in the same order. Paths that meet
+// again are copied into every branch, so this undoes the copies.
+fn merge(p: Expr, t: Expr, f: Expr) -> Option<Expr> {
+    Some(match (t, f) {
+        // `if p then t else q and t` with q true or false is `(p or q) and t`
+        (t, Expr::Binary(BinOp::And, q, t1)) if *t1 == t && q.is_boolean() => {
+            Expr::Binary(BinOp::And, Box::new(chain(BinOp::Or, p, *q)), Box::new(t))
+        }
+        (Expr::IfElse(q, t, f1), f) if *f1 == f => simplify_choice(chain(BinOp::And, p, *q), *t, f),
+        (Expr::IfElse(q, f1, t), f) if *f1 == f => simplify_choice(chain(BinOp::And, p, negate_or(*q)), *t, f),
+        (t, Expr::IfElse(q, t1, f)) if *t1 == t => simplify_choice(chain(BinOp::Or, p, *q), t, *f),
+        (t, Expr::IfElse(q, f, t1)) if *t1 == t => simplify_choice(chain(BinOp::Or, p, negate(*q)), t, *f),
+        _ => return None,
+    })
+}
+
+// `not (a or b)` as `not a and not b`, which reads as one more step of an `and` chain (for truthiness)
+fn negate_or(q: Expr) -> Expr {
+    match q {
+        Expr::Binary(BinOp::Or, a, b) => chain(BinOp::And, negate_or(*a), negate_or(*b)),
+        q => negate(q),
+    }
+}
+
+// `p and q` with q's own chain of the same operator kept flat: `p and (a and b)` is `p and a and b`
+fn chain(op: BinOp, p: Expr, q: Expr) -> Expr {
+    match q {
+        Expr::Binary(o, a, b) if o == op => Expr::Binary(op, Box::new(chain(op, p, *a)), b),
+        q => Expr::Binary(op, Box::new(p), Box::new(q)),
+    }
+}
+
+fn simplify_plain(p: Expr, t: Expr, f: Expr) -> Expr {
     let boolean = p.is_boolean();
     match (t, f) {
         (Expr::Bool(true), Expr::Bool(false)) if boolean => p,
@@ -3056,6 +3309,9 @@ impl Lifter<'_> {
             inline::RUNS_TRIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let callees = ctx.callees[self.proto_id].get(&at).cloned().unwrap_or_default();
+        if std::env::var_os("SUNBERRY_TRACE_TRY").is_some() {
+            eprintln!("   try f{} at {at} (pc {}) nested {} callees {:?} run {}..{}", self.proto_id, self.insns[at].pc, self.nested, callees, run.start, run.end);
+        }
         // diagnostics: the first callee's reason when nothing matches
         let mut why: Option<&'static str> = None;
         let note = |why: &mut Option<&'static str>, w: &'static str| {
@@ -3064,8 +3320,15 @@ impl Lifter<'_> {
             }
         };
         let flow = |b: &[Stmt]| b.iter().any(|s| !s.bodies().is_empty() || matches!(s, Stmt::Return(_)) && !std::ptr::eq(s, b.last().unwrap()));
+        // (a failed attempt leaves nothing behind, not even the closure it named made a local)
+        let outer = self.snapshot();
         for callee in callees {
-            if flow(&ctx.raw[callee].body) {
+            self.restore(&outer);
+            if self.trying.contains(&(at, callee)) {
+                continue;
+            }
+            let callee_flow = flow(&ctx.raw[callee].body);
+            if callee_flow {
                 note(&mut why, "callee has control flow");
             }
             // the callee's closure has to be somewhere the call can name it
@@ -3101,15 +3364,46 @@ impl Lifter<'_> {
             // the longest copy that matches: a shorter one can match by leaving the result out.
             // A copy is about as long as the callee (moves to the result instead of RETURN)
             let longest = run_end.min(at + 2 * self.chunk.protos[callee].code.len() + 8);
-            for end in (at + 1..=longest).rev() {
-                if !self.closed_region(at, end) {
+            // each length as a value first, then (for a callee with control flow) with its jumps
+            // to the end as early returns
+            // (and, failing that, with copies of other functions inside made back into calls:
+            // one inlined into the callee before it was inlined here)
+            let here = &ctx.callees[self.proto_id];
+            let inner = &ctx.calls[callee];
+            let any = ctx.calls_param[callee];
+            let others = |end: usize| (at + 1..end).any(|k| here.get(&k).is_some_and(|c| c.iter().any(|&q| q != callee && (any || inner.contains(&q)))));
+            let modes = |e: usize| [(e, false, false), (e, true, false), (e, false, true), (e, true, true)];
+            // (end, returns) whose plain sandbox lifted: a copy inside another is only looked
+            // for where the region lifts at all, or the tries multiply (each nested sandbox
+            // tries every copy inside it at every length)
+            let mut lifted = Vec::new();
+            for (end, returns, nested) in (at + 1..=longest).rev().flat_map(modes) {
+                if !self.closed_region(at, end, returns) || returns && !(callee_flow && self.returns_early(at, end)) {
                     continue;
                 }
+                if nested && (self.nested > 0 || !others(end) || !lifted.contains(&(end, returns)) || self.nested_budget == 0) {
+                    continue;
+                }
+                // (each nested sandbox tries every copy inside it at every length, so a
+                // function only gets so many)
+                if nested {
+                    self.nested_budget -= 1;
+                }
                 let start = self.snapshot();
-                self.inlining_off = true;
-                let sub = self.sandbox(at, end);
-                self.inlining_off = false;
+                let off = self.inlining_off;
+                let extra_before = self.extra.len();
+                self.nested += 1;
+                self.inlining_off = !nested;
+                self.trying.push((at, callee));
+                let sub = self.sandbox(at, end, returns);
+                self.trying.pop();
+                self.nested -= 1;
+                self.inlining_off = off;
                 self.restore(&start);
+                // calls made back inside are only for matching: the new upvalues they took go
+                // (the subject still names them, so matching sees them)
+                let seen_extra = self.extra.clone();
+                self.extra.truncate(extra_before);
                 if std::env::var_os("SUNBERRY_TRACE_INLINE").is_some() {
                     match &sub {
                         Err(e) => eprintln!("   sandbox f{} {at}..{end}: {e}", self.proto_id),
@@ -3123,10 +3417,13 @@ impl Lifter<'_> {
                     }
                     continue;
                 };
+                if !nested {
+                    lifted.push((end, returns));
+                }
                 for sub in variants {
                     let upvalues = match &captures {
                         Some(c) => Upvalues::Here(c),
-                        None => Upvalues::Outer { callee, caller: self.proto_id },
+                        None => Upvalues::Outer { callee, caller: self.proto_id, extra: &seen_extra },
                     };
                     let sub = &sub;
                     let Some(plan) = inline::unify(ctx, callee, upvalues, sub) else {
@@ -3138,12 +3435,26 @@ impl Lifter<'_> {
                         }
                         continue;
                     };
+                    // a new upvalue is numbered now: one level down, the sandbox may have given
+                    // other functions new upvalues since `func` was worked out
+                    let n = self.proto.num_upvalues as usize;
+                    let func = match func {
+                        Expr::Upvalue(k) if k as usize >= n => {
+                            let k = n + self.extra.iter().position(|&p| p == callee).unwrap_or(self.extra.len());
+                            if k > 255 {
+                                continue;
+                            }
+                            Expr::Upvalue(k as u8)
+                        }
+                        ref other => other.clone(),
+                    };
                     match self.call_inlined(end, func.clone(), &plan, sub) {
                         Ok(()) => {
                             if let Expr::Upvalue(k) = func
-                                && k as usize >= self.proto.num_upvalues as usize
+                                && k as usize >= n
                                 && !self.extra.contains(&callee)
                             {
+                                debug_assert_eq!(k as usize, n + self.extra.len());
                                 self.extra.push(callee);
                             }
                             if self.trace {
@@ -3163,14 +3474,56 @@ impl Lifter<'_> {
                 }
             }
         }
+        self.restore(&outer);
+        if std::env::var_os("SUNBERRY_TRACE_TRY").is_some() {
+            eprintln!("   try f{} at {at}: {}", self.proto_id, why.unwrap_or("nothing matched"));
+        }
         if at == run.start {
             inline::reason(why.unwrap_or("no callee"));
         }
         Ok(None)
     }
 
-    // lifts insns[at..end) as if it were a function body of its own
-    fn sandbox(&mut self, at: usize, end: usize) -> Result<Option<Vec<Sub>>, Error> {
+    // the pcs of every RETURN like the one at insns[end] (none if that isn't a RETURN)
+    fn return_copies(&self, end: usize) -> Vec<usize> {
+        let Some(r) = self.insns.get(end).filter(|i| i.op == Op::RETURN && i.b != 0) else { return Vec::new() };
+        self.insns.iter().filter(|i| i.op == Op::RETURN && i.a == r.a && i.b == r.b).map(|i| i.pc).collect()
+    }
+
+    // whether insns[at..end) jumps to its end from before its last instruction (or has a
+    // copy of the RETURN there)
+    fn returns_early(&self, at: usize, end: usize) -> bool {
+        let mut ends = self.exits_from(end);
+        ends.extend(self.return_copies(end));
+        let ret = self.insns.get(end).filter(|i| i.op == Op::RETURN && i.b != 0);
+        (at..end - 1).any(|k| {
+            let i = &self.insns[k];
+            matches!(i.op, Op::JUMP | Op::JUMPX) && i.target().is_some_and(|t| ends.contains(&t))
+                || ret.is_some_and(|r| i.op == Op::RETURN && i.a == r.a && i.b == r.b)
+        }) || ret.is_some_and(|r| self.insns[end - 1].op == Op::RETURN && self.insns[end - 1].a == r.a && self.insns[end - 1].b == r.b)
+    }
+
+    // whether a jump to pc is an early `return` (see `sandbox`)
+    fn returns_to(&self, pc: usize) -> bool {
+        self.ret.as_ref().is_some_and(|r| r.ends.contains(&pc))
+    }
+
+    // whether insn is a copy of the RETURN ending a region lifted as a function body
+    fn return_copy(&self, insn: &Insn) -> bool {
+        insn.op == Op::RETURN && self.ret.as_ref().and_then(|r| r.at_end).is_some_and(|e| e.a == insn.a && e.b == insn.b)
+    }
+
+    // an early `return` from a region lifted as a function body: the result registers' values
+    fn ret_from(&mut self, targets: &[u8]) -> Result<(), Error> {
+        // (the reads after the end are this return's own)
+        let values = self.take_ignoring(targets, targets)?.into_iter().map(Operand::expr).collect();
+        self.emit(Stmt::Return(values))
+    }
+
+    // lifts insns[at..end) as if it were a function body of its own. With `returns`, a jump
+    // to its end is a `return` of the result registers (an inlined body's early return, which
+    // an `if` can't say without repeating code), and so is reaching the end
+    fn sandbox(&mut self, at: usize, end: usize, returns: bool) -> Result<Option<Vec<Sub>>, Error> {
         let before = self.names.len();
         self.flush()?;
         let mut start = HashMap::new();
@@ -3179,11 +3532,6 @@ impl Lifter<'_> {
                 start.entry(l).or_insert((r as u8, l as usize >= before));
             }
         }
-        let exits = [self.pc_at(end)];
-        let stmts = self.sub_body(|l| l.block(at, end, &exits))?;
-        if stmts.iter().any(Stmt::terminates) {
-            return Ok(None);
-        }
         let mut written = Regs::default();
         for i in at..end {
             written = written.union(liveness::writes(&self.insns[i]));
@@ -3191,6 +3539,43 @@ impl Lifter<'_> {
         let live = self.live_in.get(end).copied().unwrap_or_default();
         let targets = written.intersect(live).iter().collect::<Vec<_>>();
         if targets.windows(2).any(|w| w[1] != w[0] + 1) {
+            return Ok(None);
+        }
+        let exits = [self.pc_at(end)];
+        if returns {
+            let at_end = self.insns.get(end).filter(|i| i.op == Op::RETURN && i.b != 0).copied();
+            let fork = self.snapshot();
+            // (a region inside another one's sandbox puts the outer one's mode back after)
+            let outer_ret = self.ret.take();
+            let mut variants: Vec<Sub> = Vec::new();
+            for values_to_end in [true, false] {
+                self.restore(&fork);
+                let mut ends = self.exits_from(end);
+                ends.extend(self.return_copies(end));
+                self.ret = Some(RetMode { ends, targets: targets.clone(), at_end, values_to_end });
+                let stmts = self.sub_body(|l| {
+                    l.block(at, end, &exits)?;
+                    if inline::ends_in_return(&l.body) { Ok(()) } else { l.ret_from(&targets) }
+                });
+                self.ret = None;
+                let stmts = match stmts {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if std::env::var_os("SUNBERRY_TRACE_INLINE").is_some() {
+                            eprintln!("   sandbox f{} {at}..{end} as returns: {e}", self.proto_id);
+                        }
+                        continue;
+                    }
+                };
+                if self.pending.is_empty() && stmts.iter().any(|s| !s.bodies().is_empty()) && variants.iter().all(|v| v.stmts != stmts) {
+                    variants.push(Sub { stmts, values: Vec::new(), many: false, targets: targets.clone(), start: start.clone(), returns: true });
+                }
+            }
+            self.ret = outer_ret;
+            return Ok((!variants.is_empty()).then_some(variants));
+        }
+        let stmts = self.sub_body(|l| l.block(at, end, &exits))?;
+        if stmts.iter().any(Stmt::terminates) {
             return Ok(None);
         }
         let mut values = Vec::new();
@@ -3248,7 +3633,7 @@ impl Lifter<'_> {
                 }
             }
             if ok {
-                variants.push(Sub { stmts, values, many, targets: targets.clone(), start: start.clone() });
+                variants.push(Sub { stmts, values, many, targets: targets.clone(), start: start.clone(), returns: false });
             }
         }
         // as the callee's own assignments: not results at all
@@ -3257,7 +3642,7 @@ impl Lifter<'_> {
             let targets2 = targets.iter().zip(&keep).filter(|(_, k)| **k).map(|(r, _)| *r).collect::<Vec<_>>();
             if targets2.windows(2).all(|w| w[1] == w[0] + 1) {
                 let values2 = values.iter().zip(&keep).filter(|(_, k)| **k).map(|(v, _)| v.clone()).collect();
-                variants.push(Sub { stmts, values: values2, many, targets: targets2, start });
+                variants.push(Sub { stmts, values: values2, many, targets: targets2, start, returns: false });
             }
         }
         Ok(Some(variants))
@@ -3296,9 +3681,14 @@ impl Lifter<'_> {
 impl Lifter<'_> {
     // whether insns[at..end) can be a body of its own: its jumps stay inside or go to its end
     // (or where Luau threaded that), and nothing outside jumps into its middle
-    fn closed_region(&self, at: usize, end: usize) -> bool {
+    // As a function body (`returns`), a jump to a RETURN like the one at its end is one to
+    // its end: Luau threads jumps to a RETURN to wherever there's a copy of it.
+    fn closed_region(&self, at: usize, end: usize, returns: bool) -> bool {
         let (lo, hi) = (self.pc_at(at), self.pc_at(end));
-        let exits = self.exits_from(end);
+        let mut exits = self.exits_from(end);
+        if returns {
+            exits.extend(self.return_copies(end));
+        }
         // a FASTCALL belongs with the CALL it guards
         let split_call = (at..end).any(|k| {
             let i = self.insns[k];

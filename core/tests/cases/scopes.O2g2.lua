@@ -30,10 +30,9 @@ local i2 = 0
 repeat
 	i2 += 1
 	local x = i2 * 3
-	local function v1()
+	table.insert(fs, function()
 		return x
-	end
-	table.insert(fs, v1)
+	end)
 until x > 10
 local r = {}
 for _, f in fs do
