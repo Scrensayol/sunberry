@@ -690,7 +690,11 @@ impl Lifter<'_> {
         for l in &self.proto.locals {
             let reg = l.register;
             let still_held = self.proto.locals.iter().any(|o| o.register == reg && o.start_pc <= pc && pc < o.end_pc);
-            if l.end_pc == pc && l.start_pc < pc && !still_held && matches!(self.slots[reg as usize], Slot::Local(_)) {
+            // the value can outlive the name: Luau 0.746+ leaves an inlined call's result in its
+            // parameter's register (`a, b = f(b), f(a)` keeps the first result there while the
+            // second call runs), so a register read again later stays taken
+            let read_later = self.live_in.get(self.at).is_some_and(|live| live.has(reg));
+            if l.end_pc == pc && l.start_pc < pc && !still_held && !read_later && matches!(self.slots[reg as usize], Slot::Local(_)) {
                 self.slots[reg as usize] = Slot::Free;
             }
         }

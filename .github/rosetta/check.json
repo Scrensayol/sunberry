@@ -4,6 +4,10 @@
     "sunberry": [
       "captured_args O2g1",
       "captured_args O2g2",
+      "if_local O0g1",
+      "if_local O0g2",
+      "if_local O1g1",
+      "if_local O1g2",
       "nested_inlining O2g1",
       "nested_inlining O2g2",
       "refusals O1g1",

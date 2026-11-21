@@ -47,4 +47,8 @@ local function g(t)
 	until v == nil or v < 0
 	return n
 end
-print(g({1, 2, -1, 5}), (g({})))
+local v1 = print
+local t2 = {1, 2, -1, 5}
+local v2 = g(t2)
+local t3 = {}
+v1(v2, (g(t3)))
