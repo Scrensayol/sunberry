@@ -160,6 +160,10 @@ struct RetMode {
 // where a loop's far exits land, the pcs jumping there, and the flag (see `far_exits`)
 type Far = Option<(Vec<usize>, usize, u32)>;
 
+// a far exit's landing when it's the enclosing loop's far exit too: the inner loop sets the
+// enclosing loop's flag and breaks, and the enclosing loop breaks right after it
+const PROPAGATE: usize = usize::MAX;
+
 // the loop being lifted: where a `break` and a `continue` jump to
 struct LoopCtx {
     breaks: Vec<usize>,
@@ -2479,6 +2483,13 @@ impl Lifter<'_> {
         {
             self.clear(result)?;
         }
+        // and so is one in any other register the region overwrites without reading (a dead
+        // local's initializer whose register a branch reuses for a temporary)
+        for r in written.iter() {
+            if r != result && matches!(self.slots[r as usize], Slot::Pending(_)) && !self.live_in[first].has(r) {
+                self.clear(r)?;
+            }
+        }
         // older values the region reads (besides what the first test consumes) are locals by
         // then: they were evaluated before it, and reading them out of order inside it would
         // take a statement
@@ -2784,6 +2795,9 @@ impl Lifter<'_> {
         let exit_pc = self.pc_at(exit);
         let mut pcs = Vec::new();
         let mut landing = None;
+        // the enclosing loop's flag, when it leaves for the same place (a `return` from two
+        // loops deep in an inlined function)
+        let outer = self.loops.last().and_then(|l| Some((l.far.clone(), l.flag?)));
         for k in start..back {
             let Some(t) = self.insns[k].target() else { continue };
             // (an early `return` of a region lifted as a function body leaves from anywhere)
@@ -2791,7 +2805,8 @@ impl Lifter<'_> {
                 continue;
             }
             let index = if exits.contains(&t) { end } else { self.idx(t)? };
-            if index > end || landing.is_some_and(|l| l != index) {
+            let index = if index > end && outer.as_ref().is_some_and(|(far, _)| far.contains(&t)) { PROPAGATE } else { index };
+            if (index > end && index != PROPAGATE) || landing.is_some_and(|l| l != index) {
                 return Err(self.unsupported("a loop jumping out past more than its own end"));
             }
             landing = Some(index);
@@ -2800,6 +2815,10 @@ impl Lifter<'_> {
             }
         }
         let Some(landing) = landing else { return Ok(None) };
+        if landing == PROPAGATE {
+            let (_, flag) = outer.expect("PROPAGATE only with an enclosing flag");
+            return Ok(Some((pcs, PROPAGATE, flag)));
+        }
         self.flush()?;
         let flag = self.new_local(u8::MAX, self.pc);
         self.body.push(Stmt::Local { locals: vec![flag], values: vec![Expr::Bool(false)] });
@@ -2815,6 +2834,10 @@ impl Lifter<'_> {
     fn after_far(&mut self, exit: usize, far: &Far, end: usize, exits: &[usize]) -> Result<usize, Error> {
         let Some((_, landing, flag)) = far else { return Ok(exit) };
         let (landing, flag) = (*landing, *flag);
+        if landing == PROPAGATE {
+            self.emit(Stmt::If { cond: Expr::Local(flag), then_body: vec![Stmt::Break], else_body: Vec::new() })?;
+            return Ok(exit);
+        }
         if landing > exit {
             let region_exits = if landing == end { exits.to_vec() } else { self.exits_from(landing) };
             let mut written = Regs::default();
