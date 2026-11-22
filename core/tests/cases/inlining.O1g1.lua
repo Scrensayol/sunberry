@@ -39,9 +39,7 @@ if clamp(v10, 0, 5) == 5 and scaled(3) > 4 then
 	print("both")
 end
 while v8 > 0 do
-	local v14 = clamp
-	local v15 = v8
-	v8 -= v14(v15, 1, 7)
+	v8 -= clamp(v8, 1, 7)
 	if v8 % 3 == 0 then
 		break
 	end

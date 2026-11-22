@@ -649,6 +649,16 @@ fn expr_refs(e: &Expr, out: &mut Vec<u32>) {
 
 // what Luau's constant folding might turn into a constant (an overestimate is only uglier):
 // literals, operators on them, and library members and builtin calls of them
+// evaluating it can't call a closure of the program's: no call, no table index. A global read
+// could only do it through a metatable on the environment that calls back into this very
+// closure, which is ignored here (unlike `inert`, where evaluating a global twice matters)
+fn calls_nothing(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_) | Expr::Vector(_) | Expr::Local(_) | Expr::Upvalue(_) | Expr::Global(_) | Expr::Closure(_)
+    )
+}
+
 fn foldable(expr: &Expr) -> bool {
     match expr {
         Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_) | Expr::Vector(_) | Expr::Global(_) => true,
@@ -1024,8 +1034,12 @@ impl Lifter<'_> {
             used.sort_unstable();
             used.dedup();
             let newest = used.last().copied();
+            // (only something that can run code can call the closure: a constant, a local, a
+            // global or a new closure evaluated after the copy can't change it)
+            let runs_code = |j: usize| !matches!(&self.pending[j].value, Value::Expr(e) if calls_nothing(e));
             let volatile = used.iter().copied().filter(|&i| Some(i) != newest).filter(|&i| {
                 matches!(&self.pending[i].value, Value::Expr(Expr::Local(l)) if self.by_ref[*l as usize])
+                    && used.iter().any(|&j| j > i && runs_code(j))
             }).max();
             match volatile {
                 Some(index) => {
@@ -2363,6 +2377,9 @@ impl Lifter<'_> {
         self.joins.push(joined);
 
         let before = self.slots.clone();
+        // which locals closures share is per path too: a branch that returns closes them
+        // (CLOSEUPVALS) on its way out, which says nothing about the code after the `if`
+        let by_ref_before = self.by_ref.clone();
         let then_exits = if then_end == end { exits.to_vec() } else { self.exits_from(then_end) };
         let then_body = self.sub_body(|l| {
             l.block(then_index, then_end, &then_exits)?;
@@ -2376,6 +2393,8 @@ impl Lifter<'_> {
             }
         };
         let then_slots = std::mem::replace(&mut self.slots, before.clone());
+        let then_by_ref = self.by_ref.clone();
+        self.by_ref[..by_ref_before.len()].copy_from_slice(&by_ref_before);
         let mut else_body = Vec::new();
         let mut else_slots = before;
         if let Some((s, e)) = else_range {
@@ -2393,6 +2412,16 @@ impl Lifter<'_> {
             else_slots = self.slots.clone();
         }
         let (then_returns, else_returns) = (then_body.last().is_some_and(Stmt::terminates), else_body.last().is_some_and(Stmt::terminates));
+        for l in 0..by_ref_before.len() {
+            let (then_ref, else_ref) = (then_by_ref[l], self.by_ref[l]);
+            self.by_ref[l] = if then_returns {
+                else_ref
+            } else if else_returns {
+                then_ref
+            } else {
+                then_ref || else_ref
+            };
+        }
         for r in 0..self.slots.len() {
             self.slots[r] = if then_returns {
                 else_slots[r]

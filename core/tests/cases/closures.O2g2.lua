@@ -40,9 +40,7 @@ fib = memoize(function(n2)
 	end
 	return fib(n2 - 1) + fib(n2 - 2)
 end)
-local v4 = print
-local v5 = fib
-v4(v5(40))
+print(fib(40))
 local handlers = {}
 for i = 1, 3 do
 	handlers[i] = function(x)

@@ -1,12 +1,4 @@
 {
   "generator": "typed-v2-branches",
-  "failing": {},
-  "refused": {
-    "next": [
-      "seed181 O0g1",
-      "seed181 O0g2",
-      "seed30 O0g1",
-      "seed30 O0g2"
-    ]
-  }
+  "failing": {}
 }

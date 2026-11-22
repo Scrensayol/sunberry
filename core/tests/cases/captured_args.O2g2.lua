@@ -12,41 +12,35 @@ end
 local v1 = print
 local v2 = n
 bump()
-local v3 = n
-v1(v2, v3, n)
-local v4 = print
+v1(v2, n, n)
+local v3 = print
 bump()
+local v4 = n
 local v5 = n
-local v6 = n
-v4(math.max(v6, v5), n)
-local v7 = print
+v3(math.max(v5, v4), n)
+local v6 = print
 bump()
+v6(max(n, n), n)
+local v7 = print
 local v8 = n
-local v9 = n
-v7(max(v9, v8), n)
-local v10 = print
+bump()
+v7(obj:show(v8, n, n))
+local v9 = print
+local v10 = tostring(n)
+bump()
+v9(v10 .. tostring(n), n)
 local v11 = n
 bump()
-v10(obj:show(v11, n, n))
+local t = {v11, n, n}
+print(t[1], t[2], t[3])
 local v12 = print
-local v13 = n
-local v14 = tostring(v13)
 bump()
-local v15 = n
-v12(v14 .. tostring(v15), n)
+v12(n + n, n)
+local v13 = print
+local v14
+v14 = select
+local v15
+v15 = 2
 local v16 = n
 bump()
-local t = {v16, n, n}
-print(t[1], t[2], t[3])
-local v17 = print
-bump()
-v17(n + n, n)
-local v18 = print
-local v19
-v19 = select
-local v20
-v20 = 2
-local v21 = n
-bump()
-local v22 = n
-v18(v19(v20, v21, v22, n))
+v13(v14(v15, v16, n, n))

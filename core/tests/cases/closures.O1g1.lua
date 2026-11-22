@@ -28,13 +28,11 @@ v10 = memoize(function(p11)
 	end
 	return v10(p11 - 1) + v10(p11 - 2)
 end)
-local v12 = print
-local v13 = v10
-v12(v13(40))
-local v14 = {}
+print(v10(40))
+local v12 = {}
 for i = 1, 3 do
-	v14[i] = function(p15)
-		return p15 * i
+	v12[i] = function(p13)
+		return p13 * i
 	end
 end
-print(v14[2](21))
+print(v12[2](21))

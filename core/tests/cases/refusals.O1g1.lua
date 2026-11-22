@@ -6,32 +6,31 @@ function v2(p3)
 		v2(p3 - 1)
 	end
 end
-local v4 = v2
-v4(3)
-local function isInside(parent, p5)
+v2(3)
+local function isInside(parent, p4)
 	while parent ~= nil do
-		if parent.kind == p5 then
+		if parent.kind == p4 then
 			return true
 		end
 		parent = parent.parent
 	end
 	return false
 end
-local v6 = {kind = "leaf", parent = {kind = "quote", parent = {kind = "doc"}}}
-local function check(p7, p8)
-	if p7 ~= nil and isInside(p7, p8) then
-		return "inside " .. p8
+local v5 = {kind = "leaf", parent = {kind = "quote", parent = {kind = "doc"}}}
+local function check(p6, p7)
+	if p6 ~= nil and isInside(p6, p7) then
+		return "inside " .. p7
 	end
-	return "outside " .. p8
+	return "outside " .. p7
 end
-local function isSupported(payload, p9)
+local function isSupported(payload, p8)
 	if type(payload) == "table" then
 		local kind = payload.kind
 		if kind == 1 or kind == 2 or kind == 3 then
 			return true
 		end
 	end
-	if p9 == 4 or p9 == 5 then
+	if p8 == 4 or p8 == 5 then
 		return true
 	end
 	return false
@@ -45,54 +44,54 @@ local function pick(action)
 	end
 	return action.price
 end
-local function scan(p10, p11)
-	if #p10 > 0 then
-		local v12 = 0
+local function scan(p9, p10)
+	if #p9 > 0 then
+		local v11 = 0
 		repeat
-			v12 += 1
-			if p10[v12] == p11 then
+			v11 += 1
+			if p9[v11] == p10 then
 				v1 += 100
 				return
 			end
-		until #p10 <= v12
+		until #p9 <= v11
 		return
 	end
-	if p11 then
+	if p10 then
 		v1 += 1
 	end
 end
 scan({1, 2, 3}, 2)
 scan({}, true)
-local function curve(p13)
+local function curve(p12)
 	return {
-		IsA = function(_, p14)
-			return p14 == "FloatCurve"
+		IsA = function(_, p13)
+			return p13 == "FloatCurve"
 		end,
 		GetKeys = function()
-			return p13
+			return p12
 		end
 	}
 end
-local function hasKeys(p15)
-	local X = p15.X
-	local Y = p15.Y
-	local Z = p15.Z
+local function hasKeys(p14)
+	local X = p14.X
+	local Y = p14.Y
+	local Z = p14.Z
 	return (if X then X:IsA("FloatCurve") and #X:GetKeys() > 0 else false)
 		or (if Y then Y:IsA("FloatCurve") and #Y:GetKeys() > 0 else false)
 		or (if Z then Z:IsA("FloatCurve") and #Z:GetKeys() > 0 else false)
 end
 print(hasKeys({X = curve({}), Z = curve({1})}), hasKeys({}), hasKeys({Y = curve({1, 2})}))
-local v16 = v1 > 3
-print(v1, check(v6, "quote"), check(v6, "table"), check(nil, "doc"))
+local v15 = v1 > 3
+print(v1, check(v5, "quote"), check(v5, "table"), check(nil, "doc"))
 print(
 	pick({price = 7, payload = {kind = 2}}),
 	pick({payload = 1, price = 8, request = {kind = 5}}),
 	pick({price = 9, payload = {}})
 )
-local v17 = print
-local v18 = {Asset = 1, Bundle = 2, Look = 3}
-local v19 = {GamePass = 4, Product = 5}
-local v20 = v16
+local v16 = print
+local v17 = {Asset = 1, Bundle = 2, Look = 3}
+local v18 = {GamePass = 4, Product = 5}
+local v19 = v15
 if v1 > 1000 then
 end
-v17(v20, "no")
+v16(v19, "no")

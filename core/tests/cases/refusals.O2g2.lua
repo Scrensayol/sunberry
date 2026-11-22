@@ -6,8 +6,7 @@ function tick(n)
 		tick(n - 1)
 	end
 end
-local v1 = tick
-v1(3)
+tick(3)
 local function isInside(node, kind)
 	while node ~= nil do
 		if node.kind == kind then
@@ -46,30 +45,30 @@ local function pick(state)
 	local payload2 = state.payload
 	local requestType2 = state.request and state.request.kind
 	local kind4
-	local v2
-	local v3 = type(payload2) == "table"
-	if v3 then
+	local v1
+	local v2 = type(payload2) == "table"
+	if v2 then
 		kind4 = payload2.kind
-		v3 = kind4 == A.Asset or kind4 == A.Bundle or kind4 == A.Look
+		v2 = kind4 == A.Asset or kind4 == A.Bundle or kind4 == A.Look
 	end
-	local v4 = not v3
-	if not v4 then
-		v2 = true
-		v4 = false
+	local v3 = not v2
+	if not v3 then
+		v1 = true
+		v3 = false
 	end
-	local v5 = v4
-	if v5 then
-		local v6 = not (requestType2 == B.GamePass or requestType2 == B.Product)
-		if not v6 then
-			v2 = true
-			v6 = false
+	local v4 = v3
+	if v4 then
+		local v5 = not (requestType2 == B.GamePass or requestType2 == B.Product)
+		if not v5 then
+			v1 = true
+			v5 = false
 		end
-		v5 = v6
+		v4 = v5
 	end
-	if v5 then
-		v2 = false
+	if v4 then
+		v1 = false
 	end
-	if not v2 then
+	if not v1 then
 		return nil
 	end
 	return state.price
@@ -136,19 +135,19 @@ local function hasKeys(folder)
 end
 print(hasKeys({X = curve({}), Z = curve({1})}), hasKeys({}), (hasKeys({Y = curve({1, 2})})))
 local flag = count > 3
-local v7 = print
-local v8 = count
-local v9 = check(tree, "quote")
-local v10 = check(tree, "table")
-local v11 = false
-v7(v8, v9, v10, "outside doc")
+local v6 = print
+local v7 = count
+local v8 = check(tree, "quote")
+local v9 = check(tree, "table")
+local v10 = false
+v6(v7, v8, v9, "outside doc")
 print(
 	pick({price = 7, payload = {kind = 2}}),
 	pick({payload = 1, price = 8, request = {kind = 5}}),
 	(pick({price = 9, payload = {}}))
 )
-local v12 = print
-local v13 = flag
+local v11 = print
+local v12 = flag
 if count > 1000 then
 end
-v12(v13, "no")
+v11(v12, "no")
