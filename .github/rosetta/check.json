@@ -14,6 +14,8 @@
       "mutants O2g2",
       "nested_inlining O2g1",
       "nested_inlining O2g2",
+      "pinned_values O0g1",
+      "pinned_values O0g2",
       "refusals O1g1",
       "refusals O1g2",
       "refusals O2g1",
