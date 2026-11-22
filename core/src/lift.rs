@@ -115,6 +115,10 @@ struct Lifter<'a> {
     // assign the variable declared before the `if`
     joins: Vec<Vec<u8>>,
     loops: Vec<LoopCtx>,
+    // how many value regions deep lifting is, and the literals pinned inside them so far:
+    // their locals are declared ahead of the outermost region, which stays an expression
+    regions: usize,
+    hoisted: Vec<(u32, Expr)>,
     trace: bool,
     // de-inlining (see inline.rs): what the first lift of every function found, whether it's
     // switched off (while checking a candidate), and closures created so far with the local
@@ -199,6 +203,7 @@ struct Snapshot {
     fastcall: Option<Fastcall>,
     namecall: Option<(u8, Vec<u8>)>,
     made: usize,
+    hoisted: usize,
     // where lifting was: liveness questions are asked about the current instruction
     pc: usize,
     at: usize,
@@ -293,6 +298,8 @@ pub fn lift(chunk: &Chunk, proto_id: usize, inline: Option<&Ctx>) -> Result<Lift
         index_of: Vec::new(),
         joins: Vec::new(),
         loops: Vec::new(),
+        regions: 0,
+        hoisted: Vec::new(),
         trace: std::env::var_os("SUNBERRY_TRACE").is_some(),
         inline,
         inlining_off: false,
@@ -1484,7 +1491,7 @@ impl Lifter<'_> {
                 let r = self.constant(c as u32)?;
                 // POWK special-cases ^2, ^0.5 and ^3 at runtime, but a constant base would let
                 // Luau fold the whole thing with pow() (sqrt(-0) is -0, pow(-0, 0.5) is 0)
-                if i.op == POWK && power_special(&r) && foldable(&l) {
+                if i.op == POWK && power_special(&r) && numeric_constant(&l) {
                     l = self.pin(l)?;
                 }
                 self.write(a, Expr::Binary(binary(i.op), Box::new(l), Box::new(r)))?
@@ -1540,12 +1547,17 @@ impl Lifter<'_> {
 
     // a value Luau can't fold: a local assigned after its declaration
     fn pin(&mut self, expr: Expr) -> Result<Expr, Error> {
-        if matches!(expr, Expr::Local(_)) || !foldable(&expr) {
+        if matches!(expr, Expr::Local(_)) || !numeric_constant(&expr) {
             return Ok(expr);
         }
         let local = self.new_local(u8::MAX, self.pc);
         // literals and operators on them read nothing, so they can go ahead of whatever is
-        // still pending; anything else waits its turn
+        // still pending, and even ahead of the value region they're in; anything else waits
+        // its turn
+        if literal(&expr) && self.regions > 0 {
+            self.hoisted.push((local, expr));
+            return Ok(Expr::Local(local));
+        }
         if !literal(&expr) {
             self.flush_for_statement()?;
         }
@@ -1766,6 +1778,7 @@ impl Lifter<'_> {
             fastcall: self.fastcall.clone(),
             namecall: self.namecall.clone(),
             made: self.made.len(),
+            hoisted: self.hoisted.len(),
             pc: self.pc,
             at: self.at,
         }
@@ -1784,8 +1797,28 @@ impl Lifter<'_> {
         self.fastcall.clone_from(&s.fastcall);
         self.namecall.clone_from(&s.namecall);
         self.made.truncate(s.made);
+        self.hoisted.truncate(s.hoisted);
         self.pc = s.pc;
         self.at = s.at;
+    }
+
+    // restore, but keep the literals pinned since (see pin): the value the paths built names
+    // their locals, which are the only locals a clean value path makes
+    fn rewind(&mut self, s: &Snapshot) -> Result<(), Error> {
+        let kept = self.hoisted.split_off(s.hoisted.min(self.hoisted.len()));
+        let names = self.names.split_off(s.names.min(self.names.len()));
+        if names.len() != kept.len() {
+            return Err(self.unsupported("locals made inside a value path"));
+        }
+        self.restore(s);
+        for name in names {
+            self.names.push(name);
+            self.by_value.push(false);
+            self.by_ref.push(false);
+            self.ever_by_ref.push(false);
+        }
+        self.hoisted.extend(kept);
+        Ok(())
     }
 
     // lifts insns[start..end); `exits` are the pcs meaning "the end of this region"
@@ -2450,6 +2483,14 @@ impl Lifter<'_> {
             }
             return Ok(None);
         };
+        // a value still pending in the result register that the region never reads is
+        // settled before it starts (it still has to be evaluated, just not in here), and before
+        // the target is chosen: settling a pending assignment leaves the local in the register
+        if let Slot::Pending(_) = self.slots[result as usize]
+            && !self.live_in[first].has(result)
+        {
+            self.clear(result)?;
+        }
         // A region can compute a local's new value (`x = x and y`). While it runs, a pending
         // copy of the local's current value stands in the register; its value is assigned
         // after. Not for a local some closure can assign mid-region.
@@ -2475,13 +2516,6 @@ impl Lifter<'_> {
             } else {
                 target = Some(l);
             }
-        }
-        // a value still pending in the result register that the region never reads is
-        // settled before it starts (it still has to be evaluated, just not in here)
-        if let Slot::Pending(_) = self.slots[result as usize]
-            && !self.live_in[first].has(result)
-        {
-            self.clear(result)?;
         }
         // and so is one in any other register the region overwrites without reading (a dead
         // local's initializer whose register a branch reuses for a temporary)
@@ -2534,7 +2568,9 @@ impl Lifter<'_> {
         // (only the outermost region is judged: one inside another is part of its value)
         let allow_big = self.allow_big;
         self.allow_big = true;
+        self.regions += 1;
         let paths = self.value_paths(first, join, result);
+        self.regions -= 1;
         self.allow_big = allow_big;
         let paths = match paths {
             Ok(Some(expr)) if !allow_big && expr_size(&expr) > 8 * (join_index - first) + 200 => {
@@ -2548,6 +2584,12 @@ impl Lifter<'_> {
         };
         match paths {
             Ok(Some(expr)) => {
+                if self.regions == 0 {
+                    for (local, value) in std::mem::take(&mut self.hoisted) {
+                        self.body.push(Stmt::Local { locals: vec![local], values: Vec::new() });
+                        self.body.push(Stmt::Assign { targets: vec![Expr::Local(local)], values: vec![value] });
+                    }
+                }
                 match target {
                     Some(l) => {
                         self.slots[result as usize] = Slot::Local(l);
@@ -2583,13 +2625,13 @@ impl Lifter<'_> {
         };
         let mut budget = 2000;
         let fall = self.value_path(first + 1, join, result, &fork, &base, old, &mut budget)?;
-        self.restore(&fork);
+        self.rewind(&fork)?;
         if let Some(id) = test.subject {
             self.push(result, Span::One, Value::Expr(Expr::Tested(id)))?;
         }
         let target = self.idx(self.insns[first].target().unwrap())?;
         let jump = self.value_path(target, join, result, &fork, &base, old, &mut budget)?;
-        self.restore(&fork);
+        self.rewind(&fork)?;
         let tree = Tree::Test { pred: test.pred, jump_when: test.jump_when, subject: test.subject, fall: Box::new(fall), jump: Box::new(jump) };
         let Some(expr) = build_value(tree) else { return Ok(None) };
         // the result register's old value, if the region started from one, is part of it now
@@ -2625,7 +2667,8 @@ impl Lifter<'_> {
                 return self.region_value(result, base, old).map(Tree::Value);
             }
             self.enter(i)?;
-            let clean = |l: &Self| l.body.len() == fork.body && l.names.len() == fork.names;
+            // (a hoisted literal adds a name but no statement here)
+            let clean = |l: &Self| l.body.len() == fork.body && l.names.len() - l.hoisted.len() == fork.names - fork.hoisted;
             if let Some(n) = self.try_inline(i)? {
                 if !clean(self) {
                     return Err(self.unsupported("statement inside an expression"));
@@ -2651,13 +2694,13 @@ impl Lifter<'_> {
                 }
                 let here = self.snapshot();
                 let fall = self.value_path(i + 1, join, result, fork, base, old, budget)?;
-                self.restore(&here);
+                self.rewind(&here)?;
                 if let Some(id) = test.subject {
                     self.push(result, Span::One, Value::Expr(Expr::Tested(id)))?;
                 }
                 let target = self.idx(insn.target().unwrap())?;
                 let jump = self.value_path(target, join, result, fork, base, old, budget)?;
-                self.restore(&here);
+                self.rewind(&here)?;
                 return Ok(Tree::Test { pred: test.pred, jump_when: test.jump_when, subject: test.subject, fall: Box::new(fall), jump: Box::new(jump) });
             }
             match insn.op {
@@ -3343,8 +3386,14 @@ fn literal(e: &Expr) -> bool {
 fn power_special(e: &Expr) -> bool {
     match literal_value(e) {
         Some(n) => n == 2.0 || n == 0.5 || n == 3.0,
-        None => foldable(e),
+        None => numeric_constant(e),
     }
+}
+
+// `foldable`, without a global on its own: that's never a number at compile time (a
+// global function only folds when called)
+fn numeric_constant(e: &Expr) -> bool {
+    !matches!(e, Expr::Global(_)) && foldable(e)
 }
 
 // the value of plain arithmetic on number literals, as Luau would fold it
