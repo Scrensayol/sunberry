@@ -2107,7 +2107,12 @@ impl Lifter<'_> {
             }
             let then_index = tests[n - 1] + 1;
             let then_pc = self.pc_at(then_index);
-            let Some(nodes) = self.condition_nodes(&tests[..n], then_pc, &normalize) else { continue };
+            let Some(nodes) = self.condition_nodes(&tests[..n], then_pc, &normalize) else {
+                if self.trace {
+                    eprintln!("       condition {:?} then {then_pc}: a test jumps into the middle (targets {:?})", tests[..n].iter().map(|&t| self.insns[t].pc).collect::<Vec<_>>(), tests[..n].iter().map(|&t| normalize(self.insns[t].target().unwrap())).collect::<Vec<_>>());
+                }
+                continue;
+            };
             let mut else_pc = None;
             let mut valid = true;
             for &t in &nodes {
@@ -2273,10 +2278,11 @@ impl Lifter<'_> {
             if !is_test(self.insns[k].op) {
                 // `x and false` folds to JUMPIFNOT x / JUMP else, and prints back the same way
                 // the side it never takes still points on, so the chain stays connected
+                // (`x and 1 or y` jumps on to a later part: a truth that goes there)
                 let node = match jump {
                     Succ::Then => CondNode { pre, pred: Expr::Bool(true), t: Succ::Then, f: fall },
                     Succ::Else => CondNode { pre, pred: Expr::Bool(false), t: fall, f: Succ::Else },
-                    Succ::Node(_) => return Err(self.unsupported("a constant jump inside a condition")),
+                    Succ::Node(m) => CondNode { pre, pred: Expr::Bool(true), t: Succ::Node(m), f: fall },
                 };
                 nodes.push(Some(node));
                 continue;
