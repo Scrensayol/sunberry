@@ -1413,6 +1413,14 @@ impl Lifter<'_> {
                     self.namecall_local = Some((a, m));
                     self.slots[a as usize] = Slot::Free;
                 }
+                // so does one in the base itself that the branch's result is joined in (`v = "x";
+                // v = v:rep(2)` in each branch of an `if`): the result still goes to the variable
+                if b == a
+                    && let Slot::Local(m) = self.slots[a as usize]
+                    && self.joins.iter().any(|j| j.contains(&a))
+                {
+                    self.namecall_local = Some((a, m));
+                }
                 match self.slots[b as usize] {
                     Slot::Pending(id) if b == a => {
                         let index = self.index_of(id);
