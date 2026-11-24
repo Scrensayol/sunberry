@@ -126,7 +126,18 @@ pub struct Liveness {
 }
 
 pub fn analyze(insns: &[Insn], index_of: &[usize]) -> Liveness {
-    let successors = (0..insns.len()).map(|i| successors(insns, index_of, i)).collect::<Vec<_>>();
+    let mut successors = (0..insns.len()).map(|i| successors(insns, index_of, i)).collect::<Vec<_>>();
+    // code nothing reaches (the body of `while x and false do`) is still printed where it
+    // stands, so what it reads has to be there: it counts as following the code before it
+    let mut reached = vec![false; insns.len()];
+    for s in successors.iter().flatten() {
+        reached[*s] = true;
+    }
+    for i in 1..insns.len() {
+        if !reached[i] {
+            successors[i - 1].push(i);
+        }
+    }
     let effects = insns.iter().map(|i| (reads(i), writes(i))).collect::<Vec<_>>();
     let mut live_in = vec![Regs::default(); insns.len()];
     loop {
