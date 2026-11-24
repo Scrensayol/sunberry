@@ -3500,8 +3500,11 @@ impl Lifter<'_> {
             }
             // created here: named by its local, its upvalues are its captures; created in an
             // enclosing function: named by this function's upvalue for that local
+            let orphan = ctx.orphan[callee];
             let (func, captures) = match self.made.iter().rev().find(|m| m.0 == callee) {
                 Some((_, local, captures)) => (Expr::Local(*local), Some(captures.clone())),
+                // (the closure expression itself, once matching says what it captures)
+                None if orphan => (Expr::Nil, None),
                 None => {
                     let Some(holder) = ctx.holder[callee] else {
                         note(&mut why, if ctx.site[callee].is_none() { "callee created in several places" } else { "callee not kept in a local" });
@@ -3609,12 +3612,26 @@ impl Lifter<'_> {
                     lifted.push((end, returns));
                 }
                 for sub in variants {
+                    let found = std::cell::RefCell::new(vec![None; self.chunk.protos[callee].num_upvalues as usize]);
                     let upvalues = match &captures {
                         Some(c) => Upvalues::Here(c),
+                        None if orphan => Upvalues::Infer { found: &found, count: self.proto.num_upvalues as usize },
                         None => Upvalues::Outer { callee, caller: self.proto_id, extra: &seen_extra },
                     };
                     let sub = &sub;
-                    let Some(plan) = inline::unify(ctx, callee, upvalues, sub) else {
+                    let mut plan = inline::unify(ctx, callee, upvalues, sub);
+                    let mut func = func.clone();
+                    if orphan && plan.is_some() {
+                        // every upvalue accounted for, and the match holds with exactly those
+                        // (a try that failed part way may have named one first)
+                        let named = found.borrow().iter().map(|k| k.map(Capture::Upvalue)).collect::<Option<Vec<_>>>();
+                        plan = named.and_then(|captures| {
+                            let plan = inline::unify(ctx, callee, Upvalues::Here(&captures), sub)?;
+                            func = Expr::Closure(Box::new(Closure { proto: callee, captures }));
+                            Some(plan)
+                        });
+                    }
+                    let Some(plan) = plan else {
                         if end == run_end {
                             note(&mut why, "no match");
                         }
@@ -3761,7 +3778,15 @@ impl Lifter<'_> {
             // (a region inside another one's sandbox puts the outer one's mode back after)
             let outer_ret = self.ret.take();
             let mut variants: Vec<Sub> = Vec::new();
-            for values_to_end in [true, false] {
+            // a result nothing reads (`local _ = f()`) is still written on every way out: the
+            // register the last instruction writes, tried after the region as it stands
+            let mut target_sets = vec![targets.clone()];
+            if targets.is_empty()
+                && let [r] = liveness::writes(&self.insns[end - 1]).iter().collect::<Vec<_>>()[..]
+            {
+                target_sets.push(vec![r]);
+            }
+            for (targets, values_to_end) in target_sets.iter().flat_map(|t| [(t, true), (t, false)]) {
                 self.restore(&fork);
                 let mut ends = self.exits_from(end);
                 ends.extend(self.return_copies(end));

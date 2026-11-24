@@ -138,7 +138,7 @@ fn deinline(chunk: &bytecode::Chunk, lifted: Vec<Result<lift::Lifted, Error>>) -
 // The functions main can reach through closure instructions. Luau keeps a function it inlined
 // everywhere (an immediately called `(function() ... end)()` at -O2) in the chunk with nothing
 // left that creates it.
-fn created(chunk: &bytecode::Chunk) -> Vec<bool> {
+pub(crate) fn created(chunk: &bytecode::Chunk) -> Vec<bool> {
     use bytecode::{Constant, Op};
     let mut created = vec![false; chunk.protos.len()];
     let mut work = vec![chunk.main];

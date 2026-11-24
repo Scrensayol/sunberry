@@ -58,6 +58,9 @@ pub struct Ctx {
     pub origin: Vec<Vec<Option<(usize, u32)>>>,
     // the local each function is created into, when it is `local f = function` / `local function f`
     pub holder: Vec<Option<(usize, u32)>>,
+    // functions nothing creates: Luau inlined the only use of `(function() ... end)()`, and
+    // a copy that matches is called again as that expression, capturing the caller's upvalues
+    pub orphan: Vec<bool>,
     pub runs: Vec<Vec<Run>>,
     // for each function, instruction index -> candidate callees there (innermost first)
     pub callees: Vec<HashMap<usize, Vec<usize>>>,
@@ -218,7 +221,8 @@ pub fn context(chunk: &Chunk, raw: Vec<Raw>, functions: &[Function]) -> Ctx {
         );
         calls_param.push(funcs.iter().any(|e| matches!(e, Expr::Local(l) if raw[f].params.contains(l))));
     }
-    Ctx { raw, site, origin, holder, runs, callees, calls, calls_param }
+    let orphan = crate::created(chunk).into_iter().map(|c| !c).collect();
+    Ctx { raw, site, origin, holder, orphan, runs, callees, calls, calls_param }
 }
 
 // the function expressions a statement calls, nested statements included (not closures')
@@ -363,6 +367,9 @@ pub enum Upvalues<'a> {
     // created in an enclosing function: the caller sees the same variables as its upvalues
     // (its own, then the new ones in `extra`, see `Lifter::extra`)
     Outer { callee: usize, caller: usize, extra: &'a [usize] },
+    // created nowhere (see `Ctx::orphan`): each is whichever of the caller's own `count`
+    // upvalues it is first matched with, and that one from then on
+    Infer { found: &'a std::cell::RefCell<Vec<Option<u8>>>, count: usize },
 }
 
 pub fn unify(ctx: &Ctx, callee: usize, upvalues: Upvalues, sub: &Sub) -> Option<Plan> {
@@ -390,6 +397,16 @@ pub fn unify(ctx: &Ctx, callee: usize, upvalues: Upvalues, sub: &Sub) -> Option<
                     _ => false,
                 }
             }
+            Upvalues::Infer { found, count } => match *s {
+                Expr::Upvalue(k) if (k as usize) < *count => {
+                    let mut found = found.borrow_mut();
+                    match found.get_mut(u as usize) {
+                        Some(slot) => *slot.get_or_insert(k) == k,
+                        None => false,
+                    }
+                }
+                _ => false,
+            },
         }
     };
     let why = std::env::var_os("SUNBERRY_TRACE_INLINE").is_some();
