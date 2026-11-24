@@ -275,6 +275,12 @@ pub struct Lifted {
 }
 
 pub fn lift(chunk: &Chunk, proto_id: usize, inline: Option<&Ctx>) -> Result<Lifted, Error> {
+    // code that can't do anything (see `drop_idle_code`) only goes when it is in the way:
+    // dropping it everywhere changes shapes the rest relies on
+    lift_with(chunk, proto_id, inline, false).or_else(|e| lift_with(chunk, proto_id, inline, true).map_err(|_| e))
+}
+
+fn lift_with(chunk: &Chunk, proto_id: usize, inline: Option<&Ctx>, drop_idle: bool) -> Result<Lifted, Error> {
     let proto = &chunk.protos[proto_id];
     let mut lifter = Lifter {
         proto_id,
@@ -325,12 +331,16 @@ pub fn lift(chunk: &Chunk, proto_id: usize, inline: Option<&Ctx>) -> Result<Lift
         })
         .collect();
 
-    let insns = proto.insns();
+    let mut insns = proto.insns();
     let mut index_of = vec![usize::MAX; proto.code.len() + 1];
     for (i, insn) in insns.iter().enumerate() {
         index_of[insn.pc] = i;
     }
     index_of[proto.code.len()] = insns.len();
+    // (nothing to drop: the retry would only fail the same way)
+    if drop_idle && !drop_idle_code(&mut insns, &index_of) {
+        return Err(Error::Unsupported { proto: proto_id, pc: 0, what: "no idle code".into() });
+    }
     let liveness = liveness::analyze(&insns, &index_of);
     lifter.live = liveness.live_after;
     lifter.live_in = liveness.live_in;
@@ -3519,6 +3529,69 @@ fn safe_key(e: &Expr) -> bool {
 // reading it a second time right away gives the same value and runs nothing
 fn duplicable(e: &Expr) -> bool {
     matches!(e, Expr::Local(_) | Expr::Upvalue(_)) || pure_constant(e)
+}
+
+// A test that goes to the same place either way (`x and 0/0 or 0/0` is always true, and Luau
+// leaves `JUMPIFNOT x -> L; JUMP -> L`) does nothing: only one on a value or against a
+// constant, which can't call a metamethod. It becomes a NOP, and the value it would have
+// looked at is evaluated like any other nobody reads.
+fn drop_idle_code(insns: &mut [Insn], index_of: &[usize]) -> bool {
+    let before = insns.iter().filter(|i| i.op == Op::NOP).count();
+    let insns_ro: &[Insn] = insns;
+    // where control ends up from insns[i], through unconditional forward jumps
+    let land = |mut i: usize| {
+        for _ in 0..8 {
+            match insns_ro.get(i) {
+                Some(j) if matches!(j.op, Op::JUMP | Op::JUMPX) && j.target().is_some_and(|t| t > j.pc) => {
+                    match index_of.get(j.target().unwrap()) {
+                        Some(&k) if k != usize::MAX => i = k,
+                        _ => return i,
+                    }
+                }
+                _ => return i,
+            }
+        }
+        i
+    };
+    let idle = (0..insns_ro.len())
+        .filter(|&k| {
+            let i = insns_ro[k];
+            let idle_kind = matches!(i.op, Op::JUMPIF | Op::JUMPIFNOT | Op::JUMPXEQKNIL | Op::JUMPXEQKB | Op::JUMPXEQKN | Op::JUMPXEQKS);
+            i.target()
+                .filter(|&t| idle_kind && t > i.pc)
+                .and_then(|t| index_of.get(t).copied().filter(|&t| t != usize::MAX))
+                .is_some_and(|to| land(to) == land(k + 1))
+        })
+        .collect::<Vec<_>>();
+    for k in idle {
+        insns[k].op = Op::NOP;
+    }
+    // and what a forward jump skips that nothing reaches, when all it does is load a constant
+    // or copy a register: the arm `if <always true> then a else nil` never takes
+    let targets = insns.iter().filter_map(|i| i.target()).collect::<std::collections::HashSet<_>>();
+    let mut dead = Vec::new();
+    for (j, i) in insns.iter().enumerate() {
+        if !matches!(i.op, Op::JUMP | Op::JUMPX) {
+            continue;
+        }
+        let Some(&to) = i.target().filter(|&t| t > i.pc).and_then(|t| index_of.get(t)).filter(|&&t| t != usize::MAX) else { continue };
+        let skipped = j + 1..to;
+        let loads = |x: &Insn| matches!(x.op, Op::LOADNIL | Op::LOADN | Op::LOADK | Op::LOADKX | Op::MOVE | Op::NOP) || x.op == Op::LOADB && x.c == 0;
+        if !skipped.is_empty() && skipped.clone().all(|k| loads(&insns[k]) && !targets.contains(&insns[k].pc)) {
+            dead.push(j);
+            dead.extend(skipped);
+        }
+    }
+    for k in dead {
+        insns[k].op = Op::NOP;
+    }
+    // (a jump to the very next instruction, which those leave behind, is no jump either)
+    for k in 0..insns.len().saturating_sub(1) {
+        if matches!(insns[k].op, Op::JUMP | Op::JUMPX) && insns[k].target() == Some(insns[k + 1].pc) {
+            insns[k].op = Op::NOP;
+        }
+    }
+    insns.iter().filter(|i| i.op == Op::NOP).count() > before
 }
 
 fn pure_constant(e: &Expr) -> bool {
