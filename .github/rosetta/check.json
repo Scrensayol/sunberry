@@ -19,7 +19,9 @@
       "refusals O1g1",
       "refusals O1g2",
       "refusals O2g1",
-      "refusals O2g2"
+      "refusals O2g2",
+      "wrapped_helpers O2g1",
+      "wrapped_helpers O2g2"
     ]
   }
 }
