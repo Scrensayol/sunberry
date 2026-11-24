@@ -159,6 +159,9 @@ struct RetMode {
     // whether a value region may end at its end: `return a and b` is one, but so is
     // `if c then return a end; return b` copied inline
     values_to_end: bool,
+    // where a trailing LOADNIL of the results starts (see `nil_tail`): a jump there is a
+    // `return` with no values
+    nil_at: Option<usize>,
 }
 
 // where a loop's far exits land, the pcs jumping there, and the flag (see `far_exits`)
@@ -1954,8 +1957,12 @@ impl Lifter<'_> {
                     if let Some(r) = &self.ret
                         && r.ends.contains(&target)
                     {
-                        let targets = r.targets.clone();
-                        self.ret_from(&targets)?;
+                        if r.nil_at == Some(target) {
+                            self.emit(Stmt::Return(Vec::new()))?;
+                        } else {
+                            let targets = r.targets.clone();
+                            self.ret_from(&targets)?;
+                        }
                         i += 1;
                         continue;
                     }
@@ -2093,7 +2100,9 @@ impl Lifter<'_> {
             if insn.pc >= reach && part != reach {
                 break;
             }
-            let forward_jump = matches!(insn.op, Op::JUMP | Op::JUMPX) && insn.target().is_some_and(|t| t > insn.pc);
+            // (not one that is an inlined body's early `return`: that is the then branch's
+            // statement, `if c then return end`, as the callee says it)
+            let forward_jump = matches!(insn.op, Op::JUMP | Op::JUMPX) && insn.target().is_some_and(|t| t > insn.pc && !(self.returns_to(t) && self.ret.as_ref().is_some_and(|r| r.nil_at == Some(t))));
             // (statements too: an inlined body's can sit between a condition's tests)
             let statement = matches!(insn.op, Op::CALL | Op::CALLFB | Op::SETGLOBAL | Op::SETUPVAL | Op::CLOSEUPVALS);
             if is_test(insn.op) || forward_jump {
@@ -2119,15 +2128,34 @@ impl Lifter<'_> {
         // (the first statement among the parts: without statements, no condition reaches past it;
         // see `condition`)
         let first_statement = (first + 1..end).find(|&i| self.statement_at(i)).unwrap_or(usize::MAX);
-        for (statements, n) in [false, true].into_iter().flat_map(|s| (1..=tests.len()).rev().map(move |n| (s, n))) {
-            if !statements && tests[n - 1] > first_statement {
+        // (and without the parts inside an inlined copy: once the copy is a call again, it is
+        // the code before a later part, `a and not f(b)`, and its own tests are gone)
+        let mut lists = vec![tests.clone()];
+        if let Some(ctx) = self.inline
+            && !self.inlining_off
+        {
+            // (a part in a copy that jumps within it; the caller's own test of the call's
+            // result keeps the callee's line too, but jumps out)
+            let inside = |t: usize| {
+                ctx.run_at(self.proto_id, t).is_some_and(|r| {
+                    let (lo, hi) = (self.insns[r.start].pc, self.pc_at(r.end));
+                    self.insns[t].target().is_some_and(|x| x > lo && x < hi)
+                })
+            };
+            let outside = tests.iter().copied().filter(|&t| !inside(t)).collect::<Vec<_>>();
+            if !outside.is_empty() && outside.len() < tests.len() && outside[0] == tests[0] {
+                lists.push(outside);
+            }
+        }
+        for (list, statements, n) in lists.iter().flat_map(|list| [false, true].into_iter().flat_map(move |s| (1..=list.len()).rev().map(move |n| (list, s, n)))) {
+            if !statements && list[n - 1] > first_statement {
                 continue;
             }
-            let then_index = tests[n - 1] + 1;
+            let then_index = list[n - 1] + 1;
             let then_pc = self.pc_at(then_index);
-            let Some(nodes) = self.condition_nodes(&tests[..n], then_pc, &normalize) else {
+            let Some(nodes) = self.condition_nodes(&list[..n], then_pc, &normalize) else {
                 if self.trace {
-                    eprintln!("       condition {:?} then {then_pc}: a test jumps into the middle (targets {:?})", tests[..n].iter().map(|&t| self.insns[t].pc).collect::<Vec<_>>(), tests[..n].iter().map(|&t| normalize(self.insns[t].target().unwrap())).collect::<Vec<_>>());
+                    eprintln!("       condition {:?} then {then_pc}: a test jumps into the middle (targets {:?})", list[..n].iter().map(|&t| self.insns[t].pc).collect::<Vec<_>>(), list[..n].iter().map(|&t| normalize(self.insns[t].target().unwrap())).collect::<Vec<_>>());
                 }
                 continue;
             };
@@ -3776,12 +3804,38 @@ impl Lifter<'_> {
     fn returns_early(&self, at: usize, end: usize) -> bool {
         let mut ends = self.exits_from(end);
         ends.extend(self.return_copies(end));
+        let mut tail = end;
+        while tail > at + 1 && self.insns[tail - 1].op == Op::LOADNIL {
+            tail -= 1;
+        }
+        if tail < end {
+            ends.push(self.pc_at(tail));
+        }
         let ret = self.insns.get(end).filter(|i| i.op == Op::RETURN && i.b != 0);
         (at..end - 1).any(|k| {
             let i = &self.insns[k];
             matches!(i.op, Op::JUMP | Op::JUMPX) && i.target().is_some_and(|t| ends.contains(&t))
                 || ret.is_some_and(|r| i.op == Op::RETURN && i.a == r.a && i.b == r.b)
         }) || ret.is_some_and(|r| self.insns[end - 1].op == Op::RETURN && self.insns[end - 1].a == r.a && self.insns[end - 1].b == r.b)
+    }
+
+    // An inlined body that returns no values ends by setting its results to nil, and an early
+    // `return` in it jumps there: where that run of LOADNILs into exactly the results starts
+    fn nil_tail(&self, at: usize, end: usize, targets: &[u8]) -> Option<usize> {
+        if targets.is_empty() {
+            return None;
+        }
+        let mut t = end;
+        let mut set = Regs::default();
+        while t > at + 1 && self.insns[t - 1].op == Op::LOADNIL && targets.contains(&self.insns[t - 1].a) {
+            t -= 1;
+            set.add(self.insns[t].a as usize);
+        }
+        let all = targets.iter().all(|&r| set.has(r));
+        // (and something jumps to it: otherwise the body just ends in `return nil`)
+        let pc = self.pc_at(t);
+        let jumped = (at..t).any(|k| self.insns[k].target() == Some(pc) && matches!(self.insns[k].op, Op::JUMP | Op::JUMPX));
+        (t < end && all && jumped).then_some(t)
     }
 
     // whether a jump to pc is an early `return` (see `sandbox`)
@@ -3852,10 +3906,20 @@ impl Lifter<'_> {
                 self.restore(&fork);
                 let mut ends = self.exits_from(end);
                 ends.extend(self.return_copies(end));
-                self.ret = Some(RetMode { ends, targets: targets.clone(), at_end, values_to_end });
-                let stmts = self.sub_body(|l| {
-                    l.block(at, end, &exits)?;
-                    if inline::ends_in_return(&l.body) { Ok(()) } else { l.ret_from(&targets) }
+                let nil_tail = self.nil_tail(at, end, targets);
+                let nil_at = nil_tail.map(|t| self.pc_at(t));
+                ends.extend(nil_at);
+                self.ret = Some(RetMode { ends, targets: targets.clone(), at_end, values_to_end, nil_at });
+                let stmts = self.sub_body(|l| match nil_tail {
+                    // the body up to the LOADNIL, falling off it with no values
+                    Some(t) => {
+                        l.block(at, t, &[l.pc_at(t)])?;
+                        if inline::ends_in_return(&l.body) { Ok(()) } else { l.emit(Stmt::Return(Vec::new())) }
+                    }
+                    None => {
+                        l.block(at, end, &exits)?;
+                        if inline::ends_in_return(&l.body) { Ok(()) } else { l.ret_from(&targets) }
+                    }
                 });
                 self.ret = None;
                 let stmts = match stmts {
