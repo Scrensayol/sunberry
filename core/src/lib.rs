@@ -66,6 +66,7 @@ fn deinline(chunk: &bytecode::Chunk, lifted: Vec<Result<lift::Lifted, Error>>) -
         return lifted.into_iter().map(|l| l.map(|l| l.function)).collect();
     }
     let n = chunk.protos.len();
+    let created = created(chunk);
     let mut errors = Vec::new();
     let (mut functions, mut raw): (Vec<_>, Vec<_>) = lifted
         .into_iter()
@@ -76,7 +77,10 @@ fn deinline(chunk: &bytecode::Chunk, lifted: Vec<Result<lift::Lifted, Error>>) -
                 (l.function, raw)
             }
             Err(e) => {
-                errors.push((id, e));
+                // a function nothing creates is never printed, so it can't refuse the script
+                if created[id] {
+                    errors.push((id, e));
+                }
                 let proto = &chunk.protos[id];
                 let empty = ast::Function { params: Vec::new(), is_vararg: proto.is_vararg, body: Vec::new(), names: Vec::new(), param_types: Vec::new() };
                 (empty, inline::Raw { ok: false, params: Vec::new(), is_vararg: proto.is_vararg, body: Vec::new(), flags: Vec::new() })
@@ -129,6 +133,30 @@ fn deinline(chunk: &bytecode::Chunk, lifted: Vec<Result<lift::Lifted, Error>>) -
         }
     }
     Ok(out)
+}
+
+// The functions main can reach through closure instructions. Luau keeps a function it inlined
+// everywhere (an immediately called `(function() ... end)()` at -O2) in the chunk with nothing
+// left that creates it.
+fn created(chunk: &bytecode::Chunk) -> Vec<bool> {
+    use bytecode::{Constant, Op};
+    let mut created = vec![false; chunk.protos.len()];
+    let mut work = vec![chunk.main];
+    while let Some(id) = work.pop() {
+        let Some(proto) = chunk.protos.get(id).filter(|_| !std::mem::replace(&mut created[id], true)) else { continue };
+        for insn in proto.insns() {
+            let child = match insn.op {
+                Op::NEWCLOSURE => proto.children.get(insn.d() as usize).copied(),
+                Op::DUPCLOSURE => match proto.constants.get(insn.d() as usize) {
+                    Some(Constant::Closure(child)) => Some(*child as usize),
+                    _ => None,
+                },
+                _ => None,
+            };
+            work.extend(child);
+        }
+    }
+    created
 }
 
 fn flags(function: &ast::Function) -> Vec<bool> {
