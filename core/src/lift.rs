@@ -833,13 +833,14 @@ impl Lifter<'_> {
 
     // before a statement: a table under construction that only holds constants can still
     // wait, as nothing can reach it yet and the statement can't change a constant
+    // (a nil or NaN key is an error where the table is made: that one can't wait)
     #[track_caller]
     fn flush_for_statement(&mut self) -> Result<(), Error> {
         let constant = |f: &Field| {
             let c = |e: &Expr| matches!(e, Expr::Nil | Expr::Bool(_) | Expr::Number(_) | Expr::String(_) | Expr::Vector(_));
             match f {
                 Field::Positional(v) => c(v),
-                Field::Keyed(k, v) => c(k) && c(v),
+                Field::Keyed(k, v) => safe_key(k) && c(v),
             }
         };
         let keep = self
@@ -851,9 +852,10 @@ impl Lifter<'_> {
         self.flush_except(self.pending.len(), &keep)
     }
 
-    // Making a table has no effects of its own, so when values have to become locals only to
-    // keep their order, a table under construction whose fields so far are pure can wait and
-    // stay a constructor (unless it is one of `reading`, the registers being read now).
+    // Making a table has no effects of its own (given keys it can't fail on, see `safe_key`),
+    // so when values have to become locals only to keep their order, a table under
+    // construction whose fields so far are pure can wait and stay a constructor (unless it
+    // is one of `reading`, the registers being read now).
     #[track_caller]
     fn flush_keeping(&mut self, count: usize, reading: &[u8]) -> Result<(), Error> {
         let keep = if reading.is_empty() {
@@ -921,7 +923,7 @@ impl Lifter<'_> {
         };
         match field {
             Field::Positional(v) => pure(v),
-            Field::Keyed(k, v) => pure(k) && pure(v),
+            Field::Keyed(k, v) => safe_key(k) && pure(v),
         }
     }
 
@@ -3442,6 +3444,16 @@ fn literal_value(e: &Expr) -> Option<f64> {
         }
         _ => return None,
     })
+}
+
+// a constant that storing under can't fail: a nil or NaN key raises an error, and so might
+// a key only known when it runs
+fn safe_key(e: &Expr) -> bool {
+    match e {
+        Expr::Number(n) => !n.is_nan(),
+        Expr::Bool(_) | Expr::String(_) | Expr::Vector(_) => true,
+        _ => false,
+    }
 }
 
 fn pure_constant(e: &Expr) -> bool {
