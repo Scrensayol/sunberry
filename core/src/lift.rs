@@ -790,6 +790,15 @@ impl Lifter<'_> {
         }
     }
 
+    // the locals from `from` up go out of scope: no closure shares them any more
+    fn close_upvalues(&mut self, from: u8) {
+        for slot in &self.slots[from as usize..] {
+            if let Slot::Local(l) = *slot {
+                self.by_ref[l as usize] = false;
+            }
+        }
+    }
+
     fn push(&mut self, reg: u8, span: Span, value: Value) -> Result<(), Error> {
         let width = match span {
             Span::One => 1,
@@ -1331,13 +1340,7 @@ impl Lifter<'_> {
             // closures stop sharing the locals from here up; the registers keep their values
             // (a following `return` still reads them), but a later write no longer reaches a
             // closure, so it needn't be an assignment
-            CLOSEUPVALS => {
-                for slot in &self.slots[a as usize..] {
-                    if let Slot::Local(l) = *slot {
-                        self.by_ref[l as usize] = false;
-                    }
-                }
-            }
+            CLOSEUPVALS => self.close_upvalues(a),
             GETIMPORT => {
                 let Some(Constant::Import(path)) = self.proto.constants.get(i.d() as usize) else {
                     return Err(self.unsupported("GETIMPORT of a non-import constant"));
@@ -3695,6 +3698,13 @@ impl Lifter<'_> {
                     };
                     match self.call_inlined(end, func.clone(), &plan, sub) {
                         Ok(()) => {
+                            // a CLOSEUPVALS the copy took in still ends the caller's variables
+                            // it closes: a write to their registers after it is a new local
+                            for k in at..end {
+                                if self.insns[k].op == Op::CLOSEUPVALS {
+                                    self.close_upvalues(self.insns[k].a);
+                                }
+                            }
                             if let Expr::Upvalue(k) = func
                                 && k as usize >= n
                                 && !self.extra.contains(&callee)
