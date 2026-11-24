@@ -168,11 +168,17 @@ pub fn context(chunk: &Chunk, raw: Vec<Raw>, functions: &[Function]) -> Ctx {
         callees.push(at);
     }
     // closures as the first lift found them: what each captures and where it is kept
+    // (not in a function nothing creates: an inlined `(function() ... end)()` whose copy in its
+    // caller makes the same closures again is never run itself)
+    let orphan: Vec<bool> = crate::created(chunk).into_iter().map(|c| !c).collect();
     let mut sites = vec![0usize; n];
     let mut site = vec![None; n];
     let mut captures = vec![None; n];
     let mut holder = vec![None; n];
     for (f, function) in functions.iter().enumerate() {
+        if orphan[f] {
+            continue;
+        }
         visit_closures(&function.body, &mut |closure, kept| {
             sites[closure.proto] += 1;
             site[closure.proto] = Some(f);
@@ -221,7 +227,6 @@ pub fn context(chunk: &Chunk, raw: Vec<Raw>, functions: &[Function]) -> Ctx {
         );
         calls_param.push(funcs.iter().any(|e| matches!(e, Expr::Local(l) if raw[f].params.contains(l))));
     }
-    let orphan = crate::created(chunk).into_iter().map(|c| !c).collect();
     Ctx { raw, site, origin, holder, orphan, runs, callees, calls, calls_param }
 }
 

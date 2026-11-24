@@ -3550,6 +3550,12 @@ impl Lifter<'_> {
             // created here: named by its local, its upvalues are its captures; created in an
             // enclosing function: named by this function's upvalue for that local
             let orphan = ctx.orphan[callee];
+            // (one that makes closures stays inlined: the closures it makes are counted where
+            // its copy makes them, and a call would move them into its own body)
+            if orphan && !self.chunk.protos[callee].children.is_empty() {
+                note(&mut why, "closure expression that makes closures");
+                continue;
+            }
             let (func, captures) = match self.made.iter().rev().find(|m| m.0 == callee) {
                 Some((_, local, captures)) => (Expr::Local(*local), Some(captures.clone())),
                 // (the closure expression itself, once matching says what it captures)
