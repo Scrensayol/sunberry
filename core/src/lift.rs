@@ -959,6 +959,10 @@ impl Lifter<'_> {
             if let Slot::Pending(id) = self.slots[reg as usize] {
                 let index = self.index_of(id);
                 let p = &self.pending[index];
+                // (a variable or a constant read twice, `a == a`, is the same value both times)
+                if used.contains(&index) && p.span == Span::One && matches!(&p.value, Value::Expr(e) if duplicable(e)) {
+                    continue;
+                }
                 if p.reg != reg || matches!(p.span, Span::Many(_)) || used.contains(&index) {
                     return None;
                 }
@@ -1084,8 +1088,14 @@ impl Lifter<'_> {
         }
         let mut out = Vec::new();
         let mut skip_to = 0usize;
+        // (what each register read so far gave: one read twice gives the same again)
+        let mut taken: Vec<(u8, Expr)> = Vec::new();
         for &reg in regs {
             if (reg as usize) < skip_to {
+                continue;
+            }
+            if let Some((_, e)) = taken.iter().find(|(r, _)| *r == reg) {
+                out.push(Operand::Expr(e.clone()));
                 continue;
             }
             match self.slots[reg as usize] {
@@ -1095,6 +1105,11 @@ impl Lifter<'_> {
                     let index = self.index_of(id);
                     let pending = self.pending.remove(index);
                     self.slots[reg as usize] = Slot::Free;
+                    if let Value::Expr(e) = &pending.value
+                        && duplicable(e)
+                    {
+                        taken.push((reg, e.clone()));
+                    }
                     out.push(match pending.value {
                         Value::Expr(e) => Operand::Expr(e),
                         Value::Table(fields, _) => Operand::Expr(table(fields)),
@@ -3471,6 +3486,11 @@ fn safe_key(e: &Expr) -> bool {
         Expr::Bool(_) | Expr::String(_) | Expr::Vector(_) => true,
         _ => false,
     }
+}
+
+// reading it a second time right away gives the same value and runs nothing
+fn duplicable(e: &Expr) -> bool {
+    matches!(e, Expr::Local(_) | Expr::Upvalue(_)) || pure_constant(e)
 }
 
 fn pure_constant(e: &Expr) -> bool {
