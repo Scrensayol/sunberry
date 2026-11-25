@@ -312,6 +312,9 @@ struct Printer<'a> {
     // globals Luau won't import here: assigned somewhere in the chunk, or all of them when it
     // uses getfenv/setfenv (None)
     no_imports: Option<HashSet<Vec<u8>>>,
+    // what a vector constant is built with: Roblox's spelling for Roblox's bytecode, the
+    // vector library's elsewhere (plain Luau has no Vector3)
+    vector_ctor: &'static str,
     // per function, the locals something reads, writes or captures
     used: Vec<HashSet<u32>>,
 }
@@ -331,6 +334,7 @@ pub fn print_chunk(functions: &[Function], main: usize, roblox: bool) -> String 
     }
     // printed for vector constants
     reserved.insert(b"Vector3".to_vec());
+    reserved.insert(b"vector".to_vec());
     let mut written = HashSet::new();
     for function in functions {
         collect_written_globals(&function.body, &mut written);
@@ -348,7 +352,7 @@ pub fn print_chunk(functions: &[Function], main: usize, roblox: bool) -> String 
             used
         })
         .collect();
-    let mut printer = Printer { functions, reserved, taken: HashSet::new(), counter: 0, scopes: Vec::new(), methods, used, class_tables: HashSet::new(), no_imports };
+    let mut printer = Printer { functions, reserved, taken: HashSet::new(), counter: 0, scopes: Vec::new(), methods, used, class_tables: HashSet::new(), no_imports, vector_ctor: if roblox { "Vector3.new" } else { "vector.create" } };
     printer.scopes.push(Scope { proto: main, locals: vec![None; functions[main].names.len()], upvalues: Vec::new() });
     let mut out = String::new();
     printer.body(&functions[main].body, 0, &mut out);
@@ -851,7 +855,7 @@ impl Printer<'_> {
             Expr::Bool(b) => b.to_string(),
             Expr::Number(n) => number(*n),
             Expr::String(s) | Expr::RuntimeKey(s) => string(s),
-            Expr::Vector(v) => format!("Vector3.new({}, {}, {})", number(v[0]), number(v[1]), number(v[2])),
+            Expr::Vector(v) => format!("{}({}, {}, {})", self.vector_ctor, number(v[0]), number(v[1]), number(v[2])),
             Expr::VarArg { .. } => "...".into(),
             Expr::Local(l) => self.local(*l),
             Expr::Upvalue(u) => self.scopes.last().unwrap().upvalues[*u as usize].clone(),
