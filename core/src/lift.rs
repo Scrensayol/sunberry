@@ -1968,7 +1968,10 @@ impl Lifter<'_> {
                         && r.ends.contains(&target)
                     {
                         if r.nil_at == Some(target) {
-                            self.emit(Stmt::Return(Vec::new()))?;
+                            // (nil for each result: `return` with nothing would also match a
+                            // callee whose values the caller dropped)
+                            let nils = vec![Expr::Nil; r.targets.len()];
+                            self.emit(Stmt::Return(nils))?;
                         } else {
                             let targets = r.targets.clone();
                             self.ret_from(&targets)?;
@@ -3987,7 +3990,7 @@ impl Lifter<'_> {
                     // the body up to the LOADNIL, falling off it with no values
                     Some(t) => {
                         l.block(at, t, &[l.pc_at(t)])?;
-                        if inline::ends_in_return(&l.body) { Ok(()) } else { l.emit(Stmt::Return(Vec::new())) }
+                        if inline::ends_in_return(&l.body) { Ok(()) } else { l.emit(Stmt::Return(vec![Expr::Nil; targets.len()])) }
                     }
                     None => {
                         l.block(at, end, &exits)?;
