@@ -311,9 +311,6 @@ fn drop_unreachable(ns: &mut [N]) {
     }
 }
 
-fn read_anywhere(ns: &[N], r: u8, except: &[usize]) -> bool {
-    ns.iter().enumerate().any(|(k, n)| !n.gone && !except.contains(&k) && reads(n).contains(&r))
-}
 
 // the registers an instruction reads (a rough superset is fine: it only keeps code)
 fn reads(n: &N) -> Vec<u8> {
@@ -366,6 +363,47 @@ fn reads_at(ns: &[N], k: usize) -> Vec<u8> {
         return out;
     }
     reads(n)
+}
+
+// what's read later along some path from just after each instruction
+fn live_after(ns: &[N]) -> Vec<crate::liveness::Regs> {
+    use crate::liveness::Regs;
+    let n = ns.len();
+    let succ = |k: usize| {
+        let mut v = Vec::new();
+        if let Some(t) = ns[k].target {
+            v.push(live_from(ns, t));
+        }
+        if falls(&ns[k]) {
+            v.push(live_from(ns, k + 1));
+        }
+        v
+    };
+    let mut live_in = vec![Regs::default(); n + 1];
+    loop {
+        let mut changed = false;
+        for k in (0..n).rev() {
+            if ns[k].gone {
+                continue;
+            }
+            let out = succ(k).into_iter().filter(|&s| s < n).fold(Regs::default(), |a, s| a.union(live_in[s]));
+            let mut reads = Regs::default();
+            for x in reads_at(ns, k) {
+                reads.add(x as usize);
+            }
+            let m = &ns[k];
+            let writes = crate::liveness::writes(&crate::bytecode::Insn::from_parts(m.op, m.a, m.b, m.c, m.aux, word_of(m)));
+            let inn = reads.union(out.without(writes));
+            if inn != live_in[k] {
+                live_in[k] = inn;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    (0..n).map(|k| if ns[k].gone { Regs::default() } else { succ(k).into_iter().filter(|&s| s < n).fold(Regs::default(), |a, s| a.union(live_in[s])) }).collect()
 }
 
 fn drop_dead_loads(ns: &mut [N], p: &Proto) {
@@ -469,12 +507,23 @@ fn drop_dead_loads(ns: &mut [N], p: &Proto) {
 // Instructions swapped for others that do the same, put back the way the compiler writes them
 fn unsubstitute(ns: &mut [N], p: &Proto) {
     // a constant loaded into a scratch register just for arithmetic with it: the K form
+    // (worked out once: folding a pair only drops a load and the one read of it)
+    let mut live: Option<Vec<crate::liveness::Regs>> = None;
     for k in 0..ns.len() {
-        if ns[k].gone || ns[k].op != Op::LOADK {
+        if ns[k].gone || !matches!(ns[k].op, Op::LOADK | Op::LOADN) {
             continue;
         }
         let s = ns[k].a;
-        let kidx = ns[k].d as u16 as usize;
+        // (a LOADN this already made of the LOADK: the constant it loaded is still there)
+        let kidx = if ns[k].op == Op::LOADN {
+            let v = ns[k].d as f64;
+            match p.constants.iter().position(|c| matches!(c, Constant::Number(x) if *x == v && !(*x == 0.0 && x.is_sign_negative()))) {
+                Some(i) => i,
+                None => continue,
+            }
+        } else {
+            ns[k].d as u16 as usize
+        };
         if !matches!(p.constants.get(kidx), Some(Constant::Number(_))) || kidx > 255 {
             continue;
         }
@@ -487,8 +536,10 @@ fn unsubstitute(ns: &mut [N], p: &Proto) {
             Op::DIV if u.b == s && u.c != s => (Op::DIVRK, kidx as u8, u.c),
             _ => continue,
         };
-        // (the scratch register is read nowhere else, and nothing jumps between the two)
-        if (u.a != s && read_anywhere(ns, s, &[j])) || ns.iter().any(|n| !n.gone && n.target == Some(j)) {
+        // (the scratch register isn't read again before it's loaded anew, and nothing jumps
+        // between the two)
+        let live = live.get_or_insert_with(|| live_after(ns));
+        if (u.a != s && live[j].has(s)) || ns.iter().any(|n| !n.gone && n.target == Some(j)) {
             continue;
         }
         ns[j].op = op;
@@ -886,6 +937,8 @@ fn relayout(ns: &[N]) -> Option<Vec<N>> {
         }
     }
     let mut loops: Vec<Vec<bool>> = Vec::new();
+    // (each loop's closing block and what follows it)
+    let mut closers: Vec<(usize, Vec<usize>)> = Vec::new();
     for b in 0..nb {
         for h in edges(b) {
             if !dominates(h, b) {
@@ -933,6 +986,7 @@ fn relayout(ns: &[N]) -> Option<Vec<N>> {
                 inside[x] = true;
                 work.extend(edges(x));
             }
+            closers.push((b, follow.clone()));
             loops.push(inside);
         }
     }
@@ -1054,6 +1108,19 @@ fn relayout(ns: &[N]) -> Option<Vec<N>> {
         }
         let l = last(b);
         let (f, j) = (fall[b], jump[b]);
+        // after a loop's closing jump where what follows the loop is only a return and isn't
+        // next, the compiler leaves a copy of that return (a then branch's jump past an else,
+        // threaded to the return): dead, but it's where the branch ends
+        if f.is_none()
+            && matches!(l.op, Op::JUMP | Op::JUMPX | Op::JUMPBACK)
+            && let Some((_, follow)) = closers.iter().find(|(c, _)| *c == b)
+            && let [fo] = follow[..]
+            && end_of(fo) - starts[fo] == 1
+            && last(fo).op == Op::RETURN
+            && next != Some(fo)
+        {
+            out.push(last(fo));
+        }
         if let Some(f) = f {
             let cond = l.target.is_some() && !matches!(l.op, Op::FASTCALL | Op::FASTCALL1 | Op::FASTCALL2 | Op::FASTCALL2K | Op::FASTCALL3 | Op::FASTPCALL);
             if next == Some(f) {
