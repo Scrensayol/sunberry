@@ -393,6 +393,21 @@ fn drop_unreachable(ns: &mut [N]) {
         let to = land(ns[k].target.unwrap());
         conds.iter().any(|&(cr, ct)| cr == r && ct == to)
     };
+    // (and the jump past an else right after a loop that ends a then branch, junk between the
+    // two: on the JUMPBACK's line, going where the loop's own condition leaves to)
+    for k in 0..ns.len() {
+        if seen[k] || !matches!(ns[k].op, Op::JUMP | Op::JUMPX) || ns[k].target.is_none() {
+            continue;
+        }
+        let Some(prev) = (0..k).rev().find(|&j| !ns[j].gone) else { continue };
+        let back = (0..k).rev().find(|&j| !ns[j].gone && (seen[j] || !junk_op(&ns[j])));
+        let Some(back) = back.filter(|&j| seen[j] && ns[j].op == Op::JUMPBACK && ns[j].line == ns[k].line && ends(&ns[prev])) else { continue };
+        let to = land(ns[k].target.unwrap());
+        let head = ns[back].target.map_or(back, |t| live_from(ns, t));
+        if to > back && (head..back).any(|c| seen[c] && !ns[c].gone && cond(&ns[c]) && land(ns[c].target.unwrap()) == to) {
+            seen[k] = true;
+        }
+    }
     let mut pairs = Vec::new();
     for k in 0..ns.len() {
         if seen[k] || !matches!(ns[k].op, Op::JUMP | Op::JUMPX) || ns[k].target.is_none() {
@@ -1092,7 +1107,15 @@ fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
             // (a for loop's is where FORNLOOP or FORGLOOP falls: its header is just the body's
             // first block, which may break out)
             let for_loop = matches!(last(b).op, Op::FORNLOOP | Op::FORGLOOP);
-            let mut follow = if for_loop { Vec::new() } else { exits_of(&inside, h) };
+            // (past a header that jumps on, to the test it leads to)
+            let mut test = h;
+            for _ in 0..16 {
+                match edges(test)[..] {
+                    [s] if test != b && inside[s] && matches!(last(test).op, Op::JUMP | Op::JUMPX) => test = s,
+                    _ => break,
+                }
+            }
+            let mut follow = if for_loop { Vec::new() } else { exits_of(&inside, test) };
             follow.extend(exits_of(&inside, b));
             // (and where the blocks leading into the closing one go out: a repeat's until test
             // before a JUMPBACK of its own)
@@ -1215,6 +1238,7 @@ fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
         for b in 0..nb {
             eprintln!("  block {b} at {} line {} last {:?} fall {:?} jump {:?} glued {:?} succs {:?}", ns[live[starts[b]]].old_pc, line(b), last(b).op, fall[b], jump[b], glued[b], succs(b));
         }
+        eprintln!("  closers {closers:?}");
         eprintln!("  order {order:?}");
     }
     // a glued block goes right after its loop instruction even where depth first put it elsewhere
