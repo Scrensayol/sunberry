@@ -176,6 +176,13 @@ impl Known {
 // loaded with a boolean and tested, b <= a * a) always go one way: they become a jump, or
 // nothing. Returns whether any did.
 fn fold_branches(ns: &mut [N], p: &Proto) -> bool {
+    // (only on the top two registers of the frame, past everything the code itself uses: where
+    // the always-one-way branches put theirs. The compiler's own constant tests, which -O0
+    // leaves, test the code's registers, and stay)
+    let mut scratch = [false; 256];
+    for r in (p.max_stack as usize).saturating_sub(2)..(p.max_stack as usize).min(256) {
+        scratch[r] = true;
+    }
     let mut leader = vec![false; ns.len() + 1];
     for n in ns.iter() {
         if let Some(t) = n.target {
@@ -197,7 +204,8 @@ fn fold_branches(ns: &mut [N], p: &Proto) -> bool {
             _ => None,
         };
         // Some(true): always jumps, Some(false): never
-        let decided = match n.op {
+        let tested_scratch = scratch[n.a as usize] && (!matches!(n.op, Op::JUMPIFLE | Op::JUMPIFLT | Op::JUMPIFNOTLE | Op::JUMPIFNOTLT) || scratch[(n.aux & 0xff) as usize]);
+        let decided = if !tested_scratch { None } else { match n.op {
             Op::JUMPIF => known[n.a as usize].map(Known::truthy),
             Op::JUMPIFNOT => known[n.a as usize].map(|v| !v.truthy()),
             Op::JUMPIFLE | Op::JUMPIFLT | Op::JUMPIFNOTLE | Op::JUMPIFNOTLT => match (num(n.a, &known), num(n.aux as u8, &known)) {
@@ -210,7 +218,7 @@ fn fold_branches(ns: &mut [N], p: &Proto) -> bool {
                 _ => None,
             },
             _ => None,
-        };
+        } };
         if let Some(jumps) = decided {
             if jumps {
                 ns[k].op = Op::JUMP;
@@ -1097,6 +1105,19 @@ fn relayout(ns: &[N]) -> Option<Vec<N>> {
                     } else {
                         return bail(4);
                     }
+                } else if is_last && n.op == Op::LOADB {
+                    // (a LOADB that skips is a load and a jump: fused again below where it
+                    // skips just one instruction, as the compiler writes it)
+                    n.c = 0;
+                    out.push(n);
+                    let mut glue = n;
+                    glue.op = Op::JUMP;
+                    glue.a = 0;
+                    glue.b = 0;
+                    glue.aux = 0;
+                    fix.push((out.len(), jump[b].unwrap()));
+                    out.push(glue);
+                    continue;
                 } else if is_last {
                     fix.push((out.len(), jump[b].unwrap()));
                 }
@@ -1247,6 +1268,28 @@ fn glued_after(order: &[usize], oi: usize, t: usize) -> bool {
     order.get(oi + 1) == Some(&t)
 }
 
+// `LOADB r v; JUMP past the next instruction` is the compiler's `LOADB r v +1` (a comparison
+// made a value: false skipping over true)
+fn fuse_loadb_skips(ns: &mut [N]) {
+    for k in 0..ns.len() {
+        if ns[k].gone || ns[k].op != Op::LOADB || ns[k].c != 0 {
+            continue;
+        }
+        let j = live_from(ns, k + 1);
+        let Some(over) = (j < ns.len()).then(|| live_from(ns, j + 1)) else { continue };
+        if over < ns.len()
+            && matches!(ns[j].op, Op::JUMP | Op::JUMPX)
+            && ns[j].target.map(|t| live_from(ns, t)) == Some(live_from(ns, over + 1))
+            && ns[over].op == Op::LOADB
+            && ns[over].a == ns[k].a
+            && !ns.iter().any(|n| !n.gone && n.target.is_some_and(|t| live_from(ns, t) == j))
+        {
+            ns[k].target = ns[j].target;
+            ns[j].gone = true;
+        }
+    }
+}
+
 // a jump to where control goes anyway
 fn drop_jumps_to_next(ns: &mut [N]) {
     for k in (0..ns.len()).rev() {
@@ -1332,6 +1375,7 @@ pub fn normalize(p: &mut Proto, sort_registers: bool) -> bool {
         }
         unsubstitute(&mut ns, p);
         drop_jumps_to_next(&mut ns);
+        fuse_loadb_skips(&mut ns);
         restore_imports(&mut ns, p);
     }
     renumber(&mut ns, p, sort_registers);

@@ -31,5 +31,7 @@ while v8 < 4 do
 	end
 end
 out("L13", v7[1](), v7[1](), v7[4] and v7[4](), v8)
-if "hello" >= ("back\\slash" .. "AA"):lower() then
+if nil or true or 0 or math.huge or not "s" then
+	if "hello" >= ("back\\slash" .. "AA"):lower() then
+	end
 end

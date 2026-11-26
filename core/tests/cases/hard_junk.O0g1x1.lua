@@ -16,6 +16,9 @@ local function guard(p7)
 	if not p7 then
 		return
 	end
+	if not true then
+		table["insert"](v1, "guarded " .. tostring(p7))
+	end
 end
 local v8 = 0
 local function bump(p9)
@@ -34,7 +37,7 @@ guard("yes")
 local function scaled(p13)
 	return clamp(p13 * 2, 1, 9)
 end
-if clamp(v10, 0, 5) == 5 and scaled(3) > 4 then
+if true and clamp(v10, 0, 5) == 5 and scaled(3) > 4 then
 	print("both")
 end
 while not (v8 > 0) do
