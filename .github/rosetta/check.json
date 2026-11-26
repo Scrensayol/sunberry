@@ -4,6 +4,10 @@
     "sunberry": [
       "captured_args O2g1",
       "captured_args O2g2",
+      "hard_joined_scope O0g1",
+      "hard_joined_scope O0g2",
+      "hard_joined_scope O1g1",
+      "hard_joined_scope O1g2",
       "if_local O0g1",
       "if_local O0g2",
       "if_local O1g1",
