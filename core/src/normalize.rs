@@ -808,7 +808,7 @@ fn invert(n: &mut N) -> bool {
 // that leads into it (but through a loop's back edge), successors from later source lines
 // placed after earlier ones, and a loop's own instructions kept with the blocks they fall into.
 // Conditions flip where that lets one side fall through; anything else that can't is a jump.
-fn relayout(ns: &[N]) -> Option<Vec<N>> {
+fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
     let live = (0..ns.len()).filter(|&k| !ns[k].gone).collect::<Vec<_>>();
     if live.is_empty() {
         return bail(1);
@@ -852,7 +852,11 @@ fn relayout(ns: &[N]) -> Option<Vec<N>> {
     let end_of = |b: usize| starts.get(b + 1).copied().unwrap_or(n_live);
     let last = |b: usize| ns[live[end_of(b) - 1]];
     // a block that's only a jump goes where it jumps (followed to the end of such chains)
+    // (`keep_chains`: none are skipped, for the compiler's own jumps to jumps)
     let resolve = |mut b: usize| {
+        if keep_chains {
+            return b;
+        }
         for _ in 0..nb {
             let l = last(b);
             if end_of(b) - starts[b] == 1 && matches!(l.op, Op::JUMP | Op::JUMPX) {
@@ -1352,7 +1356,9 @@ fn restore_imports(ns: &mut [N], p: &mut Proto) {
 // left as it was
 // `sort_registers`: also put registers in the order the code first writes them (undoing a
 // shuffle), not only close the gap past the parameters
-pub fn normalize(p: &mut Proto, sort_registers: bool) -> bool {
+// `keep_chains`: lay blocks that are only a jump out as they are rather than going straight to
+// where they jump (see relayout)
+pub fn normalize(p: &mut Proto, sort_registers: bool, keep_chains: bool) -> bool {
     let mut ns = decode(p);
     let before = p.clone();
     fold_branches(&mut ns, p);
@@ -1366,7 +1372,7 @@ pub fn normalize(p: &mut Proto, sort_registers: bool) -> bool {
     drop_dead_loads(&mut ns, p);
     drop_jumps_to_next(&mut ns);
     if sort_registers {
-        match relayout(&ns) {
+        match relayout(&ns, keep_chains) {
             Some(out) => ns = out,
             None => {
                 *p = before;
