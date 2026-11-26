@@ -1234,8 +1234,37 @@ fn relayout(ns: &[N], keep_chains: bool, merges_first: bool) -> Option<Vec<N>> {
         }
     }
     let mut order = post.into_iter().rev().collect::<Vec<_>>();
-    // a FORNLOOP nothing reaches goes right before the exit it falls into
+    // a FORNLOOP nothing reaches goes right before the exit it falls into; or right after a
+    // body that's one block ending in a return, as the compiler writes it, the jump to its
+    // exit after it then (left unseen, so its exit isn't glued on)
+    // (also where depth first already placed it; the body's own lone jumps lead to the return.
+    // Only on the last tries: elsewhere it loses about as many as it wins)
     for b in 0..nb {
+        let ret = |mut g: usize| {
+            for _ in 0..16 {
+                match jump[g] {
+                    Some(t) if fall[g].is_none() && end_of(g) - starts[g] == 1 && matches!(last(g).op, Op::JUMP | Op::JUMPX) => g = t,
+                    _ => break,
+                }
+            }
+            g
+        };
+        if merges_first
+            && last(b).op == Op::FORNLOOP
+            && let Some(prep) = last(b)
+                .paired
+                .map(|k| block_of[pos[k]])
+                .filter(|&p| p < nb)
+                .or_else(|| (0..nb).find(|&p| last(p).op == Op::FORNPREP && last(p).a == last(b).a && glued[p].is_some_and(|g| jump[b].is_some_and(|j| ret(g) == ret(j)))))
+            && let Some(body) = glued[prep].map(ret).filter(|&g| seen[g] && last(g).op == Op::RETURN && jump[b].map(ret) == Some(g))
+            && order.contains(&body)
+        {
+            order.retain(|&x| x != b);
+            let at = order.iter().position(|&x| x == body).unwrap();
+            order.insert(at + 1, b);
+            seen[b] = false;
+            continue;
+        }
         if !seen[b]
             && last(b).op == Op::FORNLOOP
             && let Some(exit) = fall[b]
