@@ -572,7 +572,10 @@ fn renumber(ns: &mut [N], p: &mut Proto, sort: bool) {
         }
         return;
     }
-    cuts.push(fixed_from);
+    // (the bases of calls and loops aren't boundaries here: a shuffle moves the register they
+    // name along with the rest. Ordered by first write, what a call or loop overwrites comes
+    // after what lives across it, which is what those bases need)
+    cuts = vec![np, fixed_from, 256];
     cuts.retain(|&c| c >= np && c <= 256);
     cuts.sort_unstable();
     cuts.dedup();
@@ -820,9 +823,11 @@ fn relayout(ns: &[N]) -> Option<Vec<N>> {
                 return bail(3);
             }
             if f != usize::MAX {
-                // (an empty body is only a jump to the FORNLOOP: that one does go)
+                // (an empty body is only a jump to the FORNLOOP: that one does go. Where a loop
+                // instruction falls, a jump stays too: the then branch's jump over an else)
                 let r = resolve(f);
-                fall[b] = Some(if body_fall && last(r).op != Op::FORNLOOP { f } else { r });
+                let keep = body_fall && last(r).op != Op::FORNLOOP || matches!(l.op, Op::FORNLOOP | Op::FORGLOOP);
+                fall[b] = Some(if keep { f } else { r });
             }
         }
         if let Some(t) = l.target
@@ -899,12 +904,16 @@ fn relayout(ns: &[N]) -> Option<Vec<N>> {
             // Other ways out (a break, a return in the loop) are the body's own: the compiler
             // writes them inside it, so they count as in it
             let exits_of = |inside: &Vec<bool>, x: usize| edges(x).into_iter().filter(|&s| !inside[s]).collect::<Vec<_>>();
-            let mut follow = exits_of(&inside, h);
+            // (a for loop's is where FORNLOOP or FORGLOOP falls: its header is just the body's
+            // first block, which may break out)
+            let for_loop = matches!(last(b).op, Op::FORNLOOP | Op::FORGLOOP);
+            let mut follow = if for_loop { Vec::new() } else { exits_of(&inside, h) };
             follow.extend(exits_of(&inside, b));
             // (and where the blocks leading into the closing one go out: a repeat's until test
             // before a JUMPBACK of its own)
+            let lone_jump = end_of(b) - starts[b] == 1 && matches!(last(b).op, Op::JUMP | Op::JUMPX | Op::JUMPBACK);
             for &x in &preds[b] {
-                if inside[x] && x != h {
+                if lone_jump && inside[x] && x != h {
                     follow.extend(exits_of(&inside, x));
                 }
             }
