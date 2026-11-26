@@ -937,7 +937,7 @@ fn invert(n: &mut N) -> bool {
 // that leads into it (but through a loop's back edge), successors from later source lines
 // placed after earlier ones, and a loop's own instructions kept with the blocks they fall into.
 // Conditions flip where that lets one side fall through; anything else that can't is a jump.
-fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
+fn relayout(ns: &[N], keep_chains: bool, merges_first: bool) -> Option<Vec<N>> {
     let live = (0..ns.len()).filter(|&k| !ns[k].gone).collect::<Vec<_>>();
     if live.is_empty() {
         return bail(1);
@@ -1154,6 +1154,21 @@ fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
     let leaves = |b: usize, s: usize| loops.iter().any(|l| l[b] && !l[s]);
     // depth first from the entry: successors from later lines first, so they're placed later;
     // on a tie the one it falls into last, so it can still fall into it
+    // (whether `from` gets to `to` along forward edges, not through `not`)
+    let reaches = |from: usize, to: usize, not: usize| {
+        let mut seen = vec![false; nb];
+        let mut work = vec![from];
+        while let Some(x) = work.pop() {
+            if x == to {
+                return true;
+            }
+            if x == not || std::mem::replace(&mut seen[x], true) {
+                continue;
+            }
+            work.extend(edges(x).into_iter().filter(|&y| !dominates(y, x)));
+        }
+        false
+    };
     let mut post = Vec::with_capacity(nb);
     let mut seen = vec![false; nb];
     let mut stack = vec![(0usize, 0usize)];
@@ -1191,6 +1206,17 @@ fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
             v.push((rank(f, 1), f));
         }
         v.sort_by_key(|x| x.0);
+        // (on the last try, where the other one gets to it too going forward, the other first:
+        // it's where a short circuit's branches meet, placed through them, before an else only
+        // one reaches)
+        if let [(r0, s0), (r1, s1)] = v[..]
+            && merges_first
+            && r0.0 == 2
+            && r1.0 == 2
+            && reaches(s1, s0, b)
+        {
+            v.swap(0, 1);
+        }
         v.into_iter().map(|x| x.1).collect::<Vec<_>>()
     };
     while let Some(&mut (b, ref mut i)) = stack.last_mut() {
@@ -1603,7 +1629,7 @@ fn restore_imports(ns: &mut [N], p: &mut Proto) {
 // shuffle), not only close the gap past the parameters
 // `keep_chains`: lay blocks that are only a jump out as they are rather than going straight to
 // where they jump (see relayout)
-pub fn normalize(p: &mut Proto, sort_registers: bool, keep_chains: bool) -> bool {
+pub fn normalize(p: &mut Proto, sort_registers: bool, keep_chains: bool, merges_first: bool) -> bool {
     let mut ns = decode(p);
     let before = p.clone();
     fold_branches(&mut ns, p);
@@ -1617,7 +1643,7 @@ pub fn normalize(p: &mut Proto, sort_registers: bool, keep_chains: bool) -> bool
     drop_dead_loads(&mut ns, p);
     drop_jumps_to_next(&mut ns);
     if sort_registers {
-        match relayout(&ns, keep_chains) {
+        match relayout(&ns, keep_chains, merges_first) {
             Some(out) => ns = out,
             None => {
                 *p = before;

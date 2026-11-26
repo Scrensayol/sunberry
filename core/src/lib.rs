@@ -36,10 +36,11 @@ impl From<bytecode::ReadError> for Error {
 
 pub fn disassemble(data: &[u8], key: u8) -> Result<String, Error> {
     let mut chunk = bytecode::read(data, key)?;
-    // for diagnostics: what the lifter sees once normalized (1: registers' gap closed, 2: sorted)
+    // for diagnostics: what the lifter sees once normalized (1: registers' gap closed, 2: sorted,
+    // 3: jumps to jumps kept, 4: a short circuit's meeting point laid out first)
     if let Some(level) = std::env::var("SUNBERRY_NORMALIZE").ok().and_then(|l| l.parse::<u8>().ok()) {
         for p in &mut chunk.protos {
-            normalize::normalize(p, level >= 2, level >= 3);
+            normalize::normalize(p, level >= 2, level >= 3, level >= 4);
         }
     }
     Ok(disasm::disassemble(&chunk))
@@ -56,15 +57,16 @@ pub fn decompile_named(data: &[u8], key: u8, script: Option<&str>) -> Result<Str
     let roblox = key != 1;
     decompile_chunk(&chunk, script, roblox).or_else(|e| {
         // (registers only closed up; then sorted and blocks laid out again, jumps to jumps
-        // skipped; then kept)
-        for (sort_registers, keep_chains) in [(false, false), (true, false), (true, true)] {
+        // skipped; then kept; then both again, a short circuit's meeting point laid out first)
+        let attempts = [(false, false, false), (true, false, false), (true, true, false), (true, false, true), (true, true, true)];
+        for (i, &(sort_registers, keep_chains, merges_first)) in attempts.iter().enumerate() {
             // (code the compiler never writes can break the lifter's own expectations: a panic
             // in here is this fallback not working, not a crash)
             let attempt = std::panic::catch_unwind(|| {
                 let mut normal = chunk.clone();
                 let mut changed = false;
                 for p in &mut normal.protos {
-                    changed |= normalize::normalize(p, sort_registers, keep_chains);
+                    changed |= normalize::normalize(p, sort_registers, keep_chains, merges_first);
                 }
                 (changed, decompile_chunk(&normal, script, roblox))
             });
@@ -76,7 +78,7 @@ pub fn decompile_named(data: &[u8], key: u8, script: Option<&str>) -> Result<Str
                     if std::env::var_os("SUNBERRY_TRACE_NORMALIZE").is_some() {
                         eprintln!("normalized ({sort_registers}): {e2}");
                     }
-                    if keep_chains && std::env::var_os("SUNBERRY_REPORT_NORMALIZED").is_some() {
+                    if i == 2 && std::env::var_os("SUNBERRY_REPORT_NORMALIZED").is_some() {
                         return Err(e2);
                     }
                 }
