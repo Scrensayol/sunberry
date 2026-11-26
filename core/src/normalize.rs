@@ -1157,7 +1157,9 @@ fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
             }
         };
         let mut v = Vec::new();
-        if let Some(j) = jump[b] {
+        // (a for loop's jump back isn't followed where its PREP gets to the body: a dead
+        // FORGLOOP visited first would otherwise pull the body in after it)
+        if let Some(j) = jump[b].filter(|&j| fall[b] == Some(j) || !matches!(last(b).op, Op::FORGLOOP | Op::FORNLOOP) || !(0..nb).any(|p| p != b && glued[p] == Some(j))) {
             v.push((rank(j, 0), j));
         }
         if let Some(f) = fall[b]
@@ -1227,6 +1229,35 @@ fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
                 let bi = order.iter().position(|&x| x == b).or_else(|| bail(9))?;
                 order.insert(bi + 1, g);
             }
+        }
+    }
+    // a loop's lone JUMPBACK comes right after the body's last line: a `continue` jumps to it
+    // from earlier on (depth first may have put the continue's block last). What moves is the
+    // block that jumps to it from the latest line, with the straight run of blocks leading in
+    for li in 0..order.len() {
+        let l = order[li];
+        if !(latch[l] && end_of(l) - starts[l] == 1 && last(l).op == Op::JUMPBACK) || li == 0 {
+            continue;
+        }
+        let before = order[li - 1];
+        let Some(p) = preds[l].iter().copied().filter(|&p| p != before && edges(p) == [l] && line(p) > line(before)).max_by_key(|&p| line(p)) else { continue };
+        if !edges(before).contains(&l) || preds[l].iter().any(|&x| x != p && line(x) > line(p)) {
+            continue;
+        }
+        let Some(pi) = order.iter().position(|&x| x == p).filter(|&pi| pi < li) else { continue };
+        let mut from = pi;
+        while from > 0 && preds[order[from]] == [order[from - 1]] && edges(order[from - 1]) == [order[from]] {
+            from -= 1;
+        }
+        // (only where that puts the lines in better order: fewer places a line goes back)
+        let w0 = from.saturating_sub(1);
+        let descents = |o: &[usize]| o.windows(2).filter(|w| line(w[1]) < line(w[0])).count();
+        let mut moved = order[w0..=li].to_vec();
+        let run = moved.drain(from - w0..=pi - w0).collect::<Vec<_>>();
+        let at = moved.len() - 1;
+        moved.splice(at..at, run);
+        if descents(&moved) < descents(&order[w0..=li]) {
+            order.splice(w0..=li, moved);
         }
     }
     // lay it out: each block's instructions, then a jump where what it falls into isn't next
