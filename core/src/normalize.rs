@@ -1241,6 +1241,36 @@ fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
         eprintln!("  closers {closers:?}");
         eprintln!("  order {order:?}");
     }
+    // a for loop's own break or return block goes before its FORGLOOP or FORNLOOP: depth first
+    // may have put it later, from a later line
+    // (whether x is f or a block f's lone jumps go through)
+    let on_chain = |mut f: usize, x: usize| {
+        for _ in 0..16 {
+            if f == x {
+                return true;
+            }
+            match edges(f)[..] {
+                [s] if end_of(f) - starts[f] == 1 && matches!(last(f).op, Op::JUMP | Op::JUMPX) => f = s,
+                _ => break,
+            }
+        }
+        f == x
+    };
+    for (li, (b, follow)) in closers.iter().enumerate() {
+        let b = *b;
+        let Some(bi) = order.iter().position(|&x| x == b).filter(|_| matches!(last(b).op, Op::FORGLOOP | Op::FORNLOOP)) else { continue };
+        let before = &order[..bi];
+        let late = order[bi + 1..]
+            .iter()
+            .copied()
+            .filter(|&x| loops[li][x] && !glued.contains(&Some(x)) && !follow.iter().any(|&f| on_chain(f, x)) && edges(x).iter().all(|&s| !loops[li][s]) && preds[x].iter().any(|p| loops[li][*p] && before.contains(p)))
+            .collect::<Vec<_>>();
+        if late.is_empty() {
+            continue;
+        }
+        order.retain(|x| !late.contains(x));
+        order.splice(bi..bi, late);
+    }
     // a glued block goes right after its loop instruction even where depth first put it elsewhere
     for b in 0..nb {
         if let Some(g) = glued[b]
