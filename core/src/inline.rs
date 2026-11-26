@@ -490,6 +490,17 @@ pub fn unify(ctx: &Ctx, callee: usize, upvalues: Upvalues, sub: &Sub) -> Option<
         }
         return None;
     }
+    // a parameter bound to a local the region assigns (the callee writing it as an upvalue:
+    // `x = f(x)` where f changes x) is the local's value before the region, which the
+    // region's later reads of it don't see
+    for (i, bind) in m.binds.iter().enumerate() {
+        if let Bind::Reg(r) = bind
+            && !mutated[i]
+            && sub.start.iter().any(|(l, &(reg, _))| reg == *r && assigned(ctx, &sub.stmts, &Expr::Local(*l)))
+        {
+            return None;
+        }
+    }
     // a parameter the callee assigns has a register of its own
     for (i, bind) in m.binds.iter().enumerate() {
         if let Bind::Reg(r) = bind
