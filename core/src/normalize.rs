@@ -384,8 +384,14 @@ fn drop_unreachable(ns: &mut [N]) {
         }
         None
     };
+    // (each reachable condition's return and where its jump lands, worked out once)
+    let conds = (0..ns.len())
+        .filter(|&c| seen[c] && !ns[c].gone && cond(&ns[c]))
+        .filter_map(|c| Some((falls_to(c)?, land(ns[c].target.unwrap()))))
+        .collect::<Vec<_>>();
     let goes_like = |r: usize, k: usize| {
-        (0..ns.len()).any(|c| seen[c] && !ns[c].gone && cond(&ns[c]) && falls_to(c) == Some(r) && land(ns[c].target.unwrap()) == land(ns[k].target.unwrap()))
+        let to = land(ns[k].target.unwrap());
+        conds.iter().any(|&(cr, ct)| cr == r && ct == to)
     };
     let mut pairs = Vec::new();
     for k in 0..ns.len() {
