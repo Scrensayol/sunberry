@@ -350,6 +350,9 @@ fn lift_with(chunk: &Chunk, proto_id: usize, inline: Option<&Ctx>, drop_idle: bo
     lifter.live_in = liveness.live_in;
     lifter.insns = insns;
     lifter.index_of = index_of;
+    // (retries that multiply with each nested `if` can take minutes on junk the compiler never
+    // writes; five times the most the cases and generated programs take is enough)
+    lifter.work_limit = 1_000_000 + 200 * lifter.insns.len();
     lifter.block(0, lifter.insns.len(), &[proto.code.len()])?;
     lifter.flush()?;
     let raw = lifter.body.clone();
@@ -2175,8 +2178,8 @@ impl Lifter<'_> {
             .iter()
             .filter_map(|&t| self.insns[t].target())
             .map(|t| (t, self.normalize(t, first, end, exits)))
-            .collect::<Vec<_>>();
-        let normalize = move |t: usize| normalized.iter().find(|(from, _)| *from == t).map_or(t, |(_, to)| *to);
+            .collect::<std::collections::HashMap<_, _>>();
+        let normalize = move |t: usize| normalized.get(&t).copied().unwrap_or(t);
         // the longest condition that works: a nested `if` with the same exits is the same code.
         // One whose parts need no statements reads as the source did; parts with statements
         // (through a flag) are the fallback.
@@ -2206,6 +2209,11 @@ impl Lifter<'_> {
         for (list, statements, n) in lists.iter().flat_map(|list| [false, true].into_iter().flat_map(move |s| (1..=list.len()).rev().map(move |n| (list, s, n)))) {
             if !statements && list[n - 1] > first_statement {
                 continue;
+            }
+            // (sorting out a candidate's tests costs as much as lifting each of them)
+            self.work += n;
+            if self.work > self.work_limit {
+                return Err(self.unsupported("too much work"));
             }
             let then_index = list[n - 1] + 1;
             let then_pc = self.pc_at(then_index);
