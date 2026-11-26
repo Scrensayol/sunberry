@@ -96,6 +96,7 @@ fn decompile_chunk(chunk: &bytecode::Chunk, script: Option<&str>, roblox: bool) 
     let lifted = (0..chunk.protos.len()).into_par_iter().map(|id| lift::lift(chunk, id, None)).collect::<Vec<_>>();
     let mut functions = deinline(chunk, lifted)?;
     for function in &mut functions {
+        name_called_closures(&mut function.body, &mut function.names);
         tidy(&mut function.body);
     }
     let protos = chunk.protos.iter().map(|p| p.debug_name.clone()).collect::<Vec<_>>();
@@ -203,6 +204,74 @@ pub(crate) fn created(chunk: &bytecode::Chunk) -> Vec<bool> {
         }
     }
     created
+}
+
+// A closure called right away is a local function the compiler didn't inline: it inlines
+// `(function() ... end)()` at -O2 more readily, and inlined code reads a local operand after a
+// call that changes it, where the call itself read it before. So it's declared as a local
+// just before the statement that calls it (making a closure has no effects of its own).
+// (not out of a loop's condition, which runs again)
+fn name_called_closures(body: &mut Vec<ast::Stmt>, names: &mut Vec<Option<Vec<u8>>>) {
+    use ast::{Expr, Field, Stmt};
+    fn take(e: &mut Expr, names: &mut Vec<Option<Vec<u8>>>, found: &mut Vec<(u32, Expr)>) {
+        match e {
+            Expr::Call { func, args, .. } => {
+                if matches!(**func, Expr::Closure(_)) {
+                    let local = names.len() as u32;
+                    names.push(None);
+                    found.push((local, std::mem::replace(&mut **func, Expr::Local(local))));
+                } else {
+                    take(func, names, found);
+                }
+                args.iter_mut().for_each(|a| take(a, names, found));
+            }
+            Expr::MethodCall { object, args, .. } => {
+                take(object, names, found);
+                args.iter_mut().for_each(|a| take(a, names, found));
+            }
+            Expr::Index(a, b) | Expr::Binary(_, a, b) => {
+                take(a, names, found);
+                take(b, names, found);
+            }
+            Expr::Unary(_, a) => take(a, names, found),
+            Expr::IfElse(a, b, c) => {
+                take(a, names, found);
+                take(b, names, found);
+                take(c, names, found);
+            }
+            Expr::Table(fields) => fields.iter_mut().for_each(|f| match f {
+                Field::Positional(v) => take(v, names, found),
+                Field::Keyed(k, v) => {
+                    take(k, names, found);
+                    take(v, names, found);
+                }
+            }),
+            _ => {}
+        }
+    }
+    let mut i = 0;
+    while i < body.len() {
+        for nested in body[i].bodies_mut() {
+            name_called_closures(nested, names);
+        }
+        let mut found = Vec::new();
+        match &mut body[i] {
+            Stmt::Call(e) | Stmt::If { cond: e, .. } => take(e, names, &mut found),
+            Stmt::Local { values, .. } | Stmt::Return(values) | Stmt::GenericFor { values, .. } => values.iter_mut().for_each(|v| take(v, names, &mut found)),
+            Stmt::Assign { targets, values } => targets.iter_mut().chain(values.iter_mut()).for_each(|v| take(v, names, &mut found)),
+            Stmt::NumericFor { from, to, step, .. } => {
+                take(from, names, &mut found);
+                take(to, names, &mut found);
+                step.iter_mut().for_each(|s| take(s, names, &mut found));
+            }
+            _ => {}
+        }
+        let n = found.len();
+        for (k, (local, closure)) in found.into_iter().enumerate() {
+            body.insert(i + k, Stmt::Local { locals: vec![local], values: vec![closure] });
+        }
+        i += n + 1;
+    }
 }
 
 fn flags(function: &ast::Function) -> Vec<bool> {

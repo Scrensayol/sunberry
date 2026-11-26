@@ -8,6 +8,7 @@ end
 if __rosetta then
 	return
 end
-local v2 = (function()
+local function v2()
 	print(bump(), bump())
-end)()
+end
+local v3 = v2()

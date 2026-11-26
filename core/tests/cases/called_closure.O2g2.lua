@@ -8,7 +8,7 @@ local urls = {}
 urls.delivery = "https://delivery/"
 urls.plain = "https://plain/"
 local function resolveHost()
-	local _ = (function()
+	local function v1()
 		if flags.force then
 			return urls.delivery
 		end
@@ -18,54 +18,55 @@ local function resolveHost()
 				return urls.delivery
 			end
 		end
-	end)()
+	end
+	local _ = v1()
 	return urls.plain
 end
-local v1 = print
+local v2 = print
 if flags.force then
 	local delivery = urls.delivery
 else
-	local v2
+	local v3
 	local edge = flags.edge
 	if edge then
-		v2 = layers:get("edge")
-		edge = v2
+		v3 = layers:get("edge")
+		edge = v3
 	end
-	local v3 = not edge
-	if not v3 then
-		local v4 = not v2.fromEdge
-		if not v4 then
+	local v4 = not edge
+	if not v4 then
+		local v5 = not v3.fromEdge
+		if not v5 then
 			local delivery2 = urls.delivery
-			v4 = false
+			v5 = false
 		end
-		v3 = v4
+		v4 = v5
 	end
 end
-v1(urls.plain)
+v2(urls.plain)
 flags.edge = false
-local v5 = print
+local v6 = print
 if flags.force then
 	local delivery3 = urls.delivery
 else
-	local v6
+	local v7
 	local edge2 = flags.edge
 	if edge2 then
-		v6 = layers:get("edge")
-		edge2 = v6
+		v7 = layers:get("edge")
+		edge2 = v7
 	end
-	local v7 = not edge2
-	if not v7 then
-		local v8 = not v6.fromEdge
-		if not v8 then
+	local v8 = not edge2
+	if not v8 then
+		local v9 = not v7.fromEdge
+		if not v9 then
 			local delivery4 = urls.delivery
-			v8 = false
+			v9 = false
 		end
-		v7 = v8
+		v8 = v9
 	end
 end
-v5(urls.plain)
+v6(urls.plain)
 local function pick()
-	local host = (function()
+	local function v10()
 		if flags.force then
 			return urls.delivery
 		end
@@ -76,83 +77,84 @@ local function pick()
 			end
 		end
 		return urls.plain
-	end)()
+	end
+	local host = v10()
 	return host
 end
-local v9 = print
+local v11 = print
 local delivery5
 if flags.force then
 	delivery5 = urls.delivery
 else
-	local v10
+	local v12
 	local edge3 = flags.edge
 	if edge3 then
-		v10 = layers:get("edge")
-		edge3 = v10
+		v12 = layers:get("edge")
+		edge3 = v12
 	end
-	local v11 = not edge3
-	if not v11 then
-		local v12 = not v10.fromEdge
-		if not v12 then
+	local v13 = not edge3
+	if not v13 then
+		local v14 = not v12.fromEdge
+		if not v14 then
 			delivery5 = urls.delivery
-			v12 = false
+			v14 = false
 		end
-		v11 = v12
+		v13 = v14
 	end
-	if v11 then
+	if v13 then
 		delivery5 = urls.plain
 	end
 end
-v9(delivery5)
+v11(delivery5)
 flags.edge = true
-local v13 = print
+local v15 = print
 local delivery6
 if flags.force then
 	delivery6 = urls.delivery
 else
-	local v14
+	local v16
 	local edge4 = flags.edge
 	if edge4 then
-		v14 = layers:get("edge")
-		edge4 = v14
+		v16 = layers:get("edge")
+		edge4 = v16
 	end
-	local v15 = not edge4
-	if not v15 then
-		local v16 = not v14.fromEdge
-		if not v16 then
+	local v17 = not edge4
+	if not v17 then
+		local v18 = not v16.fromEdge
+		if not v18 then
 			delivery6 = urls.delivery
-			v16 = false
+			v18 = false
 		end
-		v15 = v16
+		v17 = v18
 	end
-	if v15 then
+	if v17 then
 		delivery6 = urls.plain
 	end
 end
-v13(delivery6)
+v15(delivery6)
 flags.force = true
-local v17 = print
+local v19 = print
 local delivery7
 if flags.force then
 	delivery7 = urls.delivery
 else
-	local v18
+	local v20
 	local edge5 = flags.edge
 	if edge5 then
-		v18 = layers:get("edge")
-		edge5 = v18
+		v20 = layers:get("edge")
+		edge5 = v20
 	end
-	local v19 = not edge5
-	if not v19 then
-		local v20 = not v18.fromEdge
-		if not v20 then
+	local v21 = not edge5
+	if not v21 then
+		local v22 = not v20.fromEdge
+		if not v22 then
 			delivery7 = urls.delivery
-			v20 = false
+			v22 = false
 		end
-		v19 = v20
+		v21 = v22
 	end
-	if v19 then
+	if v21 then
 		delivery7 = urls.plain
 	end
 end
-v17(delivery7)
+v19(delivery7)

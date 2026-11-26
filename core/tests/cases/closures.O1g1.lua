@@ -1,4 +1,4 @@
-local v4, v5 = (function(p1, p2)
+local function makeCounter(p1, p2)
 	local v3 = p1
 	return function()
 		v3 += p2
@@ -6,7 +6,8 @@ local v4, v5 = (function(p1, p2)
 	end, function()
 		v3 = p1
 	end
-end)(10, 5)
+end
+local v4, v5 = makeCounter(10, 5)
 print(v4(), v4())
 v5()
 print(v4())

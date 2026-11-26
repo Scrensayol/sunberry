@@ -5,10 +5,11 @@ local v3 = 3
 local v4 = 4
 local v5 = 5
 local v6 = 6
-local v7 = select("#", 1, 2);
-(function()
+local v7 = select("#", 1, 2)
+local function show()
 	print("b", v7, v1, 6)
-end)()
+end
+show()
 local v8 = {}
 for _ = 1, 1 do
 	for i = 1, 3 do

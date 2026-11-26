@@ -18,9 +18,10 @@ local function matches(p2, p3)
 	end
 	return "yes"
 end
-local v4 = (function()
+local function v4()
 	print(
 		matches({kind = 1, name = {"a", "b"}}, {kind = 1, name = "b"}),
 		matches({kind = 1, name = "x"}, {kind = 1, name = "y"})
 	)
-end)()
+end
+local v5 = v4()

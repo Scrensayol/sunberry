@@ -1,4 +1,4 @@
-local v6 = (function()
+local function v6()
 	local function escape(name)
 		if name ~= "" then
 			return "%00"
@@ -26,4 +26,5 @@ local v6 = (function()
 	local v4 = {name = ""}
 	local v5 = {name = "a.b", parent = v4}
 	print(pathOf({name = "c", parent = v5}, {{node = v5, segment = "M"}}))
-end)()
+end
+local v7 = v6()

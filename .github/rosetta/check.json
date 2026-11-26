@@ -2,6 +2,8 @@
   "generator": "typed-v2",
   "failing": {
     "sunberry": [
+      "called_local_function O2g1",
+      "called_local_function O2g2",
       "captured_args O2g1",
       "captured_args O2g2",
       "hard_joined_scope O0g1",

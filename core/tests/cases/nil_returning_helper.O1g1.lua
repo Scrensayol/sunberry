@@ -1,11 +1,12 @@
 local function hasName(name, _)
-	(function()
+	local function inner()
 		if type(name) == "table" then
 			return
 		end
 		if type(name) == "string" then
 		end
-	end)()
+	end
+	inner()
 end
 local function matches(p1, p2)
 	if not (p1.kind == p2.kind and (p1.name == nil or hasName(p1.name, p2.name))) then

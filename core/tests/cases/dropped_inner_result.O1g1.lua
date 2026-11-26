@@ -1,10 +1,11 @@
 local function bump()
-	(function(_)
+	local function inner(_)
 		if skip then
 			return
 		end
 		return 0
-	end)(1)
+	end
+	inner(1)
 end
 print(bump(), bump())
 for _ = 1, 1 do
