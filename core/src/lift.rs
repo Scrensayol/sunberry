@@ -337,6 +337,7 @@ fn lift_with(chunk: &Chunk, proto_id: usize, inline: Option<&Ctx>, drop_idle: bo
         index_of[insn.pc] = i;
     }
     index_of[proto.code.len()] = insns.len();
+    drop_junk(&mut insns, &index_of);
     // (nothing to drop: the retry would only fail the same way)
     if drop_idle && !drop_idle_code(&mut insns, &index_of) {
         return Err(Error::Unsupported { proto: proto_id, pc: 0, what: "no idle code".into() });
@@ -773,6 +774,32 @@ impl Lifter<'_> {
         }
         let continues = self.proto.locals.iter().any(|v| v.register == reg && v.start_pc <= self.pc && self.pc < v.end_pc);
         (self.by_ref[l as usize] || continues).then_some(l)
+    }
+
+    // A register written on the way to a join is one variable around it, declared before: the
+    // local it holds where that can be assigned, else a new one. When the register is read
+    // before it's written again, the new one starts as what it holds (only rewritten code gets
+    // there: the compiler never reuses a captured local's register while it's still read)
+    fn join_variable(&mut self, r: u8, live: bool) -> Result<(), Error> {
+        // (a value list, or one older that flushing would take along, can't become a local)
+        if live
+            && let Slot::Pending(id) = self.slots[r as usize]
+            && self.pending[..=self.index_of(id)].iter().all(|p| p.span == Span::One)
+        {
+            let index = self.index_of(id);
+            self.flush_oldest(index + 1)?;
+        }
+        if matches!(self.slots[r as usize], Slot::Local(l) if !self.by_value[l as usize]) {
+            return Ok(());
+        }
+        let current = match self.slots[r as usize] {
+            Slot::Local(l) if live => Some(Expr::Local(l)),
+            _ => None,
+        };
+        let local = self.new_local(r, self.pc);
+        self.body.push(Stmt::Local { locals: vec![local], values: current.into_iter().collect() });
+        self.slots[r as usize] = Slot::Local(local);
+        Ok(())
     }
 
     // a register about to take a new value: a pending value still in it is never read, but
@@ -2279,11 +2306,8 @@ impl Lifter<'_> {
                     return Err(self.unsupported("condition code with statements"));
                 }
                 for &r in &out {
-                    if !matches!(self.slots[r as usize], Slot::Local(l) if !self.by_value[l as usize]) {
-                        let local = self.new_local(r, self.pc);
-                        self.body.push(Stmt::Local { locals: vec![local], values: Vec::new() });
-                        self.slots[r as usize] = Slot::Local(local);
-                    }
+                    let live = self.live_in.get(tests[n - 1] + 1).is_some_and(|l| l.has(r));
+                    self.join_variable(r, live)?;
                 }
                 self.joins.push(out);
                 let pre = self.sub_body(|l| {
@@ -2442,12 +2466,8 @@ impl Lifter<'_> {
         let live = self.live_in.get(join).copied().unwrap_or_default();
         let joined = written.intersect(live).iter().collect::<Vec<_>>();
         for &r in &joined {
-            let assignable = matches!(self.slots[r as usize], Slot::Local(l) if !self.by_value[l as usize]);
-            if !assignable {
-                let local = self.new_local(r, self.pc);
-                self.body.push(Stmt::Local { locals: vec![local], values: Vec::new() });
-                self.slots[r as usize] = Slot::Local(local);
-            }
+            let live = self.live_in.get(then_index).is_some_and(|l| l.has(r)) || else_range.is_some_and(|(s, _)| self.live_in.get(s).is_some_and(|l| l.has(r)));
+            self.join_variable(r, live)?;
         }
         self.joins.push(joined);
 
@@ -2894,12 +2914,8 @@ impl Lifter<'_> {
             }
         }
         for &r in &joined {
-            let assignable = matches!(self.slots[r as usize], Slot::Local(l) if !self.by_value[l as usize]);
-            if !assignable {
-                let local = self.new_local(r, self.pc);
-                self.body.push(Stmt::Local { locals: vec![local], values: Vec::new() });
-                self.slots[r as usize] = Slot::Local(local);
-            }
+            let live = self.live_in.get(start).is_some_and(|l| l.has(r));
+            self.join_variable(r, live)?;
         }
         self.joins.push(joined);
         let (far_pcs, flag) = match far {
@@ -2994,11 +3010,8 @@ impl Lifter<'_> {
             let live = self.live_in.get(landing).copied().unwrap_or_default();
             let joined = written.intersect(live).iter().collect::<Vec<_>>();
             for &r in &joined {
-                if !matches!(self.slots[r as usize], Slot::Local(l) if !self.by_value[l as usize]) {
-                    let local = self.new_local(r, self.pc);
-                    self.body.push(Stmt::Local { locals: vec![local], values: Vec::new() });
-                    self.slots[r as usize] = Slot::Local(local);
-                }
+                let live = self.live_in.get(exit).is_some_and(|l| l.has(r));
+                self.join_variable(r, live)?;
             }
             self.joins.push(joined);
             let before = self.slots.clone();
@@ -3532,6 +3545,59 @@ fn safe_key(e: &Expr) -> bool {
 // reading it a second time right away gives the same value and runs nothing
 fn duplicable(e: &Expr) -> bool {
     matches!(e, Expr::Local(_) | Expr::Upvalue(_)) || pure_constant(e)
+}
+
+// Junk: a run nothing reaches made only of loads, moves, arithmetic and tests, ending in a jump
+// or a return, the kind obfuscators (and Rosetta's hard tier) put after instructions that never
+// fall through. The compiler's own unreachable code doesn't look like that (a loop's closing
+// jump, the body of `while x and false do`, statements after `do return end`), and lifting junk
+// as if it ran can put it on a path that does run, so it goes before anything else.
+fn drop_junk(insns: &mut [Insn], index_of: &[usize]) {
+    let n = insns.len();
+    let mut seen = vec![false; n];
+    let mut work = vec![0];
+    while let Some(k) = work.pop() {
+        if k >= n || seen[k] {
+            continue;
+        }
+        seen[k] = true;
+        work.extend(liveness::successors(insns, index_of, k));
+        // (a fast call's fallback runs too)
+        if let Some(i) = insns.get(k)
+            && matches!(i.op, Op::FASTCALL | Op::FASTCALL1 | Op::FASTCALL2 | Op::FASTCALL2K | Op::FASTCALL3 | Op::FASTPCALL)
+        {
+            work.push(k + 1);
+        }
+    }
+    let junk_op = |i: &Insn| {
+        matches!(i.op, Op::LOADN | Op::LOADK | Op::MOVE | Op::ADD | Op::SUB | Op::MUL | Op::NOT | Op::LOADNIL | Op::JUMPIF | Op::JUMPIFNOT | Op::NOP)
+            || (i.op == Op::LOADB && i.c == 0)
+    };
+    let mut k = 0;
+    while k < n {
+        if seen[k] {
+            k += 1;
+            continue;
+        }
+        let start = k;
+        while k < n && !seen[k] && junk_op(&insns[k]) {
+            k += 1;
+        }
+        // (the compiler's own: the dead arm of a value, `c and true or false` folded, jumps to
+        // the same join as the arm just before it)
+        // (junk comes right after something that never falls through; inside code nothing reaches,
+        // an arm after a test is that code's own)
+        let after_end = start > 0 && (matches!(insns[start - 1].op, Op::JUMP | Op::JUMPX | Op::JUMPBACK | Op::RETURN) || insns[start - 1].op == Op::LOADB && insns[start - 1].c != 0);
+        let same_join = start > 0 && matches!(insns[start - 1].op, Op::JUMP | Op::JUMPX) && insns[start - 1].target() == insns.get(k).and_then(|i| i.target());
+        let ends_run = k < n && !seen[k] && (matches!(insns[k].op, Op::JUMP | Op::JUMPX) && !same_join || insns[k].op == Op::RETURN && insns[k].b == 1);
+        if ends_run && after_end && k > start {
+            for i in &mut insns[start..=k] {
+                i.op = Op::NOP;
+            }
+        }
+        // (a run can start right after something unreachable that isn't junk)
+        k += 1;
+    }
 }
 
 // A test that goes to the same place either way (`x and 0/0 or 0/0` is always true, and Luau
