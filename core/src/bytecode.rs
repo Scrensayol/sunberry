@@ -65,6 +65,11 @@ pub struct Insn {
 }
 
 impl Insn {
+    // (for rewriting code: an instruction from its fields, pc 0)
+    pub fn from_parts(op: Op, a: u8, b: u8, c: u8, aux: u32, word: u32) -> Insn {
+        Insn { pc: 0, op, a, b, c, aux, word }
+    }
+
     pub fn d(&self) -> i32 {
         (self.word as i32) >> 16
     }

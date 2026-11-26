@@ -5,6 +5,7 @@ pub mod inline;
 mod lift;
 mod liveness;
 mod names;
+mod normalize;
 pub mod print;
 
 use rayon::prelude::*;
@@ -34,7 +35,14 @@ impl From<bytecode::ReadError> for Error {
 }
 
 pub fn disassemble(data: &[u8], key: u8) -> Result<String, Error> {
-    Ok(disasm::disassemble(&bytecode::read(data, key)?))
+    let mut chunk = bytecode::read(data, key)?;
+    // for diagnostics: what the lifter sees once normalized (1: registers' gap closed, 2: sorted)
+    if let Some(level) = std::env::var("SUNBERRY_NORMALIZE").ok().and_then(|l| l.parse::<u8>().ok()) {
+        for p in &mut chunk.protos {
+            normalize::normalize(p, level >= 2);
+        }
+    }
+    Ok(disasm::disassemble(&chunk))
 }
 
 pub fn decompile(data: &[u8], key: u8) -> Result<String, Error> {
@@ -44,17 +52,44 @@ pub fn decompile(data: &[u8], key: u8) -> Result<String, Error> {
 // `script`: the script's name, which the table a module returns is named after
 pub fn decompile_named(data: &[u8], key: u8, script: Option<&str>) -> Result<String, Error> {
     let chunk = bytecode::read(data, key)?;
+    // bytecode rewritten away from the compiler's shapes lifts once they're back (see normalize)
+    let roblox = key != 1;
+    decompile_chunk(&chunk, script, roblox).or_else(|e| {
+        for sort_registers in [false, true] {
+            // (code the compiler never writes can break the lifter's own expectations: a panic
+            // in here is this fallback not working, not a crash)
+            let attempt = std::panic::catch_unwind(|| {
+                let mut normal = chunk.clone();
+                let mut changed = false;
+                for p in &mut normal.protos {
+                    changed |= normalize::normalize(p, sort_registers);
+                }
+                (changed, decompile_chunk(&normal, script, roblox))
+            });
+            let (changed, attempt) = attempt.unwrap_or_else(|_| (true, Err(Error::Unsupported { proto: 0, pc: 0, what: "normalized code panicked".into() })));
+            match attempt {
+                Ok(out) if changed => return Ok(out),
+                // (for diagnostics: why the normalized code didn't lift either)
+                Err(e2) if changed && std::env::var_os("SUNBERRY_TRACE_NORMALIZE").is_some() => eprintln!("normalized ({sort_registers}): {e2}"),
+                _ => {}
+            }
+        }
+        Err(e)
+    })
+}
+
+fn decompile_chunk(chunk: &bytecode::Chunk, script: Option<&str>, roblox: bool) -> Result<String, Error> {
     // functions lift independently; names are only chosen while printing, top-down
     // the first failing function by id, so errors don't depend on thread timing
     // a function that fails on its own can still lift once its inlined copies are calls again
-    let lifted = (0..chunk.protos.len()).into_par_iter().map(|id| lift::lift(&chunk, id, None)).collect::<Vec<_>>();
-    let mut functions = deinline(&chunk, lifted)?;
+    let lifted = (0..chunk.protos.len()).into_par_iter().map(|id| lift::lift(chunk, id, None)).collect::<Vec<_>>();
+    let mut functions = deinline(chunk, lifted)?;
     for function in &mut functions {
         tidy(&mut function.body);
     }
     let protos = chunk.protos.iter().map(|p| p.debug_name.clone()).collect::<Vec<_>>();
     names::infer(&mut functions, &protos, chunk.main, script);
-    Ok(print::print_chunk(&functions, chunk.main, key != 1))
+    Ok(print::print_chunk(&functions, chunk.main, roblox))
 }
 
 // a second lift of every function with inlined copies in it, which turns those back into
