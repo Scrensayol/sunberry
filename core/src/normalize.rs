@@ -468,6 +468,34 @@ fn drop_dead_loads(ns: &mut [N], p: &Proto) {
 
 // Instructions swapped for others that do the same, put back the way the compiler writes them
 fn unsubstitute(ns: &mut [N], p: &Proto) {
+    // a constant loaded into a scratch register just for arithmetic with it: the K form
+    for k in 0..ns.len() {
+        if ns[k].gone || ns[k].op != Op::LOADK {
+            continue;
+        }
+        let s = ns[k].a;
+        let kidx = ns[k].d as u16 as usize;
+        if !matches!(p.constants.get(kidx), Some(Constant::Number(_))) || kidx > 255 {
+            continue;
+        }
+        let Some(j) = (k + 1..ns.len()).find(|&j| !ns[j].gone) else { continue };
+        let u = ns[j];
+        let (op, b, c) = match u.op {
+            Op::ADD | Op::SUB | Op::MUL | Op::DIV | Op::MOD if u.c == s && u.b != s => (Op::from_byte(u.op as u8 + 6).unwrap(), u.b, kidx as u8),
+            Op::IDIV if u.c == s && u.b != s => (Op::IDIVK, u.b, kidx as u8),
+            Op::SUB if u.b == s && u.c != s => (Op::SUBRK, kidx as u8, u.c),
+            Op::DIV if u.b == s && u.c != s => (Op::DIVRK, kidx as u8, u.c),
+            _ => continue,
+        };
+        // (the scratch register is read nowhere else, and nothing jumps between the two)
+        if (u.a != s && read_anywhere(ns, s, &[j])) || ns.iter().any(|n| !n.gone && n.target == Some(j)) {
+            continue;
+        }
+        ns[j].op = op;
+        ns[j].b = b;
+        ns[j].c = c;
+        ns[k].gone = true;
+    }
     for k in 0..ns.len() {
         if ns[k].gone {
             continue;
@@ -499,34 +527,7 @@ fn unsubstitute(ns: &mut [N], p: &Proto) {
             _ => {}
         }
     }
-    // a constant loaded into a scratch register just for arithmetic with it: the K form
-    for k in 0..ns.len() {
-        if ns[k].gone || ns[k].op != Op::LOADK {
-            continue;
-        }
-        let s = ns[k].a;
-        let kidx = ns[k].d as u16 as usize;
-        if !matches!(p.constants.get(kidx), Some(Constant::Number(_))) || kidx > 255 {
-            continue;
-        }
-        let Some(j) = (k + 1..ns.len()).find(|&j| !ns[j].gone) else { continue };
-        let u = ns[j];
-        let (op, b, c) = match u.op {
-            Op::ADD | Op::SUB | Op::MUL | Op::DIV | Op::MOD if u.c == s && u.b != s => (Op::from_byte(u.op as u8 + 6).unwrap(), u.b, kidx as u8),
-            Op::IDIV if u.c == s && u.b != s => (Op::IDIVK, u.b, kidx as u8),
-            Op::SUB if u.b == s && u.c != s => (Op::SUBRK, kidx as u8, u.c),
-            Op::DIV if u.b == s && u.c != s => (Op::DIVRK, kidx as u8, u.c),
-            _ => continue,
-        };
-        // (the scratch register is read nowhere else, and nothing jumps between the two)
-        if (u.a != s && read_anywhere(ns, s, &[j])) || ns.iter().any(|n| !n.gone && n.target == Some(j)) {
-            continue;
-        }
-        ns[j].op = op;
-        ns[j].b = b;
-        ns[j].c = c;
-        ns[k].gone = true;
-    }
+
 }
 
 // Renumbers registers past the parameters so they sit where the compiler puts them: in the
@@ -893,6 +894,35 @@ fn relayout(ns: &[N]) -> Option<Vec<N>> {
                     inside[x] = true;
                     work.extend(preds[x].iter().copied());
                 }
+            }
+            // What follows the loop is where its header or the block closing it goes out to.
+            // Other ways out (a break, a return in the loop) are the body's own: the compiler
+            // writes them inside it, so they count as in it
+            let exits_of = |inside: &Vec<bool>, x: usize| edges(x).into_iter().filter(|&s| !inside[s]).collect::<Vec<_>>();
+            let mut follow = exits_of(&inside, h);
+            follow.extend(exits_of(&inside, b));
+            // (and where the blocks leading into the closing one go out: a repeat's until test
+            // before a JUMPBACK of its own)
+            for &x in &preds[b] {
+                if inside[x] && x != h {
+                    follow.extend(exits_of(&inside, x));
+                }
+            }
+            if follow.is_empty() {
+                // (`while true` left only by breaks: what the breaks go to)
+                let first = (0..nb).filter(|&x| inside[x]).flat_map(|x| exits_of(&inside, x)).collect::<Vec<_>>();
+                follow = first.iter().flat_map(|&e| edges(e)).filter(|s| first.contains(s) || !inside[*s]).collect();
+                if follow.is_empty() {
+                    follow = first;
+                }
+            }
+            let mut work = (0..nb).filter(|&x| inside[x]).flat_map(|x| exits_of(&inside, x)).collect::<Vec<_>>();
+            while let Some(x) = work.pop() {
+                if inside[x] || follow.contains(&x) || !dominates(h, x) {
+                    continue;
+                }
+                inside[x] = true;
+                work.extend(edges(x));
             }
             loops.push(inside);
         }

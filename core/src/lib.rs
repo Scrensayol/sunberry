@@ -70,7 +70,14 @@ pub fn decompile_named(data: &[u8], key: u8, script: Option<&str>) -> Result<Str
             match attempt {
                 Ok(out) if changed => return Ok(out),
                 // (for diagnostics: why the normalized code didn't lift either)
-                Err(e2) if changed && std::env::var_os("SUNBERRY_TRACE_NORMALIZE").is_some() => eprintln!("normalized ({sort_registers}): {e2}"),
+                Err(e2) if changed => {
+                    if std::env::var_os("SUNBERRY_TRACE_NORMALIZE").is_some() {
+                        eprintln!("normalized ({sort_registers}): {e2}");
+                    }
+                    if sort_registers && std::env::var_os("SUNBERRY_REPORT_NORMALIZED").is_some() {
+                        return Err(e2);
+                    }
+                }
                 _ => {}
             }
         }

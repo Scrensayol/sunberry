@@ -2913,6 +2913,20 @@ impl Lifter<'_> {
                 return Err(self.unsupported("an until condition reading the body's values"));
             }
         }
+        // a register a closure in the loop captures, and the loop closes each time round, is a
+        // new variable every iteration: it can't be one variable around the loop (the compiler
+        // never asks for that; rewritten code can)
+        for &r in &joined {
+            let captured = (start..back).any(|k| self.insns[k].op == Op::CAPTURE && self.insns[k].a == 1 && self.insns[k].b == r);
+            // (one on the way out, before a return or a jump past the loop, doesn't count)
+            let leaves = |k: usize| {
+                self.insns.get(k + 1).is_some_and(|n| n.op == Op::RETURN || matches!(n.op, Op::JUMP | Op::JUMPX) && n.target().is_some_and(|t| t >= self.pc_at(exit)))
+            };
+            let closed = (start..back).any(|k| self.insns[k].op == Op::CLOSEUPVALS && self.insns[k].a <= r && !leaves(k));
+            if captured && closed {
+                return Err(self.unsupported("a variable around a loop that each iteration captures anew"));
+            }
+        }
         for &r in &joined {
             let live = self.live_in.get(start).is_some_and(|l| l.has(r));
             self.join_variable(r, live)?;
