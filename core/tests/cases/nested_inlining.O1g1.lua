@@ -85,7 +85,7 @@ end
 local v16 = {name = ""}
 local v17 = {name = "a.b", parent = v16}
 local v18 = {name = "c", parent = v17}
-print(pathOf(v18, {{segment = "M", node = v17}}), pathOf(v18, {}))
+print(pathOf(v18, {{node = v17, segment = "M"}}), pathOf(v18, {}))
 local v19 = {}
 local v20 = 0
 local function pick(p21)

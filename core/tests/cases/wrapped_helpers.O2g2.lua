@@ -24,5 +24,5 @@ local function pathOf(node2, known2)
 end
 local root = {name = ""}
 local mid = {name = "a.b", parent = root}
-print(pathOf({name = "c", parent = mid}, {{segment = "M", node = mid}}))
+print(pathOf({name = "c", parent = mid}, {{node = mid, segment = "M"}}))
 local _

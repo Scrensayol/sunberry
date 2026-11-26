@@ -84,9 +84,9 @@ print(hasKeys({X = curve({}), Z = curve({1})}), hasKeys({}), hasKeys({Y = curve(
 local v15 = v1 > 3
 print(v1, check(v5, "quote"), check(v5, "table"), check(nil, "doc"))
 print(
-	pick({price = 7, payload = {kind = 2}}),
-	pick({payload = 1, price = 8, request = {kind = 5}}),
-	pick({price = 9, payload = {}})
+	pick({payload = {kind = 2}, price = 7}),
+	pick({payload = 1, request = {kind = 5}, price = 8}),
+	pick({payload = {}, price = 9})
 )
 local v16 = print
 local v17 = {Asset = 1, Bundle = 2, Look = 3}

@@ -119,6 +119,8 @@ struct Lifter<'a> {
     // their locals are declared ahead of the outermost region, which stays an expression
     regions: usize,
     hoisted: Vec<(u32, Expr)>,
+    // each DUPTABLE's keys in the template's order, by the constructor's pending id
+    templates: Vec<(u64, Vec<Expr>)>,
     trace: bool,
     // de-inlining (see inline.rs): what the first lift of every function found, whether it's
     // switched off (while checking a candidate), and closures created so far with the local
@@ -309,6 +311,7 @@ fn lift_with(chunk: &Chunk, proto_id: usize, inline: Option<&Ctx>, drop_idle: bo
         loops: Vec::new(),
         regions: 0,
         hoisted: Vec::new(),
+        templates: Vec::new(),
         trace: std::env::var_os("SUNBERRY_TRACE").is_some(),
         inline,
         inlining_off: false,
@@ -734,7 +737,10 @@ impl Lifter<'_> {
             // parameter's register (`a, b = f(b), f(a)` keeps the first result there while the
             // second call runs), so a register read again later stays taken
             let read_later = self.live_in.get(self.at).is_some_and(|live| live.has(reg));
-            if l.end_pc == pc && l.start_pc < pc && !still_held && !read_later && matches!(self.slots[reg as usize], Slot::Local(_)) {
+            // (nor one a branch or loop joins: that's the variable from before it, which the
+            // name ending here only shared the register with)
+            let joined = self.joins.iter().any(|j| j.contains(&reg));
+            if l.end_pc == pc && l.start_pc < pc && !still_held && !read_later && !joined && matches!(self.slots[reg as usize], Slot::Local(_)) {
                 self.slots[reg as usize] = Slot::Free;
             }
         }
@@ -1266,8 +1272,13 @@ impl Lifter<'_> {
                     && self.index_of(table_id) + 1 == self.pending.len()
                 {
                     let table_index = self.index_of(table_id);
+                    // (a key the template holds goes where the template has it: the order the
+                    // keys go into the table is the order `next` visits them in)
+                    let order = self.templates.iter().find(|(id, _)| *id == table_id).map(|(_, o)| o);
+                    let rank = |k: &Expr| order.and_then(|o| o.iter().position(|x| x == k));
                     if let Value::Table(fields, _) = &mut self.pending[table_index].value {
-                        fields.push(Field::Keyed(key, value));
+                        let at = rank(&key).and_then(|r| fields.iter().position(|f| matches!(f, Field::Keyed(k, _) if rank(k).is_some_and(|r2| r2 > r))));
+                        fields.insert(at.unwrap_or(fields.len()), Field::Keyed(key, value));
                     }
                     return Ok(());
                 }
@@ -1606,12 +1617,17 @@ impl Lifter<'_> {
                 // constants the template already holds come first: they are string keys, so
                 // no positional value can land on them
                 let mut fields = Vec::new();
+                let mut order = Vec::new();
                 for (key, value) in keys.clone() {
+                    order.push(self.constant(key)?);
                     if let Some(value) = value {
                         fields.push(Field::Keyed(self.constant(key)?, self.constant(value)?));
                     }
                 }
-                self.new_table(a, fields)?
+                self.new_table(a, fields)?;
+                if let Slot::Pending(id) = self.slots[a as usize] {
+                    self.templates.push((id, order));
+                }
             }
             SETLIST => self.set_list(a, b, c, i.aux)?,
             GETVARARGS => match b {

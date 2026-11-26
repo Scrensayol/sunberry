@@ -25,5 +25,5 @@ local v6 = (function()
 	end
 	local v4 = {name = ""}
 	local v5 = {name = "a.b", parent = v4}
-	print(pathOf({name = "c", parent = v5}, {{segment = "M", node = v5}}))
+	print(pathOf({name = "c", parent = v5}, {{node = v5, segment = "M"}}))
 end)()

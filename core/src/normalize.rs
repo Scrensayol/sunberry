@@ -312,6 +312,30 @@ fn drop_unreachable(ns: &mut [N]) {
             }
         }
     }
+    // (and a for-in body that's only a `break`, which FORGLOOP's jump back skips once threaded:
+    // the jumps from FORGPREP to it are where the loop's body is)
+    for k in 0..ns.len() {
+        if seen[k] && matches!(ns[k].op, Op::FORGPREP | Op::FORGPREP_INEXT | Op::FORGPREP_NEXT) {
+            // (where a jump lands past any jumps it lands on)
+            let land = |mut j: usize, chain: &mut Vec<usize>| {
+                while j < ns.len() && matches!(ns[j].op, Op::JUMP | Op::JUMPX) && !chain.contains(&j) {
+                    chain.push(j);
+                    j = ns[j].target.map_or(ns.len(), |t| live_from(ns, t));
+                }
+                j
+            };
+            let Some(back) = ns[k].target.map(|t| live_from(ns, t)).and_then(|l| ns.get(l)).and_then(|l| l.target) else { continue };
+            let back = land(live_from(ns, back), &mut Vec::new());
+            let mut chain = Vec::new();
+            let start = live_from(ns, k + 1);
+            if start < ns.len() && !seen[start] && back < ns.len() && land(start, &mut chain) == back {
+                chain.retain(|&j| !seen[j]);
+                for j in chain {
+                    seen[j] = true;
+                }
+            }
+        }
+    }
     // (and a return right after something reachable that never falls through: the return Luau
     // copied over a then branch's jump past an else, after a loop that leaves on its own, which
     // marks where the branch ends. Junk always has something before its own)
@@ -330,6 +354,60 @@ fn drop_unreachable(ns: &mut [N]) {
         if back.is_some_and(|j| seen[j] && ends(&ns[j])) {
             seen[k] = true;
         }
+    }
+    // (and the jump past an else right after a then branch's `if ... then return end`: Luau
+    // threaded that if's condition through it, so the two go to the same place)
+    // (blocks shuffled apart: the return on the jump's line whose condition goes there too)
+    let cond = |n: &N| n.target.is_some() && falls(n) && !matches!(n.op, Op::FASTCALL | Op::FASTCALL1 | Op::FASTCALL2 | Op::FASTCALL2K | Op::FASTCALL3 | Op::FASTPCALL | Op::FORNPREP | Op::FORNLOOP | Op::FORGLOOP | Op::LOADB);
+    // (where a jump lands past any jumps it lands on)
+    let land = |t: usize| {
+        let mut j = live_from(ns, t);
+        for _ in 0..16 {
+            match ns.get(j) {
+                Some(n) if matches!(n.op, Op::JUMP | Op::JUMPX) && n.target.is_some() => j = live_from(ns, n.target.unwrap()),
+                _ => break,
+            }
+        }
+        j
+    };
+    // (the return a condition falls into, through straight code and jumps)
+    let falls_to = |c: usize| {
+        let mut j = live_from(ns, c + 1);
+        for _ in 0..256 {
+            let n = ns.get(j)?;
+            match n.op {
+                Op::RETURN => return Some(j),
+                Op::JUMP | Op::JUMPX => j = live_from(ns, n.target?),
+                _ if ends(n) || n.target.is_some() && !matches!(n.op, Op::FASTCALL | Op::FASTCALL1 | Op::FASTCALL2 | Op::FASTCALL2K | Op::FASTCALL3 | Op::FASTPCALL) => return None,
+                _ => j = live_from(ns, j + 1),
+            }
+        }
+        None
+    };
+    let goes_like = |r: usize, k: usize| {
+        (0..ns.len()).any(|c| seen[c] && !ns[c].gone && cond(&ns[c]) && falls_to(c) == Some(r) && land(ns[c].target.unwrap()) == land(ns[k].target.unwrap()))
+    };
+    let mut pairs = Vec::new();
+    for k in 0..ns.len() {
+        if seen[k] || !matches!(ns[k].op, Op::JUMP | Op::JUMPX) || ns[k].target.is_none() {
+            continue;
+        }
+        let Some(prev) = (0..k).rev().find(|&j| !ns[j].gone) else { continue };
+        if !ends(&ns[prev]) {
+            continue;
+        }
+        let r = if seen[prev] && ns[prev].op == Op::RETURN && ns[prev].line == ns[k].line && goes_like(prev, k) {
+            Some(prev)
+        } else {
+            (0..ns.len()).find(|&r| seen[r] && !ns[r].gone && ns[r].op == Op::RETURN && ns[r].line == ns[k].line && goes_like(r, k))
+        };
+        if let Some(r) = r {
+            pairs.push((k, r));
+        }
+    }
+    for (k, r) in pairs {
+        seen[k] = true;
+        ns[k].paired = Some(r);
     }
     for (k, n) in ns.iter_mut().enumerate() {
         if !seen[k] {
@@ -933,7 +1011,7 @@ fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
     // a FORNLOOP nothing reaches falls where its own FORNPREP jumps (the loop's exit), not
     // into whatever the shuffle put after it: it never runs, so that only says where it goes
     for l in 0..nb {
-        if let Some(prep) = last(l).paired {
+        if let Some(prep) = last(l).paired.filter(|_| last(l).op == Op::FORNLOOP) {
             let pb = block_of[pos[prep]];
             fall[l] = if pb == usize::MAX { None } else { jump[pb] };
         }
@@ -948,6 +1026,12 @@ fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
             Op::FORGPREP | Op::FORGPREP_INEXT | Op::FORGPREP_NEXT => {
                 let g = jump[b].or_else(|| bail(6))?;
                 glued[b] = jump[g].filter(|_| matches!(last(g).op, Op::FORGLOOP));
+                // (or the jump right after it, where the body is only that `break`, which
+                // FORGLOOP's jump back skips once threaded)
+                let lone = |x: usize| end_of(x) - starts[x] == 1 && matches!(last(x).op, Op::JUMP | Op::JUMPX);
+                if b + 1 < nb && lone(b + 1) && fall[g].is_some_and(|e| resolve(e) == resolve(b + 1)) && glued[b].is_some_and(|body| resolve(b + 1) == resolve(body)) {
+                    glued[b] = Some(b + 1);
+                }
             }
             _ => {}
         }
@@ -1104,6 +1188,21 @@ fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
             seen[b] = true;
         }
     }
+    // (and a dead jump kept after a return: right after it, still)
+    for b in 0..nb {
+        let Some(after) = last(b).paired.filter(|_| matches!(last(b).op, Op::JUMP | Op::JUMPX)).map(|r| block_of[pos[r]]) else { continue };
+        if !seen[b]
+            && after < nb
+            && seen[after]
+            && last(after).op == Op::RETURN
+            && end_of(b) - starts[b] == 1
+            && jump[b].is_none_or(|t| seen[t])
+            && let Some(at) = order.iter().position(|&x| x == after)
+        {
+            order.insert(at + 1, b);
+            seen[b] = true;
+        }
+    }
     if std::env::var_os("SUNBERRY_TRACE_LAYOUT").is_some() {
         for b in 0..nb {
             eprintln!("  block {b} at {} line {} last {:?} fall {:?} jump {:?} glued {:?} succs {:?}", ns[live[starts[b]]].old_pc, line(b), last(b).op, fall[b], jump[b], glued[b], succs(b));
@@ -1184,9 +1283,10 @@ fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
         {
             if end_of(fo) - starts[fo] == 1 && last(fo).op == Op::RETURN {
                 out.push(last(fo));
-            } else if next.is_some_and(|x| !loops[li][x] && preds[fo].contains(&x)) && preds[fo].iter().any(|&x| loops[li][x]) {
-                // (or the jump itself, to what follows, where it's an else after it that
-                // falls there too)
+            } else if order[oi + 1..].contains(&fo)
+                && next.is_some_and(|x| !loops[li][x]) && preds[fo].iter().any(|&x| loops[li][x]) && preds[fo].iter().any(|&x| !loops[li][x] && !dominates(fo, x)) {
+                // (or the jump itself, to what follows, where it's an else after it that gets
+                // there too)
                 let mut dead = l;
                 dead.op = Op::JUMP;
                 dead.a = 0;

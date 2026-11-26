@@ -92,7 +92,7 @@ end
 local root = {name = ""}
 local mid = {name = "a.b", parent = root}
 local leaf = {name = "c", parent = mid}
-print(pathOf(leaf, {{segment = "M", node = mid}}), pathOf(leaf, {}))
+print(pathOf(leaf, {{node = mid, segment = "M"}}), pathOf(leaf, {}))
 local misses = 0
 local picks = {}
 local function pick(x)

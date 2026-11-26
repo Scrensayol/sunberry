@@ -142,9 +142,9 @@ local v9 = check(tree, "table")
 local v10 = false
 v6(v7, v8, v9, "outside doc")
 print(
-	pick({price = 7, payload = {kind = 2}}),
-	pick({payload = 1, price = 8, request = {kind = 5}}),
-	(pick({price = 9, payload = {}}))
+	pick({payload = {kind = 2}, price = 7}),
+	pick({payload = 1, request = {kind = 5}, price = 8}),
+	(pick({payload = {}, price = 9}))
 )
 local v11 = print
 local v12 = flag
