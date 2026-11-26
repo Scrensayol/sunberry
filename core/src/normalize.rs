@@ -312,6 +312,25 @@ fn drop_unreachable(ns: &mut [N]) {
             }
         }
     }
+    // (and a return right after something reachable that never falls through: the return Luau
+    // copied over a then branch's jump past an else, after a loop that leaves on its own, which
+    // marks where the branch ends. Junk always has something before its own)
+    // (junk may sit between the two: what's right before the return still never falls
+    // through, and back past junk is something reachable that doesn't either)
+    let junk_op = |n: &N| matches!(n.op, Op::LOADN | Op::LOADK | Op::MOVE | Op::ADD | Op::SUB | Op::MUL | Op::NOT | Op::LOADNIL | Op::JUMPIF | Op::JUMPIFNOT | Op::JUMP | Op::RETURN) || n.op == Op::LOADB && n.c == 0;
+    for k in 0..ns.len() {
+        if seen[k] || ns[k].op != Op::RETURN {
+            continue;
+        }
+        let Some(prev) = (0..k).rev().find(|&j| !ns[j].gone) else { continue };
+        if !ends(&ns[prev]) {
+            continue;
+        }
+        let back = (0..k).rev().find(|&j| !ns[j].gone && (seen[j] || !junk_op(&ns[j])));
+        if back.is_some_and(|j| seen[j] && ends(&ns[j])) {
+            seen[k] = true;
+        }
+    }
     for (k, n) in ns.iter_mut().enumerate() {
         if !seen[k] {
             n.gone = true;
@@ -499,7 +518,18 @@ fn drop_dead_loads(ns: &mut [N], p: &Proto) {
                 _ => false,
             };
             let out = succ(k).into_iter().filter(|&s| s < n).fold(Regs::default(), |a, s| a.union(live_in[s]));
-            if pure && !out.has(m.a) {
+            // (`local f; f = function() ... f ... end` declares f before the closure captures it)
+            let declares = || {
+                let mut j = k + 1;
+                while j < n && (ns[j].gone || !ends(&ns[j])) && !(j > k + 1 && leader[j]) {
+                    if !ns[j].gone && ns[j].op == Op::CAPTURE && ns[j].a == 1 && ns[j].b == m.a {
+                        return true;
+                    }
+                    j += 1;
+                }
+                false
+            };
+            if pure && !out.has(m.a) && !declares() {
                 drop.push(k);
             }
         }
@@ -977,10 +1007,16 @@ fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
             // (and where the blocks leading into the closing one go out: a repeat's until test
             // before a JUMPBACK of its own)
             let lone_jump = end_of(b) - starts[b] == 1 && matches!(last(b).op, Op::JUMP | Op::JUMPX | Op::JUMPBACK);
+            let mut until = Vec::new();
             for &x in &preds[b] {
                 if lone_jump && inside[x] && x != h {
-                    follow.extend(exits_of(&inside, x));
+                    until.extend(exits_of(&inside, x));
                 }
+            }
+            // (a repeat: its header is the body's first block, which may return or break, so
+            // only the until test's way out follows it)
+            if !until.is_empty() {
+                follow = until;
             }
             if follow.is_empty() {
                 // (`while true` left only by breaks: what the breaks go to)
@@ -1011,7 +1047,10 @@ fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
     seen[0] = true;
     let succs = |b: usize| {
         if forgprep(b) {
-            return glued[b].into_iter().collect::<Vec<_>>();
+            // (and its FORGLOOP where nothing else gets there, the body always leaving: first,
+            // so it's placed after the body)
+            let dead = jump[b].filter(|&l| preds[l].iter().all(|&x| x == b) && fall[l] != glued[b]);
+            return dead.into_iter().chain(glued[b]).collect::<Vec<_>>();
         }
         // (rank: a loop's exit first, so it's placed after the loop; then the block that closes
         // the loop, so it's placed after the rest of it; then later lines first; the glued one
@@ -1138,13 +1177,24 @@ fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
         // threaded to the return): dead, but it's where the branch ends
         if f.is_none()
             && matches!(l.op, Op::JUMP | Op::JUMPX | Op::JUMPBACK)
-            && let Some((_, follow)) = closers.iter().find(|(c, _)| *c == b)
+            && let Some(li) = closers.iter().position(|(c, _)| *c == b)
+            && let (_, follow) = &closers[li]
             && let [fo] = follow[..]
-            && end_of(fo) - starts[fo] == 1
-            && last(fo).op == Op::RETURN
             && next != Some(fo)
         {
-            out.push(last(fo));
+            if end_of(fo) - starts[fo] == 1 && last(fo).op == Op::RETURN {
+                out.push(last(fo));
+            } else if next.is_some_and(|x| !loops[li][x] && preds[fo].contains(&x)) && preds[fo].iter().any(|&x| loops[li][x]) {
+                // (or the jump itself, to what follows, where it's an else after it that
+                // falls there too)
+                let mut dead = l;
+                dead.op = Op::JUMP;
+                dead.a = 0;
+                dead.b = 0;
+                dead.aux = 0;
+                fix.push((out.len(), fo));
+                out.push(dead);
+            }
         }
         if let Some(f) = f {
             let cond = l.target.is_some() && !matches!(l.op, Op::FASTCALL | Op::FASTCALL1 | Op::FASTCALL2 | Op::FASTCALL2K | Op::FASTCALL3 | Op::FASTPCALL);
@@ -1172,6 +1222,7 @@ fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
     for (k, b) in fix {
         let s = start_of[b];
         if s == usize::MAX {
+            if std::env::var_os("SUNBERRY_TRACE_LAYOUT").is_some() { eprintln!("unplaced {b} from out {k} op {:?} line {}", out[k].op, out[k].line); }
             return bail(5);
         }
         out[k].target = Some(s);
