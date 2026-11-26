@@ -85,6 +85,28 @@ pub fn decompile_named(data: &[u8], key: u8, script: Option<&str>) -> Result<Str
                 _ => {}
             }
         }
+        // (last, each function as the first of these that lifts it on its own: the tries can
+        // each stumble on a different function, and normalizing one changes no other)
+        let mixed = std::panic::catch_unwind(|| {
+            let mut variants = vec![chunk.clone()];
+            for &(sort_registers, keep_chains, merges_first) in &attempts {
+                let mut normal = chunk.clone();
+                for p in &mut normal.protos {
+                    normalize::normalize(p, sort_registers, keep_chains, merges_first);
+                }
+                variants.push(normal);
+            }
+            let mut mixed = chunk.clone();
+            for id in 0..chunk.protos.len() {
+                if let Some(v) = variants.iter().find(|v| lift::lift(v, id, None).is_ok()) {
+                    mixed.protos[id] = v.protos[id].clone();
+                }
+            }
+            decompile_chunk(&mixed, script, roblox)
+        });
+        if let Ok(Ok(out)) = mixed {
+            return Ok(out);
+        }
         Err(e)
     })
 }
