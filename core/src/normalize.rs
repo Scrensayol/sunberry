@@ -1234,13 +1234,6 @@ fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
             seen[b] = true;
         }
     }
-    if std::env::var_os("SUNBERRY_TRACE_LAYOUT").is_some() {
-        for b in 0..nb {
-            eprintln!("  block {b} at {} line {} last {:?} fall {:?} jump {:?} glued {:?} succs {:?}", ns[live[starts[b]]].old_pc, line(b), last(b).op, fall[b], jump[b], glued[b], succs(b));
-        }
-        eprintln!("  closers {closers:?}");
-        eprintln!("  order {order:?}");
-    }
     // a for loop's own break or return block goes before its FORGLOOP or FORNLOOP: depth first
     // may have put it later, from a later line
     // (whether x is f or a block f's lone jumps go through)
@@ -1263,7 +1256,7 @@ fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
         let late = order[bi + 1..]
             .iter()
             .copied()
-            .filter(|&x| loops[li][x] && !glued.contains(&Some(x)) && !follow.iter().any(|&f| on_chain(f, x)) && edges(x).iter().all(|&s| !loops[li][s]) && preds[x].iter().any(|p| loops[li][*p] && before.contains(p)))
+            .filter(|&x| loops[li][x] && !glued.contains(&Some(x)) && !follow.iter().any(|&f| on_chain(f, x)) && edges(x).iter().all(|&s| !loops[li][s] || follow.iter().any(|&f| on_chain(f, s))) && preds[x].iter().any(|p| loops[li][*p] && before.contains(p)))
             .collect::<Vec<_>>();
         if late.is_empty() {
             continue;
@@ -1316,6 +1309,13 @@ fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
         if descents(&moved) < descents(&order[w0..=li]) {
             order.splice(w0..=li, moved);
         }
+    }
+    if std::env::var_os("SUNBERRY_TRACE_LAYOUT").is_some() {
+        for b in 0..nb {
+            eprintln!("  block {b} at {} line {} last {:?} fall {:?} jump {:?} glued {:?} succs {:?}", ns[live[starts[b]]].old_pc, line(b), last(b).op, fall[b], jump[b], glued[b], succs(b));
+        }
+        eprintln!("  closers {closers:?}");
+        eprintln!("  order {order:?}");
     }
     // lay it out: each block's instructions, then a jump where what it falls into isn't next
     let mut out: Vec<N> = Vec::with_capacity(n_live + nb);
