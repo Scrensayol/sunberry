@@ -1255,12 +1255,12 @@ fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
             }
         }
     }
-    // a loop's lone JUMPBACK comes right after the body's last line: a `continue` jumps to it
+    // a loop's lone JUMPBACK (or FORNLOOP) comes right after the body's last line: a `continue` jumps to it
     // from earlier on (depth first may have put the continue's block last). What moves is the
     // block that jumps to it from the latest line, with the straight run of blocks leading in
     for li in 0..order.len() {
         let l = order[li];
-        if !(latch[l] && end_of(l) - starts[l] == 1 && last(l).op == Op::JUMPBACK) || li == 0 {
+        if !(latch[l] && end_of(l) - starts[l] == 1 && matches!(last(l).op, Op::JUMPBACK | Op::FORNLOOP)) || li == 0 {
             continue;
         }
         let before = order[li - 1];
@@ -1277,6 +1277,9 @@ fn relayout(ns: &[N], keep_chains: bool) -> Option<Vec<N>> {
         let w0 = from.saturating_sub(1);
         let descents = |o: &[usize]| o.windows(2).filter(|w| line(w[1]) < line(w[0])).count();
         let mut moved = order[w0..=li].to_vec();
+        if (0..nb).any(|x| glued[x] == Some(order[from])) {
+            continue;
+        }
         let run = moved.drain(from - w0..=pi - w0).collect::<Vec<_>>();
         let at = moved.len() - 1;
         moved.splice(at..at, run);
