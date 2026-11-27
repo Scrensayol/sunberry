@@ -37,19 +37,19 @@ sudo loginctl enable-linger "$USER"   # keep it running while you're logged out
 
 ## What's different from shiny
 
-**A new core that refuses instead of guessing.** Sunberry decompiles with a core written from scratch. Instead of rebuilding control flow from a graph, it replays what Luau's compiler does in reverse, so every construct comes back the way the compiler emitted it. It's checked by a round-trip suite, [Rosetta](https://github.com/Scrensayol/rosetta): generate a program, compile it at six optimization and debug levels, decompile it, recompile the output, run both and compare what they print. Across 24,000 generated programs, the new core has no output that behaves differently. The 0.4% it can't reproduce exactly, it refuses. When that happens, `decompile` and `serve` hand back the original core's output under a comment saying so. `--core old` (or `?core=old`) uses the original core directly.
+**A new core that refuses instead of guessing.** Sunberry decompiles with a core written from scratch. Instead of rebuilding control flow from a graph, it replays what Luau's compiler does in reverse, so every construct comes back the way the compiler emitted it. It's checked by a round-trip suite, [Rosetta](https://github.com/Scrensayol/rosetta): generate a program, compile it at six optimization and debug levels, decompile it, recompile the output, run both and compare what they print. On Rosetta's full tier it passes all 12,276 round trips, and 99.4% of the hard tier, where the bytecode is rewritten to hide the compiler's patterns, with no output that behaves differently on either. What it can't reproduce exactly, it refuses. When that happens, `decompile` and `serve` hand back the original core's output under a comment saying so. `--core old` (or `?core=old`) uses the original core directly.
 
 **Inlined functions come back.** At `-O2`, Luau copies small local functions into their callers. The new core spots those copies and turns them back into calls, but only when the copy matches the function exactly, with every argument and upvalue accounted for. That restored about 9,000 calls in a dump of 33,000 Roblox scripts.
 
-**About 4x faster.** Times for one 1.8 MB Roblox script (1,970 functions, 78,396 lines of output):
+**3 to 5x faster.** Times for one 1.8 MB Roblox script (1,970 functions; 78,396 lines of output from shiny, 81,981 from Sunberry):
 
 | Machine | shiny | Sunberry |
 | --- | --- | --- |
-| Raspberry Pi 5 (4x Cortex-A76) | 3.35 s | **0.58 s** |
-| x86 desktop, 1 thread | 1.87 s | **0.88 s** |
-| x86 desktop, 4 threads | 1.87 s | **0.43 s** |
+| Raspberry Pi 5 (4x Cortex-A76) | 3.35 s | **0.67 s** |
+| x86 desktop, 1 thread | 1.87 s | **0.66 s** |
+| x86 desktop, 4 threads | 1.87 s | **0.40 s** |
 
-Those times are for the original core. On this script the new core runs about the same number of instructions, and over the whole dump it used 16% less CPU.
+Sunberry 0.5.7 with its default core, median of 7 to 21 runs. shiny's times were measured on the same machines.
 
 Where it comes from:
 
