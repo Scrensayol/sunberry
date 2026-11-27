@@ -603,6 +603,37 @@ fn drop_dead_loads(ns: &mut [N], p: &Proto) {
                 break;
             }
         }
+        // registers a closure captured by reference and nothing has closed yet, on some path to
+        // each instruction: the closure reads them through its upvalue, which no read here shows
+        let mut open_in = vec![Regs::default(); n + 1];
+        loop {
+            let mut changed = false;
+            for k in 0..n {
+                if ns[k].gone {
+                    continue;
+                }
+                let m = &ns[k];
+                let mut open = open_in[k];
+                if m.op == Op::CAPTURE && m.a == 1 {
+                    open.add(m.b as usize);
+                }
+                if m.op == Op::CLOSEUPVALS {
+                    let mut closed = Regs::default();
+                    closed.add_range(m.a as usize, 256);
+                    open = open.without(closed);
+                }
+                for s in succ(k).into_iter().filter(|&s| s < n) {
+                    let joined = open_in[s].union(open);
+                    if joined != open_in[s] {
+                        open_in[s] = joined;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
         let mut drop = Vec::new();
         for k in 0..n {
             let m = ns[k];
@@ -628,7 +659,7 @@ fn drop_dead_loads(ns: &mut [N], p: &Proto) {
                 }
                 false
             };
-            if pure && !out.has(m.a) && !declares() {
+            if pure && !out.has(m.a) && !declares() && !open_in[k].has(m.a) {
                 drop.push(k);
             }
         }
